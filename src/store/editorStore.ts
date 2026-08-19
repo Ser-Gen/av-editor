@@ -1,96 +1,368 @@
 import { create } from 'zustand';
 import type {
   AssetType,
+  AudioClip,
   Clip,
+  EditorDoc,
   EditorState,
+  EffectInstance,
+  EffectType,
+  Interp,
+  Keyframe,
   MediaAsset,
+  NormalizedRect,
+  OverlayTransform,
   ProjectSettings,
   ResolutionPreset,
   TextTemplate,
   Track,
+  TrackKind,
+  TransitionType,
 } from '../types/editor';
-import { buildClipsForAsset, findLaneForPlacement, isAssetInUse } from './clipFactory';
+import {
+  buildClipsForAsset,
+  buildRecordingClips,
+  createTrack,
+  findLaneForPlacement,
+  insertTrack,
+  isAssetInUse,
+  MAX_TRACK_HEIGHT,
+  MIN_TRACK_HEIGHT,
+  ADJUSTMENT_CLIP_DURATION,
+  TEXT_CLIP_DURATION,
+  defaultTracks,
+  nextTrackLabel,
+  trackHasOverlap,
+} from './clipFactory';
+import { docEquals, docSnapshot, pruneSelection, pushEntry } from './history';
+import { SOURCE_LANE } from '../capture/recordingStore';
+import type { RecordedSource } from '../capture/recordingStore';
+import {
+  DEFAULT_REGION,
+  EFFECTS,
+  REGION_CHANNELS,
+  REGION_MODE,
+  defaultParams,
+} from '../render/effects/registry';
+import { TRANSFORM_CHANNELS, clampFade } from '../utils/clipRender';
+import {
+  channelTimes,
+  evaluateChannel,
+  moveKey,
+  removeKeyAt,
+  setKeyInterp,
+  splitChannelMap,
+  upsertKey,
+} from '../utils/keyframes';
+import { audioTracks, videoTracks } from '../utils/compositeOrder';
 import { inferAssetKind } from '../utils/assetKind';
 import { uid } from '../utils/id';
 import { probeMediaFile } from '../utils/probeMedia';
 import { fetchUrlAsFile } from '../utils/urlMedia';
 import { clearVideoThumbnailCache } from '../utils/videoThumbnailCache';
 import { clearWaveformCache } from '../utils/waveformCache';
-import { DEFAULT_FULL_FRAME, DEFAULT_OVERLAY_TRANSFORM } from '../utils/overlayTransform';
-import { clampTrackVolume, DEFAULT_TRACK_VOLUME } from '../utils/trackVolume';
-import { clipDuration, clipEnd, MIN_CLIP_DURATION, snapTime } from '../utils/time';
+import { DEFAULT_FULL_FRAME } from '../utils/overlayTransform';
+import { clampTrackVolume } from '../utils/trackVolume';
+import { overlapIsTransition } from '../utils/transitions';
+import {
+  clipDuration,
+  clipEnd,
+  MIN_CLIP_DURATION,
+  quantizeToFrame,
+  rangesOverlap,
+} from '../utils/time';
 
-function computeDuration(clips: Clip[]): number {
-  if (clips.length === 0) return 30;
-  return Math.max(5, ...clips.map((c) => clipEnd(c)));
+export const MIN_PX_PER_SEC = 2;
+export const MAX_PX_PER_SEC = 1000;
+/** Scrollable slack after the last clip, in seconds. */
+export const TIMELINE_TAIL_SECONDS = 4;
+/** An empty project still needs something to look at. Drawing only, never content. */
+export const MIN_TIMELINE_SPAN_SECONDS = 10;
+
+export interface ClipMove {
+  id: string;
+  timelineStart: number;
+  trackId: string;
 }
 
-function defaultTracks(): Track[] {
-  return [
-    { id: uid('track'), kind: 'overlay', label: 'Overlay 1' },
-    { id: uid('track'), kind: 'overlay', label: 'Overlay 2' },
-    { id: uid('track'), kind: 'video', label: 'Video 1' },
-    { id: uid('track'), kind: 'audio', label: 'Audio 1', volume: DEFAULT_TRACK_VOLUME },
-    { id: uid('track'), kind: 'audio', label: 'Audio 2', volume: DEFAULT_TRACK_VOLUME },
-  ];
+/**
+ * What an effect action operates on. A bare string means a clip, so every existing
+ * caller keeps working; tracks are addressed explicitly.
+ */
+export type EffectTarget = { kind: 'clip' | 'track'; id: string };
+export type EffectTargetRef = string | EffectTarget;
+
+function toTarget(ref: EffectTargetRef): EffectTarget {
+  return typeof ref === 'string' ? { kind: 'clip', id: ref } : ref;
+}
+
+/** Addresses one animatable channel: an effect parameter, or a placement field. */
+export interface ChannelRef {
+  effectId: string | null;
+  param: string;
+}
+
+function channelKeys(clip: Clip, ref: ChannelRef): Keyframe[] | undefined {
+  if (ref.effectId === null) return clip.transformKeyframes?.[ref.param];
+  return clip.effects?.find((e) => e.id === ref.effectId)?.keyframes?.[ref.param];
+}
+
+/** The channel's static value — what a first keyframe should capture. */
+function currentChannelValue(clip: Clip, ref: ChannelRef): number | null {
+  if (ref.effectId === null) {
+    if (clip.kind !== 'video' && clip.kind !== 'image') return null;
+    const transform = clip.transform;
+    if (!transform) return null;
+    const [group, axis] = ref.param.split('.') as ['crop' | 'frame', 'x' | 'y' | 'w' | 'h'];
+    return transform[group]?.[axis] ?? null;
+  }
+  const effect = clip.effects?.find((e) => e.id === ref.effectId);
+  return effect ? (effect.params[ref.param] ?? null) : null;
+}
+
+/** Writes a scalar back into the channel's static home, used when disarming. */
+function freezeChannel(clip: Clip, ref: ChannelRef, value: number): Clip {
+  if (ref.effectId === null) {
+    if (clip.kind !== 'video' && clip.kind !== 'image') return clip;
+    if (!clip.transform) return clip;
+    const [group, axis] = ref.param.split('.') as ['crop' | 'frame', 'x' | 'y' | 'w' | 'h'];
+    return {
+      ...clip,
+      transform: { ...clip.transform, [group]: { ...clip.transform[group], [axis]: value } },
+    };
+  }
+  return {
+    ...clip,
+    effects: (clip.effects ?? []).map((e) =>
+      e.id === ref.effectId ? { ...e, params: { ...e.params, [ref.param]: value } } : e,
+    ),
+  };
+}
+
+/** Rewrites one channel's key list, leaving everything else on the clip alone. */
+function withChannel(
+  clip: Clip,
+  ref: ChannelRef,
+  update: (keys: Keyframe[] | undefined) => Keyframe[] | undefined,
+): Clip {
+  if (ref.effectId === null) {
+    const next = update(clip.transformKeyframes?.[ref.param]);
+    const channels = { ...(clip.transformKeyframes ?? {}) };
+    if (next === undefined) delete channels[ref.param];
+    else channels[ref.param] = next;
+    return { ...clip, transformKeyframes: Object.keys(channels).length > 0 ? channels : undefined };
+  }
+  return {
+    ...clip,
+    effects: (clip.effects ?? []).map((effect) => {
+      if (effect.id !== ref.effectId) return effect;
+      const next = update(effect.keyframes?.[ref.param]);
+      const channels = { ...(effect.keyframes ?? {}) };
+      if (next === undefined) delete channels[ref.param];
+      else channels[ref.param] = next;
+      return { ...effect, keyframes: Object.keys(channels).length > 0 ? channels : undefined };
+    }),
+  };
+}
+
+/** Rewrites the effect chain of a clip or a track, whichever the target names. */
+function applyEffects(
+  state: EditorState,
+  ref: EffectTargetRef,
+  update: (effects: EffectInstance[]) => EffectInstance[],
+): Partial<EditorState> {
+  const target = toTarget(ref);
+  if (target.kind === 'track') {
+    return {
+      tracks: state.tracks.map((t) =>
+        t.id === target.id ? { ...t, effects: update(t.effects ?? []) } : t,
+      ),
+    };
+  }
+  return { clips: mapEffects(state.clips, target.id, update) };
+}
+
+/** The region settings of a parameter set — kept when resetting an effect's own params. */
+function regionOnly(params: Record<string, number>): Record<string, number> {
+  return Object.fromEntries(Object.entries(params).filter(([k]) => k.startsWith('region.')));
+}
+
+/** Where the content actually ends — the number export renders and the transport reports. */
+function computeDuration(clips: Clip[]): number {
+  if (clips.length === 0) return 0;
+  return Math.max(0, ...clips.map((c) => clipEnd(c)));
+}
+
+/**
+ * How much timeline to *draw*, which is not the same question. The tail is working room —
+ * somewhere to drop a clip past the current end — and an empty project still needs a ruler
+ * to look at. Neither is content.
+ *
+ * These used to be one number, floored at 5s and with the tail baked in, so a 2-second take
+ * drew a 9-second project and then exported 2 seconds. Keeping them apart is what lets the
+ * lanes show the extra room as *room* rather than as length.
+ */
+function computeSpan(clips: Clip[]): number {
+  return Math.max(MIN_TIMELINE_SPAN_SECONDS, computeDuration(clips) + TIMELINE_TAIL_SECONDS);
+}
+
+/**
+ * Where the playhead has to move to, or null when it is already in range.
+ *
+ * The playhead may not sit past the end of the content, and this is not a cosmetic tidy:
+ * `setPlayhead` clamps against the project duration, so a playhead beyond it is a position
+ * that can never be moved rightwards and never returned to. Deleting every clip is the
+ * extreme case — the content is then zero seconds long and the playhead belongs at zero.
+ *
+ * Applied only when an edit is *finished*. Mid-drag the duration moves with every frame, and
+ * clamping there would walk the playhead leftwards as a clip is dragged in and fail to walk
+ * it back when the clip returns — losing a position the user never asked to change.
+ */
+function playheadInRange(clips: Clip[], playhead: number): number | null {
+  const end = computeDuration(clips);
+  return playhead > end ? end : null;
 }
 
 const initialState: EditorState = {
   settings: { resolution: '1080p', fps: 30 },
   tracks: defaultTracks(),
   clips: [],
-  mediaLibrary: {},
   libraryOrder: [],
-  selectedClipId: null,
+  mediaLibrary: {},
+  past: [],
+  future: [],
+  selectedClipIds: [],
   playhead: 0,
   trimPreview: null,
   isPlaying: false,
-  timelineZoom: 80,
+  pxPerSec: 80,
+  scrollX: 0,
+  scrollY: 0,
+  viewportWidth: 800,
+  viewportHeight: 300,
+  followPlayhead: true,
+  snapEnabled: true,
+  snapIndicator: null,
   ffmpegStatus: 'idle',
   ffmpegError: null,
   exportProgress: null,
+  exportEngine: null,
+  exportNotice: null,
   libraryNotice: null,
 };
 
 interface EditorActions {
+  // History
+  undo: () => void;
+  redo: () => void;
+  beginInteraction: (label: string) => void;
+  endInteraction: () => void;
+  undoLabel: () => string | null;
+  redoLabel: () => string | null;
+
+  // Session
   setResolution: (resolution: ResolutionPreset) => void;
   setPlayhead: (t: number) => void;
   setPlaying: (playing: boolean) => void;
-  setTimelineZoom: (zoom: number) => void;
-  selectClip: (id: string | null) => void;
   setFfmpegStatus: (status: EditorState['ffmpegStatus'], error?: string | null) => void;
   setExportProgress: (p: number | null) => void;
+  setExportEngine: (engine: EditorState['exportEngine']) => void;
+  setExportNotice: (message: string | null) => void;
+  setLibraryNotice: (message: string | null) => void;
+  getProjectDuration: () => number;
+  /** What the timeline draws: content, plus tail, never less than the minimum span. */
+  getTimelineSpan: () => number;
+  getContentHeight: () => number;
+
+  // Selection
+  selectClip: (id: string | null, additive?: boolean) => void;
+  setSelection: (ids: string[]) => void;
+  selectAll: () => void;
+
+  // Viewport
+  setViewportSize: (width: number, height: number) => void;
+  setScroll: (x: number, y: number) => void;
+  setPxPerSec: (px: number) => void;
+  zoomAt: (factor: number, anchorX: number) => void;
+  zoomToFit: () => void;
+  zoomToSelection: () => void;
+  setFollowPlayhead: (follow: boolean) => void;
+  toggleSnap: () => void;
+  setSnapIndicator: (t: number | null) => void;
+
+  // Tracks
+  addTrack: (kind: TrackKind) => void;
+  removeTrack: (id: string) => void;
+  renameTrack: (id: string, label: string) => void;
+  moveTrack: (id: string, direction: -1 | 1) => void;
+  setTrackHeight: (id: string, height: number) => void;
+  toggleTrackFlag: (id: string, flag: 'hidden' | 'muted' | 'solo' | 'locked') => void;
+  setTrackVolume: (trackId: string, volume: number) => void;
+
+  // Media
   importToLibrary: (files: FileList | File[], kind: AssetType) => Promise<void>;
   importFiles: (files: FileList | File[], kind: AssetType) => Promise<void>;
   importUrlsToLibrary: (urls: string[]) => Promise<void>;
-  setLibraryNotice: (message: string | null) => void;
   addAssetToTimeline: (assetId: string) => void;
   removeLibraryItem: (assetId: string) => void;
+  /** Imports one capture session and lays its sources out keeping their measured offsets. */
+  importRecordings: (recordings: RecordedSource[]) => Promise<string[]>;
+
+  // Clips
   addTextClip: (text: string, template: TextTemplate) => void;
-  updateTextClip: (id: string, text: string, template: TextTemplate, textFrame?: import('../types/editor').NormalizedRect) => void;
-  updateImageTransform: (id: string, overlayTransform: import('../types/editor').OverlayTransform) => void;
-  removeSelectedClip: () => void;
-  duplicateSelectedClip: () => void;
-  splitSelectedAtPlayhead: () => void;
-  canSplitAtPlayhead: () => boolean;
-  moveClip: (id: string, timelineStart: number) => void;
-  trimClip: (id: string, edge: 'left' | 'right', timelineDelta: number) => void;
-  setTrimPreview: (clipId: string, sourceTime: number) => void;
-  clearTrimPreview: () => void;
+  updateTextClip: (
+    id: string,
+    text: string,
+    template: TextTemplate,
+    textFrame?: NormalizedRect,
+  ) => void;
+  updateClipTransform: (id: string, transform: OverlayTransform | undefined) => void;
   updateVideoFlags: (
     id: string,
-    flags: {
-      muteAudio?: boolean;
-      hideVideo?: boolean;
-      overlayMode?: boolean;
-      overlayTransform?: import('../types/editor').OverlayTransform;
-    },
+    flags: { audioEnabled?: boolean; hideVideo?: boolean; gain?: number },
   ) => void;
-  getProjectDuration: () => number;
-  addAudioTrack: () => void;
-  addOverlayTrack: () => void;
-  setTrackVolume: (trackId: string, volume: number) => void;
+  setClipGain: (id: string, gain: number) => void;
+  detachAudio: (id: string) => void;
+
+  // Effects and fades. `target` is a clip id, or { kind: 'track', id } for a track grade.
+  addEffect: (target: EffectTargetRef, type: EffectType) => void;
+  removeEffect: (target: EffectTargetRef, effectId: string) => void;
+  moveEffect: (target: EffectTargetRef, effectId: string, direction: -1 | 1) => void;
+  toggleEffect: (target: EffectTargetRef, effectId: string) => void;
+  setEffectParam: (target: EffectTargetRef, effectId: string, param: string, value: number) => void;
+  /** Region shape: 0 = whole frame, 1 = rectangle, 2 = ellipse. Seeds a default box. */
+  setRegionMode: (target: EffectTargetRef, effectId: string, mode: number) => void;
+  /** Moves or resizes the mask box, writing keyframes when the region is armed. */
+  setRegionRect: (target: EffectTargetRef, effectId: string, rect: NormalizedRect) => void;
+  /** Adds an effect already configured with a region — the one-click masking presets. */
+  addRegionEffect: (target: EffectTargetRef, type: EffectType) => void;
+  resetEffect: (target: EffectTargetRef, effectId: string) => void;
+  setClipFade: (clipId: string, edge: 'in' | 'out', seconds: number) => void;
+  /** Adds a ranged grade: a clip with no picture that affects everything below it. */
+  addAdjustmentClip: () => void;
+  setTransitionType: (clipId: string, type: TransitionType) => void;
+
+  // Keyframes. `effectId: null` addresses a placement channel (`frame.x`, `crop.w`, …).
+  isChannelArmed: (clipId: string, ref: ChannelRef) => boolean;
+  toggleChannelArmed: (clipId: string, ref: ChannelRef) => void;
+  moveKeyframe: (clipId: string, ref: ChannelRef, from: number, to: number) => void;
+  removeKeyframe: (clipId: string, ref: ChannelRef, t: number) => void;
+  setKeyframeInterp: (clipId: string, ref: ChannelRef, t: number, interp: Interp) => void;
+  jumpToKeyframe: (direction: -1 | 1) => void;
+
+  /** `allowTransitions` off refuses every overlap — used by nudge and duplicate. */
+  moveClipsTo: (moves: ClipMove[], commit: boolean, allowTransitions?: boolean) => boolean;
+  trimClipTo: (id: string, edge: 'left' | 'right', timelineTime: number) => void;
+  nudgeSelected: (frames: number) => void;
+  removeSelected: (ripple?: boolean) => void;
+  duplicateSelected: () => void;
+  splitSelectedAtPlayhead: () => void;
+  canSplitAtPlayhead: () => boolean;
+  setTrimPreview: (clipId: string, sourceTime: number) => void;
+  clearTrimPreview: () => void;
 }
+
+type Store = EditorState & EditorActions;
 
 async function createAssetFromFile(file: File, kind: AssetType): Promise<MediaAsset> {
   const probe = await probeMediaFile(file, kind);
@@ -107,71 +379,341 @@ async function createAssetFromFile(file: File, kind: AssetType): Promise<MediaAs
   };
 }
 
-export const useEditorStore = create<EditorState & EditorActions>((set, get) => ({
-  ...initialState,
+function assetDurationFor(clip: Clip, mediaLibrary: Record<string, MediaAsset>): number {
+  // Text, stills and adjustments have no source, so they can be stretched freely.
+  if (!('assetId' in clip)) return Infinity;
+  const asset = mediaLibrary[clip.assetId];
+  return asset?.duration ?? clip.sourceTrimOut;
+}
 
-  getProjectDuration: () => computeDuration(get().clips),
+/** Rewrites one clip's effect chain, leaving the array identity alone when nothing changed. */
+function mapEffects(
+  clips: Clip[],
+  clipId: string,
+  update: (effects: EffectInstance[]) => EffectInstance[],
+): Clip[] {
+  return clips.map((c) => {
+    if (c.id !== clipId) return c;
+    const next = update(c.effects ?? []);
+    return next === c.effects ? c : { ...c, effects: next };
+  });
+}
 
-  addAudioTrack: () => {
-    set((state) => {
-      const n = state.tracks.filter((t) => t.kind === 'audio').length + 1;
-      return {
-        tracks: [
-          ...state.tracks,
-          {
-            id: uid('track'),
-            kind: 'audio' as const,
-            label: `Audio ${n}`,
-            volume: DEFAULT_TRACK_VOLUME,
-          },
-        ],
-      };
-    });
-  },
+function clipAcceptsTrack(clip: Clip, track: Track | undefined): boolean {
+  if (!track) return false;
+  return clip.kind === 'audio' ? track.kind === 'audio' : track.kind === 'video';
+}
 
-  addOverlayTrack: () => {
-    set((state) => {
-      const n = state.tracks.filter((t) => t.kind === 'overlay').length + 1;
-      return {
-        tracks: [
-          ...state.tracks,
-          { id: uid('track'), kind: 'overlay' as const, label: `Overlay ${n}` },
-        ],
-      };
-    });
-  },
+export const useEditorStore = create<Store>((set, get) => {
+  /** Interaction in progress: intermediate mutations don't push history. */
+  let interaction: { label: string; doc: EditorDoc } | null = null;
+  let lastCoalesce: { label: string; at: number } | null = null;
 
-  setTrackVolume: (trackId, volume) => {
-    const clamped = clampTrackVolume(volume);
-    set((state) => ({
-      tracks: state.tracks.map((t) =>
-        t.id === trackId && t.kind === 'audio' ? { ...t, volume: clamped } : t,
-      ),
-    }));
-  },
+  /** Push an undo entry, then apply. Coalesces repeats of the same label within 500ms. */
+  function commit(label: string, updater: (state: Store) => Partial<EditorState>, coalesce = false): void {
+    const state = get();
+    const before = docSnapshot(state);
+    let patch = updater(state);
+    const after = { ...before, ...patch } as EditorDoc;
+    if (docEquals(before, after)) {
+      set(patch as Partial<Store>);
+      return;
+    }
 
-  setResolution: (resolution) =>
-    set((s) => ({ settings: { ...s.settings, resolution } as ProjectSettings })),
+    if (interaction) {
+      set(patch as Partial<Store>);
+      return;
+    }
 
-  setPlayhead: (t) => set({ playhead: Math.max(0, Math.min(t, get().getProjectDuration())) }),
-  setPlaying: (isPlaying) => set({ isPlaying }),
-  setTimelineZoom: (timelineZoom) => set({ timelineZoom: Math.max(20, Math.min(400, timelineZoom)) }),
-  selectClip: (selectedClipId) => set({ selectedClipId }),
-  setFfmpegStatus: (ffmpegStatus, ffmpegError = null) => set({ ffmpegStatus, ffmpegError }),
-  setExportProgress: (exportProgress) => set({ exportProgress }),
-  setLibraryNotice: (libraryNotice) => set({ libraryNotice }),
+    // Every finished edit passes through here, so this is the one place the rule is needed
+    // for them — drags are caught in `endInteraction` instead, once they settle.
+    const moved = playheadInRange(after.clips, state.playhead);
+    if (moved !== null) patch = { ...patch, playhead: moved };
 
-  importUrlsToLibrary: async (urls) => {
-    if (urls.length === 0) return;
+    const now = performance.now();
+    const shouldCoalesce =
+      coalesce && lastCoalesce?.label === label && now - lastCoalesce.at < 500;
+    lastCoalesce = coalesce ? { label, at: now } : null;
 
-    set({ libraryNotice: `Importing ${urls.length} file(s) from URL…` });
-    let imported = 0;
-    const errors: string[] = [];
+    set({
+      ...(patch as Partial<Store>),
+      ...(shouldCoalesce ? {} : { past: pushEntry(state.past, { label, doc: before }) }),
+      future: [],
+    } as Partial<Store>);
+  }
 
-    for (const url of urls) {
-      try {
-        const file = await fetchUrlAsFile(url);
-        const kind = inferAssetKind(file.name, file.type);
+  function contentHeight(tracks: Track[]): number {
+    return tracks.reduce((sum, t) => sum + t.height, 0);
+  }
+
+  function clampScroll(state: EditorState, x: number, y: number): { scrollX: number; scrollY: number } {
+    const maxX = Math.max(0, computeSpan(state.clips) * state.pxPerSec - state.viewportWidth);
+    const maxY = Math.max(0, contentHeight(state.tracks) - state.viewportHeight);
+    return {
+      scrollX: Math.min(maxX, Math.max(0, x)),
+      scrollY: Math.min(maxY, Math.max(0, y)),
+    };
+  }
+
+  return {
+    ...initialState,
+
+    getProjectDuration: () => computeDuration(get().clips),
+    getTimelineSpan: () => computeSpan(get().clips),
+    getContentHeight: () => contentHeight(get().tracks),
+
+    // ---------------------------------------------------------------- history
+
+    beginInteraction: (label) => {
+      if (interaction) return;
+      interaction = { label, doc: docSnapshot(get()) };
+    },
+
+    endInteraction: () => {
+      const pending = interaction;
+      interaction = null;
+      if (!pending) return;
+      const state = get();
+      if (docEquals(pending.doc, docSnapshot(state))) return;
+      lastCoalesce = null;
+      const moved = playheadInRange(state.clips, state.playhead);
+      set({
+        past: pushEntry(state.past, { label: pending.label, doc: pending.doc }),
+        future: [],
+        ...(moved !== null ? { playhead: moved } : {}),
+      });
+    },
+
+    undo: () => {
+      const state = get();
+      const entry = state.past[state.past.length - 1];
+      if (!entry) return;
+      interaction = null;
+      lastCoalesce = null;
+      const moved = playheadInRange(entry.doc.clips, state.playhead);
+      set({
+        ...entry.doc,
+        past: state.past.slice(0, -1),
+        future: [...state.future, { label: entry.label, doc: docSnapshot(state) }],
+        selectedClipIds: pruneSelection(state.selectedClipIds, entry.doc),
+        trimPreview: null,
+        libraryNotice: `Undid: ${entry.label}`,
+        ...(moved !== null ? { playhead: moved } : {}),
+      });
+    },
+
+    redo: () => {
+      const state = get();
+      const entry = state.future[state.future.length - 1];
+      if (!entry) return;
+      interaction = null;
+      lastCoalesce = null;
+      const moved = playheadInRange(entry.doc.clips, state.playhead);
+      set({
+        ...entry.doc,
+        future: state.future.slice(0, -1),
+        past: pushEntry(state.past, { label: entry.label, doc: docSnapshot(state) }),
+        selectedClipIds: pruneSelection(state.selectedClipIds, entry.doc),
+        trimPreview: null,
+        libraryNotice: `Redid: ${entry.label}`,
+        ...(moved !== null ? { playhead: moved } : {}),
+      });
+    },
+
+    undoLabel: () => get().past[get().past.length - 1]?.label ?? null,
+    redoLabel: () => get().future[get().future.length - 1]?.label ?? null,
+
+    // ---------------------------------------------------------------- session
+
+    setResolution: (resolution) =>
+      commit('Change resolution', (s) => ({
+        settings: { ...s.settings, resolution } as ProjectSettings,
+      })),
+
+    setPlayhead: (t) => {
+      const max = get().getProjectDuration();
+      set({ playhead: Math.max(0, Math.min(t, max)) });
+    },
+    setPlaying: (isPlaying) => set({ isPlaying }),
+    setFfmpegStatus: (ffmpegStatus, ffmpegError = null) => set({ ffmpegStatus, ffmpegError }),
+    setExportProgress: (exportProgress) => set({ exportProgress }),
+    setExportEngine: (exportEngine) => set({ exportEngine }),
+    setExportNotice: (exportNotice) => set({ exportNotice }),
+    setLibraryNotice: (libraryNotice) => set({ libraryNotice }),
+
+    // -------------------------------------------------------------- selection
+
+    selectClip: (id, additive = false) => {
+      if (id === null) {
+        set({ selectedClipIds: [] });
+        return;
+      }
+      set((s) => {
+        if (!additive) return { selectedClipIds: [id] };
+        return s.selectedClipIds.includes(id)
+          ? { selectedClipIds: s.selectedClipIds.filter((x) => x !== id) }
+          : { selectedClipIds: [...s.selectedClipIds, id] };
+      });
+    },
+
+    setSelection: (ids) => set({ selectedClipIds: ids }),
+    selectAll: () => set((s) => ({ selectedClipIds: s.clips.map((c) => c.id) })),
+
+    // --------------------------------------------------------------- viewport
+
+    setViewportSize: (viewportWidth, viewportHeight) =>
+      set((s) => {
+        const clamped = clampScroll({ ...s, viewportWidth, viewportHeight }, s.scrollX, s.scrollY);
+        return { viewportWidth, viewportHeight, ...clamped };
+      }),
+
+    setScroll: (x, y) => set((s) => clampScroll(s, x, y)),
+
+    setPxPerSec: (px) =>
+      set((s) => {
+        const pxPerSec = Math.min(MAX_PX_PER_SEC, Math.max(MIN_PX_PER_SEC, px));
+        return { pxPerSec, ...clampScroll({ ...s, pxPerSec }, s.scrollX, s.scrollY) };
+      }),
+
+    zoomAt: (factor, anchorX) =>
+      set((s) => {
+        const pxPerSec = Math.min(MAX_PX_PER_SEC, Math.max(MIN_PX_PER_SEC, s.pxPerSec * factor));
+        const anchorTime = (s.scrollX + anchorX) / s.pxPerSec;
+        const scrollX = anchorTime * pxPerSec - anchorX;
+        return { pxPerSec, ...clampScroll({ ...s, pxPerSec }, scrollX, s.scrollY) };
+      }),
+
+    zoomToFit: () =>
+      set((s) => {
+        const duration = Math.max(1, computeDuration(s.clips));
+        const pxPerSec = Math.min(
+          MAX_PX_PER_SEC,
+          Math.max(MIN_PX_PER_SEC, (s.viewportWidth - 24) / duration),
+        );
+        return { pxPerSec, ...clampScroll({ ...s, pxPerSec }, 0, s.scrollY) };
+      }),
+
+    zoomToSelection: () =>
+      set((s) => {
+        const selected = s.clips.filter((c) => s.selectedClipIds.includes(c.id));
+        if (selected.length === 0) return {};
+        const start = Math.min(...selected.map((c) => c.timelineStart));
+        const end = Math.max(...selected.map((c) => clipEnd(c)));
+        const span = Math.max(0.2, end - start);
+        const pxPerSec = Math.min(
+          MAX_PX_PER_SEC,
+          Math.max(MIN_PX_PER_SEC, (s.viewportWidth - 80) / span),
+        );
+        const scrollX = start * pxPerSec - 40;
+        return { pxPerSec, ...clampScroll({ ...s, pxPerSec }, scrollX, s.scrollY) };
+      }),
+
+    setFollowPlayhead: (followPlayhead) => set({ followPlayhead }),
+    toggleSnap: () => set((s) => ({ snapEnabled: !s.snapEnabled })),
+    setSnapIndicator: (snapIndicator) => set({ snapIndicator }),
+
+    // ----------------------------------------------------------------- tracks
+
+    addTrack: (kind) =>
+      commit(`Add ${kind} track`, (s) => ({
+        tracks: insertTrack(s.tracks, createTrack(kind, nextTrackLabel(s.tracks, kind))),
+      })),
+
+    removeTrack: (id) =>
+      commit('Delete track', (s) => {
+        const track = s.tracks.find((t) => t.id === id);
+        if (!track) return {};
+        const sameKind = s.tracks.filter((t) => t.kind === track.kind);
+        if (sameKind.length <= 1) return {};
+        return {
+          tracks: s.tracks.filter((t) => t.id !== id),
+          clips: s.clips.filter((c) => c.trackId !== id),
+        };
+      }),
+
+    renameTrack: (id, label) =>
+      commit('Rename track', (s) => ({
+        tracks: s.tracks.map((t) => (t.id === id ? { ...t, label: label.trim() || t.label } : t)),
+      })),
+
+    /** Reorders within the track's own kind group — video and audio never interleave. */
+    moveTrack: (id, direction) =>
+      commit('Reorder track', (s) => {
+        const track = s.tracks.find((t) => t.id === id);
+        if (!track) return {};
+        const group = track.kind === 'video' ? videoTracks(s.tracks) : audioTracks(s.tracks);
+        const index = group.findIndex((t) => t.id === id);
+        const target = index + direction;
+        if (index < 0 || target < 0 || target >= group.length) return {};
+
+        const reordered = [...group];
+        [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+        const others = s.tracks.filter((t) => t.kind !== track.kind);
+        return {
+          tracks: track.kind === 'video' ? [...reordered, ...others] : [...others, ...reordered],
+        };
+      }),
+
+    setTrackHeight: (id, height) =>
+      set((s) => ({
+        tracks: s.tracks.map((t) =>
+          t.id === id
+            ? { ...t, height: Math.min(MAX_TRACK_HEIGHT, Math.max(MIN_TRACK_HEIGHT, height)) }
+            : t,
+        ),
+      })),
+
+    toggleTrackFlag: (id, flag) =>
+      set((s) => ({
+        tracks: s.tracks.map((t) => (t.id === id ? { ...t, [flag]: !t[flag] } : t)),
+      })),
+
+    setTrackVolume: (trackId, volume) =>
+      set((s) => ({
+        tracks: s.tracks.map((t) =>
+          t.id === trackId && t.kind === 'audio' ? { ...t, volume: clampTrackVolume(volume) } : t,
+        ),
+      })),
+
+    // ------------------------------------------------------------------ media
+
+    importUrlsToLibrary: async (urls) => {
+      if (urls.length === 0) return;
+      set({ libraryNotice: `Importing ${urls.length} file(s) from URL…` });
+      let imported = 0;
+      const errors: string[] = [];
+
+      for (const url of urls) {
+        try {
+          const file = await fetchUrlAsFile(url);
+          const kind = inferAssetKind(file.name, file.type);
+          const asset = await createAssetFromFile(file, kind);
+          set((state) => ({
+            mediaLibrary: { ...state.mediaLibrary, [asset.id]: asset },
+            libraryOrder: state.libraryOrder.includes(asset.id)
+              ? state.libraryOrder
+              : [...state.libraryOrder, asset.id],
+          }));
+          imported += 1;
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          errors.push(msg);
+          console.warn('[MediaLibrary] URL import failed:', url, e);
+        }
+      }
+
+      if (imported === 0 && errors.length > 0) {
+        set({ libraryNotice: `URL import failed: ${errors[0]}` });
+      } else if (errors.length > 0) {
+        set({ libraryNotice: `Imported ${imported} file(s). ${errors.length} failed (see console).` });
+      } else {
+        set({ libraryNotice: `Imported ${imported} file(s) from URL.` });
+      }
+    },
+
+    importToLibrary: async (fileInput, kind) => {
+      const files = Array.from(fileInput instanceof FileList ? fileInput : fileInput);
+      for (const file of files) {
         const asset = await createAssetFromFile(file, kind);
         set((state) => ({
           mediaLibrary: { ...state.mediaLibrary, [asset.id]: asset },
@@ -179,273 +721,880 @@ export const useEditorStore = create<EditorState & EditorActions>((set, get) => 
             ? state.libraryOrder
             : [...state.libraryOrder, asset.id],
         }));
-        imported += 1;
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        errors.push(msg);
-        console.warn('[MediaLibrary] URL import failed:', url, e);
       }
-    }
+    },
 
-    if (imported === 0 && errors.length > 0) {
-      set({ libraryNotice: `URL import failed: ${errors[0]}` });
-    } else if (errors.length > 0) {
-      set({
-        libraryNotice: `Imported ${imported} file(s). ${errors.length} failed (see console).`,
-      });
-    } else {
-      set({ libraryNotice: `Imported ${imported} file(s) from URL.` });
-    }
-  },
+    importFiles: async (fileInput, kind) => {
+      const files = Array.from(fileInput instanceof FileList ? fileInput : fileInput);
+      for (const file of files) {
+        const asset = await createAssetFromFile(file, kind);
+        set((state) => ({
+          mediaLibrary: { ...state.mediaLibrary, [asset.id]: asset },
+          libraryOrder: state.libraryOrder.includes(asset.id)
+            ? state.libraryOrder
+            : [...state.libraryOrder, asset.id],
+        }));
+        get().addAssetToTimeline(asset.id);
+      }
+    },
 
-  importToLibrary: async (fileInput, kind) => {
-    const files = Array.from(fileInput instanceof FileList ? fileInput : fileInput);
-    for (const file of files) {
-      const asset = await createAssetFromFile(file, kind);
-      set((state) => ({
-        mediaLibrary: { ...state.mediaLibrary, [asset.id]: asset },
-        libraryOrder: [...state.libraryOrder, asset.id],
-      }));
-    }
-  },
-
-  importFiles: async (fileInput, kind) => {
-    const files = Array.from(fileInput instanceof FileList ? fileInput : fileInput);
-    for (const file of files) {
-      const asset = await createAssetFromFile(file, kind);
-      set((state) => ({
-        mediaLibrary: { ...state.mediaLibrary, [asset.id]: asset },
-        libraryOrder: state.libraryOrder.includes(asset.id)
-          ? state.libraryOrder
-          : [...state.libraryOrder, asset.id],
-      }));
-      get().addAssetToTimeline(asset.id);
-    }
-  },
-
-  addAssetToTimeline: (assetId) => {
-    const asset = get().mediaLibrary[assetId];
-    if (!asset) return;
-
-    set((state) => {
-      const placed = buildClipsForAsset(
-        asset,
-        assetId,
-        state.tracks,
-        state.clips,
-        state.playhead,
-      );
-      return {
-        tracks: placed.tracks,
-        clips: [...state.clips, ...placed.clips],
-        selectedClipId: placed.selectedClipId,
-      };
-    });
-  },
-
-  removeLibraryItem: (assetId) => {
-    const asset = get().mediaLibrary[assetId];
-    if (!asset) return;
-    if (isAssetInUse(assetId, get().clips)) return;
-
-    URL.revokeObjectURL(asset.blobUrl);
-    clearWaveformCache(assetId);
-    clearVideoThumbnailCache(assetId);
-    set((state) => {
-      const { [assetId]: _, ...mediaLibrary } = state.mediaLibrary;
-      return {
-        mediaLibrary,
-        libraryOrder: state.libraryOrder.filter((id) => id !== assetId),
-      };
-    });
-  },
-
-  addTextClip: (text, template) => {
-    set((state) => {
-      const textDuration = 3;
-      const lane = findLaneForPlacement(
-        state.tracks,
-        state.clips,
-        [],
-        'overlay',
-        state.playhead,
-        textDuration,
-      );
-      const clip: Clip = {
-        id: uid('clip'),
-        trackId: lane.trackId,
-        kind: 'text',
-        text,
-        template,
-        timelineStart: lane.start,
-        sourceTrimIn: 0,
-        sourceTrimOut: textDuration,
-        textFrame: DEFAULT_FULL_FRAME,
-      };
-      return {
-        tracks: lane.tracks,
-        clips: [...state.clips, clip],
-        selectedClipId: clip.id,
-      };
-    });
-  },
-
-  updateTextClip: (id, text, template, textFrame) => {
-    set((state) => ({
-      clips: state.clips.map((c) => {
-        if (c.id !== id || c.kind !== 'text') return c;
+    addAssetToTimeline: (assetId) => {
+      const asset = get().mediaLibrary[assetId];
+      if (!asset) return;
+      commit(`Add ${asset.name}`, (s) => {
+        const placed = buildClipsForAsset(
+          asset,
+          assetId,
+          s.tracks,
+          s.clips,
+          s.playhead,
+          s.settings.fps,
+        );
         return {
-          ...c,
+          tracks: placed.tracks,
+          clips: [...s.clips, ...placed.clips],
+          selectedClipIds: [placed.selectedClipId],
+        } as Partial<EditorState>;
+      });
+    },
+
+    /**
+     * A capture session arrives as up to three files that belong together. They enter the
+     * library like any import, but reach the timeline through their own placement so the
+     * measured start offsets survive — and as a single history entry, because undoing a
+     * recording one track at a time would be a strange thing to make someone do.
+     */
+    importRecordings: async (recordings) => {
+      const placements: { assetId: string; asset: MediaAsset; startOffset: number; lane: number }[] = [];
+
+      for (const recording of recordings) {
+        const kind: AssetType = recording.kind === 'screen' ? 'video' : 'audio';
+        const asset = await createAssetFromFile(recording.file, kind);
+        // Prefer the length the capture reported. `probeMediaFile` substitutes a flat 10s
+        // whenever a container says `Infinity`, which is exactly the state an unrepaired
+        // recording is in — so trusting the probe here would silently truncate a recording
+        // on the one path where repair failed.
+        const duration = recording.duration > 0 ? recording.duration : asset.duration;
+        const resolved: MediaAsset = { ...asset, duration };
+        set((state) => ({
+          mediaLibrary: { ...state.mediaLibrary, [resolved.id]: resolved },
+          libraryOrder: state.libraryOrder.includes(resolved.id)
+            ? state.libraryOrder
+            : [...state.libraryOrder, resolved.id],
+        }));
+        placements.push({
+          assetId: resolved.id,
+          asset: resolved,
+          startOffset: recording.startOffset,
+          lane: SOURCE_LANE[recording.kind],
+        });
+      }
+
+      if (placements.length === 0) return [];
+
+      commit('Add recording', (s) => {
+        const placed = buildRecordingClips(placements, s.tracks, s.clips, s.playhead, s.settings.fps);
+        return {
+          tracks: placed.tracks,
+          clips: [...s.clips, ...placed.clips],
+          selectedClipIds: placed.selectedClipId ? [placed.selectedClipId] : [],
+        } as Partial<EditorState>;
+      });
+
+      return placements.map((p) => p.assetId);
+    },
+
+    removeLibraryItem: (assetId) => {
+      const asset = get().mediaLibrary[assetId];
+      if (!asset) return;
+      if (isAssetInUse(assetId, get().clips)) return;
+
+      URL.revokeObjectURL(asset.blobUrl);
+      clearWaveformCache(assetId);
+      clearVideoThumbnailCache(assetId);
+      set((state) => {
+        const { [assetId]: _removed, ...mediaLibrary } = state.mediaLibrary;
+        return {
+          mediaLibrary,
+          libraryOrder: state.libraryOrder.filter((id) => id !== assetId),
+        };
+      });
+    },
+
+    // ------------------------------------------------------------------ clips
+
+    addTextClip: (text, template) =>
+      commit('Add text', (s) => {
+        const lane = findLaneForPlacement(
+          s.tracks,
+          s.clips,
+          'video',
+          s.playhead,
+          TEXT_CLIP_DURATION,
+          s.settings.fps,
+          true,
+        );
+        const clip: Clip = {
+          id: uid('clip'),
+          trackId: lane.trackId,
+          kind: 'text',
           text,
           template,
-          ...(textFrame !== undefined ? { textFrame } : {}),
+          timelineStart: lane.start,
+          sourceTrimIn: 0,
+          sourceTrimOut: TEXT_CLIP_DURATION,
+          textFrame: DEFAULT_FULL_FRAME,
+        };
+        return {
+          tracks: lane.tracks,
+          clips: [...s.clips, clip],
+          selectedClipIds: [clip.id],
+        } as Partial<EditorState>;
+      }),
+
+    updateTextClip: (id, text, template, textFrame) =>
+      commit(
+        'Edit text',
+        (s) => ({
+          clips: s.clips.map((c) => {
+            if (c.id !== id || c.kind !== 'text') return c;
+            return { ...c, text, template, ...(textFrame !== undefined ? { textFrame } : {}) };
+          }),
+        }),
+        true,
+      ),
+
+    updateClipTransform: (id, transform) => {
+      const state = get();
+      const clip = state.clips.find((c) => c.id === id);
+      const armed =
+        !!transform &&
+        !!clip &&
+        TRANSFORM_CHANNELS.some((ch) => (clip.transformKeyframes?.[ch]?.length ?? 0) > 0);
+
+      if (armed && clip) {
+        // With placement armed, moving the box writes the whole rectangle as one set of
+        // keys at the playhead — that is what makes a picture-in-picture travel.
+        const at = quantizeToFrame(
+          Math.max(0, state.playhead - clip.timelineStart),
+          state.settings.fps,
+        );
+        commit(
+          'Set placement keyframe',
+          (s) => ({
+            clips: s.clips.map((c) => {
+              if (c.id !== id) return c;
+              let next = c;
+              for (const channel of TRANSFORM_CHANNELS) {
+                const [group, axis] = channel.split('.') as [
+                  'crop' | 'frame',
+                  'x' | 'y' | 'w' | 'h',
+                ];
+                const value = transform[group][axis];
+                next = withChannel(next, { effectId: null, param: channel }, (keys) =>
+                  upsertKey(keys, at, value),
+                );
+              }
+              return next;
+            }),
+          }),
+          true,
+        );
+        return;
+      }
+
+      commit(
+        transform ? 'Change placement' : 'Reset to full frame',
+        (s) => ({
+          clips: s.clips.map((c) => {
+            if (c.id !== id) return c;
+            if (c.kind !== 'video' && c.kind !== 'image') return c;
+            // Dropping the transform drops any animation of it with it.
+            return transform ? { ...c, transform } : { ...c, transform, transformKeyframes: undefined };
+          }),
+        }),
+        true,
+      );
+    },
+
+    updateVideoFlags: (id, flags) =>
+      commit('Change clip', (s) => ({
+        clips: s.clips.map((c) => (c.id === id && c.kind === 'video' ? { ...c, ...flags } : c)),
+      })),
+
+    setClipGain: (id, gain) =>
+      commit(
+        'Change volume',
+        (s) => ({
+          clips: s.clips.map((c) => {
+            if (c.id !== id) return c;
+            if (c.kind !== 'video' && c.kind !== 'audio') return c;
+            return { ...c, gain: clampTrackVolume(gain) };
+          }),
+        }),
+        true,
+      ),
+
+    // ------------------------------------------------------ effects and fades
+
+    addEffect: (target, type) =>
+      commit(`Add ${EFFECTS[type].label}`, (s) =>
+        applyEffects(s, target, (effects) => [
+          ...effects,
+          { id: uid('fx'), type, enabled: true, params: defaultParams(type) },
+        ]),
+      ),
+
+    removeEffect: (target, effectId) =>
+      commit('Remove effect', (s) =>
+        applyEffects(s, target, (effects) => effects.filter((e) => e.id !== effectId)),
+      ),
+
+    /** Chain order is render order, so this is a real edit, not a display preference. */
+    moveEffect: (target, effectId, direction) =>
+      commit('Reorder effects', (s) =>
+        applyEffects(s, target, (effects) => {
+          const index = effects.findIndex((e) => e.id === effectId);
+          const swap = index + direction;
+          if (index < 0 || swap < 0 || swap >= effects.length) return effects;
+          const next = [...effects];
+          [next[index], next[swap]] = [next[swap], next[index]];
+          return next;
+        }),
+      ),
+
+    toggleEffect: (target, effectId) =>
+      commit('Toggle effect', (s) =>
+        applyEffects(s, target, (effects) =>
+          effects.map((e) => (e.id === effectId ? { ...e, enabled: !e.enabled } : e)),
+        ),
+      ),
+
+    /**
+     * Writes a keyframe at the playhead when the parameter is armed, otherwise sets the
+     * scalar. Same control, two meanings — which is how every editor does it.
+     */
+    setEffectParam: (target, effectId, param, value) => {
+      const state = get();
+      const ref = toTarget(target);
+      if (ref.kind === 'track') {
+        // Tracks have no time base, so a track effect's parameters are always scalars.
+        commit(
+          'Adjust effect',
+          (s) =>
+            applyEffects(s, target, (effects) =>
+              effects.map((e) =>
+                e.id === effectId ? { ...e, params: { ...e.params, [param]: value } } : e,
+              ),
+            ),
+          true,
+        );
+        return;
+      }
+      const clipId = ref.id;
+      const clip = state.clips.find((c) => c.id === clipId);
+      const armed = clip ? (channelKeys(clip, { effectId, param })?.length ?? 0) > 0 : false;
+
+      if (armed) {
+        const at = quantizeToFrame(
+          Math.max(0, state.playhead - (clip?.timelineStart ?? 0)),
+          state.settings.fps,
+        );
+        commit(
+          'Set keyframe',
+          (s) => ({
+            clips: s.clips.map((c) =>
+              c.id === clipId
+                ? withChannel(c, { effectId, param }, (keys) => upsertKey(keys, at, value))
+                : c,
+            ),
+          }),
+          true,
+        );
+        return;
+      }
+
+      commit(
+        'Adjust effect',
+        (s) => ({
+          clips: mapEffects(s.clips, clipId, (effects) =>
+            effects.map((e) =>
+              e.id === effectId ? { ...e, params: { ...e.params, [param]: value } } : e,
+            ),
+          ),
+        }),
+        true,
+      );
+    },
+
+    setTransitionType: (clipId, type) =>
+      commit('Change transition', (s) => ({
+        clips: s.clips.map((c) => (c.id === clipId ? { ...c, transitionIn: type } : c)),
+      })),
+
+    addAdjustmentClip: () =>
+      commit('Add adjustment', (s) => {
+        // Placed top-down like text: an adjustment grades what is *below* it, so the
+        // topmost free lane is the useful default.
+        const lane = findLaneForPlacement(
+          s.tracks,
+          s.clips,
+          'video',
+          s.playhead,
+          ADJUSTMENT_CLIP_DURATION,
+          s.settings.fps,
+          true,
+        );
+        const clip: Clip = {
+          id: uid('clip'),
+          trackId: lane.trackId,
+          kind: 'adjustment',
+          timelineStart: lane.start,
+          sourceTrimIn: 0,
+          sourceTrimOut: ADJUSTMENT_CLIP_DURATION,
+          effects: [{ id: uid('fx'), type: 'eq', enabled: true, params: defaultParams('eq') }],
+        };
+        return {
+          tracks: lane.tracks,
+          clips: [...s.clips, clip],
+          selectedClipIds: [clip.id],
+        } as Partial<EditorState>;
+      }),
+
+    resetEffect: (target, effectId) =>
+      commit('Reset effect', (s) =>
+        applyEffects(s, target, (effects) =>
+          effects.map((e) =>
+            e.id === effectId
+              ? { ...e, params: { ...regionOnly(e.params), ...defaultParams(e.type) } }
+              : e,
+          ),
+        ),
+      ),
+
+    setClipFade: (clipId, edge, seconds) =>
+      commit(
+        edge === 'in' ? 'Fade in' : 'Fade out',
+        (s) => ({
+          clips: s.clips.map((c) => {
+            if (c.id !== clipId) return c;
+            const value = quantizeToFrame(clampFade(c, edge, seconds), s.settings.fps);
+            return edge === 'in' ? { ...c, fadeIn: value } : { ...c, fadeOut: value };
+          }),
+        }),
+        true,
+      ),
+
+    setRegionMode: (target, effectId, mode) =>
+      commit(mode > 0 ? 'Add mask region' : 'Remove mask region', (s) =>
+        applyEffects(s, target, (effects) =>
+          effects.map((e) => {
+            if (e.id !== effectId) return e;
+            if (mode <= 0) {
+              const { [REGION_MODE]: _mode, ...rest } = e.params;
+              return { ...e, params: rest };
+            }
+            // Turning a region on seeds a visible default box rather than a zero-size
+            // one the user would have to hunt for.
+            return { ...e, params: { ...DEFAULT_REGION, ...e.params, [REGION_MODE]: mode } };
+          }),
+        ),
+      ),
+
+    setRegionRect: (targetRef, effectId, rect) => {
+      const state = get();
+      const target = toTarget(targetRef);
+      const clipId = target.id;
+      const clip = target.kind === 'clip' ? state.clips.find((c) => c.id === clipId) : undefined;
+      const armed =
+        !!clip &&
+        REGION_CHANNELS.some(
+          (ch) => (channelKeys(clip, { effectId, param: ch })?.length ?? 0) > 0,
+        );
+      const values: Record<string, number> = {
+        'region.x': rect.x,
+        'region.y': rect.y,
+        'region.w': rect.w,
+        'region.h': rect.h,
+      };
+
+      if (armed && clip) {
+        // Scrub, drag, scrub, drag — the workflow the moving-licence-plate case needs.
+        const at = quantizeToFrame(
+          Math.max(0, state.playhead - clip.timelineStart),
+          state.settings.fps,
+        );
+        commit(
+          'Set region keyframe',
+          (s) => ({
+            clips: s.clips.map((c) => {
+              if (c.id !== clipId) return c;
+              let next = c;
+              for (const channel of REGION_CHANNELS) {
+                next = withChannel(next, { effectId, param: channel }, (keys) =>
+                  upsertKey(keys, at, values[channel]),
+                );
+              }
+              return next;
+            }),
+          }),
+          true,
+        );
+        return;
+      }
+
+      commit(
+        'Move mask region',
+        (s) =>
+          applyEffects(s, targetRef, (effects) =>
+            effects.map((e) =>
+              e.id === effectId ? { ...e, params: { ...e.params, ...values } } : e,
+            ),
+          ),
+        true,
+      );
+    },
+
+    addRegionEffect: (target, type) =>
+      commit(`Add ${EFFECTS[type].label} region`, (s) =>
+        applyEffects(s, target, (effects) => [
+          ...effects,
+          {
+            id: uid('fx'),
+            type,
+            enabled: true,
+            params: { ...defaultParams(type), ...DEFAULT_REGION },
+          },
+        ]),
+      ),
+
+    // -------------------------------------------------------------- keyframes
+
+    isChannelArmed: (clipId, ref) => {
+      const clip = get().clips.find((c) => c.id === clipId);
+      return clip ? (channelKeys(clip, ref)?.length ?? 0) > 0 : false;
+    },
+
+    /**
+     * Arming drops a key at the playhead holding the current value, so the parameter
+     * keeps its look until a second key is made. Disarming discards the animation and
+     * freezes the value the playhead is currently showing.
+     */
+    toggleChannelArmed: (clipId, ref) =>
+      commit('Toggle keyframing', (s) => {
+        const clip = s.clips.find((c) => c.id === clipId);
+        if (!clip) return {};
+        const rel = quantizeToFrame(Math.max(0, s.playhead - clip.timelineStart), s.settings.fps);
+        const keys = channelKeys(clip, ref);
+
+        if (keys && keys.length > 0) {
+          const frozen = evaluateChannel(keys, rel, 0);
+          const cleared = withChannel(clip, ref, () => undefined);
+          return {
+            clips: s.clips.map((c) => (c.id === clipId ? freezeChannel(cleared, ref, frozen) : c)),
+          };
+        }
+
+        const current = currentChannelValue(clip, ref);
+        if (current === null) return {};
+        return {
+          clips: s.clips.map((c) =>
+            c.id === clipId ? withChannel(c, ref, (k) => upsertKey(k, rel, current)) : c,
+          ),
         };
       }),
-    }));
-  },
 
-  updateImageTransform: (id, overlayTransform) => {
-    set((state) => ({
-      clips: state.clips.map((c) =>
-        c.id === id && c.kind === 'image' ? { ...c, overlayTransform } : c,
-      ),
-    }));
-  },
-
-  removeSelectedClip: () => {
-    const id = get().selectedClipId;
-    if (!id) return;
-    set((state) => ({
-      clips: state.clips.filter((c) => c.id !== id),
-      selectedClipId: null,
-    }));
-  },
-
-  duplicateSelectedClip: () => {
-    const id = get().selectedClipId;
-    if (!id) return;
-    const clip = get().clips.find((c) => c.id === id);
-    if (!clip) return;
-    const copy: Clip = {
-      ...clip,
-      id: uid('clip'),
-      timelineStart: snapTime(get().playhead + 0.1),
-    };
-    set((state) => ({
-      clips: [...state.clips, copy],
-      selectedClipId: copy.id,
-    }));
-  },
-
-  canSplitAtPlayhead: () => {
-    const { selectedClipId, playhead, clips } = get();
-    if (!selectedClipId) return false;
-    const clip = clips.find((c) => c.id === selectedClipId);
-    if (!clip) return false;
-    const rel = playhead - clip.timelineStart;
-    const dur = clipDuration(clip);
-    return rel > MIN_CLIP_DURATION && rel < dur - MIN_CLIP_DURATION;
-  },
-
-  splitSelectedAtPlayhead: () => {
-    if (!get().canSplitAtPlayhead()) return;
-    const { selectedClipId, playhead, clips } = get();
-    const clip = clips.find((c) => c.id === selectedClipId);
-    if (!clip) return;
-    const rel = playhead - clip.timelineStart;
-
-    const left: Clip = {
-      ...clip,
-      sourceTrimOut: clip.sourceTrimIn + rel,
-    };
-    const right: Clip = {
-      ...clip,
-      id: uid('clip'),
-      timelineStart: clip.timelineStart + rel,
-      sourceTrimIn: clip.sourceTrimIn + rel,
-    };
-
-    set((state) => ({
-      clips: state.clips.map((c) => (c.id === clip.id ? left : c)).concat(right),
-      selectedClipId: right.id,
-    }));
-  },
-
-  moveClip: (id, timelineStart) => {
-    set((state) => ({
-      clips: state.clips.map((c) =>
-        c.id === id ? { ...c, timelineStart: snapTime(Math.max(0, timelineStart)) } : c,
-      ),
-    }));
-  },
-
-  trimClip: (id, edge, timelineDelta) => {
-    set((state) => {
-      let playhead = state.playhead;
-      const clips = state.clips.map((c) => {
-        if (c.id !== id) return c;
-        if (edge === 'left') {
-          const delta = timelineDelta;
-          const newTrimIn = Math.min(
-            c.sourceTrimOut - MIN_CLIP_DURATION,
-            Math.max(0, c.sourceTrimIn + delta),
-          );
-          const actual = newTrimIn - c.sourceTrimIn;
-          const updated = {
-            ...c,
-            timelineStart: c.timelineStart + actual,
-            sourceTrimIn: newTrimIn,
-          };
-          if (state.selectedClipId === id) {
-            playhead = updated.timelineStart;
-          }
-          return updated;
-        }
-        const newTrimOut = Math.max(
-          c.sourceTrimIn + MIN_CLIP_DURATION,
-          Math.min(
-            c.sourceTrimOut + timelineDelta,
-            getMaxSourceOut(c, state.mediaLibrary),
-          ),
+    moveKeyframe: (clipId, ref, from, to) =>
+      commit('Move keyframe', (s) => {
+        const clip = s.clips.find((c) => c.id === clipId);
+        if (!clip) return {};
+        // Keys snap to frames and stay inside the clip, like every other timeline edit.
+        const target = Math.min(
+          clipDuration(clip),
+          Math.max(0, quantizeToFrame(to, s.settings.fps)),
         );
-        return { ...c, sourceTrimOut: newTrimOut };
-      });
-      return { clips, playhead };
-    });
-  },
-
-  setTrimPreview: (clipId, sourceTime) => set({ trimPreview: { clipId, sourceTime } }),
-
-  clearTrimPreview: () =>
-    set((state) => {
-      let playhead = state.playhead;
-      const clip = state.clips.find((c) => c.id === state.selectedClipId);
-      if (clip) {
-        const start = clip.timelineStart;
-        const end = clipEnd(clip);
-        if (playhead > end) playhead = end;
-        else if (playhead < start) playhead = start;
-      }
-      return { trimPreview: null, playhead };
-    }),
-
-  updateVideoFlags: (id, flags) => {
-    set((state) => ({
-      clips: state.clips.map((c) => {
-        if (c.id !== id || c.kind !== 'video') return c;
-        const next = { ...c, ...flags };
-        if (flags.overlayMode && !next.overlayTransform) {
-          next.overlayTransform = DEFAULT_OVERLAY_TRANSFORM;
-        }
-        return next;
+        return {
+          clips: s.clips.map((c) =>
+            c.id === clipId ? withChannel(c, ref, (k) => moveKey(k, from, target)) : c,
+          ),
+        };
       }),
-    }));
-  },
-}));
 
-function getMaxSourceOut(clip: Clip, mediaLibrary: Record<string, MediaAsset>): number {
-  if (clip.kind === 'text') return clip.sourceTrimOut;
-  if (clip.kind === 'image') return clip.sourceTrimOut;
-  const asset = mediaLibrary[clip.assetId];
-  return asset?.duration ?? clip.sourceTrimOut;
-}
+    removeKeyframe: (clipId, ref, t) =>
+      commit('Delete keyframe', (s) => ({
+        clips: s.clips.map((c) => {
+          if (c.id !== clipId) return c;
+          return withChannel(c, ref, (keys) => {
+            const next = removeKeyAt(keys, t);
+            return next.length > 0 ? next : undefined;
+          });
+        }),
+      })),
+
+    setKeyframeInterp: (clipId, ref, t, interp) =>
+      commit('Change interpolation', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId ? withChannel(c, ref, (k) => setKeyInterp(k, t, interp)) : c,
+        ),
+      })),
+
+    jumpToKeyframe: (direction) => {
+      const state = get();
+      const clip = state.clips.find((c) => state.selectedClipIds.includes(c.id));
+      if (!clip) return;
+      const times = channelTimes([
+        clip.transformKeyframes,
+        ...(clip.effects ?? []).map((e) => e.keyframes),
+      ]).map((t) => t + clip.timelineStart);
+      if (times.length === 0) return;
+
+      const epsilon = 1 / (state.settings.fps * 4);
+      const next =
+        direction > 0
+          ? times.find((t) => t > state.playhead + epsilon)
+          : [...times].reverse().find((t) => t < state.playhead - epsilon);
+      if (next !== undefined) get().setPlayhead(next);
+    },
+
+    /** Splits a video clip's audio onto an audio lane; the two are independent afterwards. */
+    detachAudio: (id) =>
+      commit('Detach audio', (s) => {
+        const clip = s.clips.find((c) => c.id === id);
+        if (!clip || clip.kind !== 'video' || !clip.hasAudio || !clip.audioEnabled) return {};
+
+        const lane = findLaneForPlacement(
+          s.tracks,
+          s.clips,
+          'audio',
+          clip.timelineStart,
+          clipDuration(clip),
+          s.settings.fps,
+        );
+        const audioClip: AudioClip = {
+          id: uid('clip'),
+          trackId: lane.trackId,
+          timelineStart: clip.timelineStart,
+          sourceTrimIn: clip.sourceTrimIn,
+          sourceTrimOut: clip.sourceTrimOut,
+          kind: 'audio',
+          assetId: clip.assetId,
+          gain: clip.gain,
+        };
+        return {
+          tracks: lane.tracks,
+          clips: s.clips
+            .map((c) => (c.id === id && c.kind === 'video' ? { ...c, audioEnabled: false } : c))
+            .concat(audioClip),
+          selectedClipIds: [audioClip.id],
+        } as Partial<EditorState>;
+      }),
+
+    /**
+     * Atomic, validated placement. Rejects overlaps, locked tracks and
+     * kind mismatches so a drag can never corrupt the timeline.
+     */
+    moveClipsTo: (moves, commitToHistory, allowTransitions = true) => {
+      const state = get();
+      if (moves.length === 0) return false;
+
+      const movingIds = new Set(moves.map((m) => m.id));
+      const byId = new Map(state.clips.map((c) => [c.id, c]));
+      const trackById = new Map(state.tracks.map((t) => [t.id, t]));
+
+      for (const move of moves) {
+        const clip = byId.get(move.id);
+        const track = trackById.get(move.trackId);
+        if (!clip || !track || track.locked) return false;
+        if (!clipAcceptsTrack(clip, track)) return false;
+        if (move.timelineStart < 0) return false;
+
+        const sourceTrack = trackById.get(clip.trackId);
+        if (sourceTrack?.locked) return false;
+
+        const duration = clipDuration(clip);
+        const end = move.timelineStart + duration;
+        const proposed: Clip = { ...clip, trackId: move.trackId, timelineStart: move.timelineStart };
+
+        // Overlap is still refused, with one exception: a *single* neighbour overlapping
+        // by less than either clip's length. That overlap is the cross-dissolve — the
+        // transition has no separate existence, so this is the only rule it needs.
+        let overlaps = 0;
+        for (const other of state.clips) {
+          if (movingIds.has(other.id)) continue;
+          if (other.trackId !== move.trackId) continue;
+          if (!rangesOverlap(move.timelineStart, end, other.timelineStart, clipEnd(other))) {
+            continue;
+          }
+          if (!allowTransitions || !overlapIsTransition(proposed, other)) return false;
+          overlaps += 1;
+          if (overlaps > 1) return false;
+        }
+        for (const peer of moves) {
+          if (peer.id === move.id || peer.trackId !== move.trackId) continue;
+          const peerClip = byId.get(peer.id);
+          if (!peerClip) continue;
+          if (
+            rangesOverlap(
+              move.timelineStart,
+              end,
+              peer.timelineStart,
+              peer.timelineStart + clipDuration(peerClip),
+            )
+          ) {
+            return false;
+          }
+        }
+      }
+
+      const moveById = new Map(moves.map((m) => [m.id, m]));
+      const apply = (s: Store): Partial<EditorState> => ({
+        clips: s.clips.map((c) => {
+          const move = moveById.get(c.id);
+          if (!move) return c;
+          return {
+            ...c,
+            trackId: move.trackId,
+            timelineStart: quantizeToFrame(move.timelineStart, s.settings.fps),
+          };
+        }),
+      });
+
+      if (commitToHistory) commit('Move clip', apply);
+      else set(apply(state) as Partial<Store>);
+      return true;
+    },
+
+    /** Absolute trim: `timelineTime` is where the edge should land. */
+    trimClipTo: (id, edge, timelineTime) => {
+      const state = get();
+      const clip = state.clips.find((c) => c.id === id);
+      if (!clip) return;
+      const track = state.tracks.find((t) => t.id === clip.trackId);
+      if (track?.locked) return;
+
+      const fps = state.settings.fps;
+      const maxSource = assetDurationFor(clip, state.mediaLibrary);
+      const neighbours = state.clips.filter((c) => c.trackId === clip.trackId && c.id !== clip.id);
+
+      let next: Clip;
+      if (edge === 'left') {
+        const leftBound = neighbours
+          .filter((c) => clipEnd(c) <= clip.timelineStart + 1e-6)
+          .reduce((max, c) => Math.max(max, clipEnd(c)), 0);
+        // Can't pull in earlier than the source has material for.
+        const earliest = Math.max(leftBound, clip.timelineStart - clip.sourceTrimIn);
+        const latest = clipEnd(clip) - MIN_CLIP_DURATION;
+        const start = quantizeToFrame(Math.min(latest, Math.max(earliest, timelineTime)), fps);
+        const delta = start - clip.timelineStart;
+        next = {
+          ...clip,
+          timelineStart: start,
+          sourceTrimIn: quantizeToFrame(clip.sourceTrimIn + delta, fps),
+        };
+      } else {
+        const rightBound = neighbours
+          .filter((c) => c.timelineStart >= clipEnd(clip) - 1e-6)
+          .reduce((min, c) => Math.min(min, c.timelineStart), Infinity);
+        const sourceLimit =
+          maxSource === Infinity
+            ? Infinity
+            : clip.timelineStart + (maxSource - clip.sourceTrimIn);
+        const latest = Math.min(rightBound, sourceLimit);
+        const earliest = clip.timelineStart + MIN_CLIP_DURATION;
+        const end = quantizeToFrame(Math.min(latest, Math.max(earliest, timelineTime)), fps);
+        next = {
+          ...clip,
+          sourceTrimOut: quantizeToFrame(clip.sourceTrimIn + (end - clip.timelineStart), fps),
+        };
+      }
+
+      commit('Trim clip', (s) => ({
+        clips: s.clips.map((c) => (c.id === id ? next : c)),
+      }));
+    },
+
+    nudgeSelected: (frames) => {
+      const state = get();
+      if (state.selectedClipIds.length === 0) return;
+      const delta = frames / state.settings.fps;
+      const moves: ClipMove[] = [];
+      for (const id of state.selectedClipIds) {
+        const clip = state.clips.find((c) => c.id === id);
+        if (!clip) continue;
+        moves.push({
+          id,
+          trackId: clip.trackId,
+          timelineStart: Math.max(0, clip.timelineStart + delta),
+        });
+      }
+      const movingIds = new Set(moves.map((m) => m.id));
+      const byId = new Map(state.clips.map((c) => [c.id, c]));
+      const blocked = moves.some((move) =>
+        state.clips.some((other) => {
+          if (movingIds.has(other.id) || other.trackId !== move.trackId) return false;
+          const clip = byId.get(move.id)!;
+          return rangesOverlap(
+            move.timelineStart,
+            move.timelineStart + clipDuration(clip),
+            other.timelineStart,
+            clipEnd(other),
+          );
+        }),
+      );
+      if (blocked) return;
+
+      const moveById = new Map(moves.map((m) => [m.id, m]));
+      commit(
+        'Nudge clip',
+        (s) => ({
+          clips: s.clips.map((c) => {
+            const move = moveById.get(c.id);
+            return move
+              ? { ...c, timelineStart: quantizeToFrame(move.timelineStart, s.settings.fps) }
+              : c;
+          }),
+        }),
+        true,
+      );
+    },
+
+    removeSelected: (ripple = false) => {
+      const ids = get().selectedClipIds;
+      if (ids.length === 0) return;
+
+      commit(ripple ? 'Ripple delete' : 'Delete clip', (s) => {
+        const removed = s.clips.filter((c) => ids.includes(c.id));
+        let clips = s.clips.filter((c) => !ids.includes(c.id));
+
+        if (ripple) {
+          const ordered = [...removed].sort((a, b) => a.timelineStart - b.timelineStart);
+          for (const gone of ordered) {
+            const gap = clipDuration(gone);
+            const from = gone.timelineStart;
+            clips = clips.map((c) =>
+              c.trackId === gone.trackId && c.timelineStart >= from - 1e-6
+                ? { ...c, timelineStart: Math.max(0, c.timelineStart - gap) }
+                : c,
+            );
+          }
+        }
+        return { clips, selectedClipIds: [] } as Partial<EditorState>;
+      });
+    },
+
+    duplicateSelected: () => {
+      const state = get();
+      if (state.selectedClipIds.length === 0) return;
+
+      commit('Duplicate clip', (s) => {
+        const copies: Clip[] = [];
+        let working = [...s.clips];
+
+        for (const id of s.selectedClipIds) {
+          const clip = working.find((c) => c.id === id);
+          if (!clip) continue;
+          const duration = clipDuration(clip);
+          // Land in the first free slot after the original, on its own track.
+          let start = clipEnd(clip);
+          let guard = 0;
+          while (trackHasOverlap(working, clip.trackId, start, duration) && guard < 500) {
+            const blocker = working
+              .filter((c) => c.trackId === clip.trackId && clipEnd(c) > start)
+              .sort((a, b) => a.timelineStart - b.timelineStart)[0];
+            if (!blocker) break;
+            start = clipEnd(blocker);
+            guard += 1;
+          }
+          const copy: Clip = {
+            ...clip,
+            id: uid('clip'),
+            timelineStart: quantizeToFrame(start, s.settings.fps),
+          };
+          copies.push(copy);
+          working = [...working, copy];
+        }
+
+        return {
+          clips: working,
+          selectedClipIds: copies.map((c) => c.id),
+        } as Partial<EditorState>;
+      });
+    },
+
+    canSplitAtPlayhead: () => {
+      const { selectedClipIds, playhead, clips } = get();
+      return clips.some((c) => {
+        if (!selectedClipIds.includes(c.id)) return false;
+        const rel = playhead - c.timelineStart;
+        return rel > MIN_CLIP_DURATION && rel < clipDuration(c) - MIN_CLIP_DURATION;
+      });
+    },
+
+    splitSelectedAtPlayhead: () => {
+      if (!get().canSplitAtPlayhead()) return;
+
+      commit('Split clip', (s) => {
+        const nextClips: Clip[] = [];
+        const selected: string[] = [];
+
+        for (const clip of s.clips) {
+          const rel = s.playhead - clip.timelineStart;
+          const splittable =
+            s.selectedClipIds.includes(clip.id) &&
+            rel > MIN_CLIP_DURATION &&
+            rel < clipDuration(clip) - MIN_CLIP_DURATION;
+
+          if (!splittable) {
+            nextClips.push(clip);
+            continue;
+          }
+
+          const cut = quantizeToFrame(rel, s.settings.fps);
+          // Keys are clip-relative, so the split has to divide them and rebase the
+          // right-hand set. Both halves get a key at the cut holding the interpolated
+          // value, so the pair renders the same curve the single clip did.
+          const transformParts = splitChannelMap(clip.transformKeyframes, cut);
+          const effectParts = (clip.effects ?? []).map((effect) => {
+            const parts = splitChannelMap(effect.keyframes, cut);
+            return {
+              left: { ...effect, keyframes: parts.left },
+              right: { ...effect, keyframes: parts.right },
+            };
+          });
+          // Fades belong to their own end of the cut.
+          const fadeIn = clip.fadeIn ?? 0;
+          const fadeOut = clip.fadeOut ?? 0;
+
+          const left: Clip = {
+            ...clip,
+            sourceTrimOut: clip.sourceTrimIn + cut,
+            transformKeyframes: transformParts.left,
+            effects: clip.effects ? effectParts.map((p) => p.left) : undefined,
+            fadeIn: Math.min(fadeIn, cut),
+            fadeOut: 0,
+          };
+          const right: Clip = {
+            ...clip,
+            id: uid('clip'),
+            timelineStart: clip.timelineStart + cut,
+            sourceTrimIn: clip.sourceTrimIn + cut,
+            transformKeyframes: transformParts.right,
+            effects: clip.effects ? effectParts.map((p) => p.right) : undefined,
+            fadeIn: 0,
+            fadeOut: Math.min(fadeOut, clipDuration(clip) - cut),
+          };
+          nextClips.push(left, right);
+          selected.push(right.id);
+        }
+
+        return {
+          clips: nextClips,
+          selectedClipIds: selected.length > 0 ? selected : s.selectedClipIds,
+        } as Partial<EditorState>;
+      });
+    },
+
+    setTrimPreview: (clipId, sourceTime) => set({ trimPreview: { clipId, sourceTime } }),
+    clearTrimPreview: () => set({ trimPreview: null }),
+  };
+});

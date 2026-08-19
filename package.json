@@ -13,6 +13,7 @@
     "@ffmpeg/core": "0.12.6",
     "@ffmpeg/ffmpeg": "0.12.15",
     "@ffmpeg/util": "0.12.2",
+    "mediabunny": "^1.51.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
     "zustand": "^5.0.13"

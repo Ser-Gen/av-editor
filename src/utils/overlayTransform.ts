@@ -7,33 +7,8 @@ export const DEFAULT_OVERLAY_TRANSFORM: OverlayTransform = {
 
 export const DEFAULT_FULL_FRAME: NormalizedRect = { x: 0, y: 0, w: 1, h: 1 };
 
-/** Letterbox frame for 16:9 canvas (resolution-independent normalized coords). */
-export function defaultLetterboxFrame(assetW: number, assetH: number): NormalizedRect {
-  const cw = 16;
-  const ch = 9;
-  const aw = Math.max(1, assetW);
-  const ah = Math.max(1, assetH);
-  const scale = Math.min(cw / aw, ch / ah);
-  const w = (aw * scale) / cw;
-  const h = (ah * scale) / ch;
-  return clampRect({ x: (1 - w) / 2, y: (1 - h) / 2, w, h });
-}
-
-export function defaultImageTransform(assetW: number, assetH: number): OverlayTransform {
-  return {
-    crop: { x: 0, y: 0, w: 1, h: 1 },
-    frame: defaultLetterboxFrame(assetW, assetH),
-  };
-}
-
-export function imageTransformForClip(
-  transform: OverlayTransform | undefined,
-  assetW: number,
-  assetH: number,
-): OverlayTransform {
-  if (transform) return normalizeOverlayTransform(transform);
-  return defaultImageTransform(assetW, assetH);
-}
+// Clips with no transform are fit-and-letterboxed by the renderer, so there is no
+// need to bake a default frame into the clip itself.
 
 export function textFrameForClip(frame?: NormalizedRect): NormalizedRect {
   return clampRect(frame ?? DEFAULT_FULL_FRAME);

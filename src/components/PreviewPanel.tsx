@@ -2,7 +2,45 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { PlaybackEngine } from '../preview/PlaybackEngine';
 import { captureCanvasAsPngFile, frameFileNameFromTime } from '../utils/captureFrame';
-import { formatTimecode } from '../utils/time';
+import { formatTimecode, parseTimecode } from '../utils/time';
+import { MaskOverlay } from './MaskOverlay';
+
+/** Editable MM:SS:FF — type a timecode and the playhead jumps there. */
+function TimecodeField({
+  playhead,
+  fps,
+  onSeek,
+}: {
+  playhead: number;
+  fps: number;
+  onSeek: (t: number) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+
+  return (
+    <input
+      className="transport-timecode"
+      value={draft ?? formatTimecode(playhead, fps)}
+      onChange={(e) => setDraft(e.target.value)}
+      onFocus={(e) => e.currentTarget.select()}
+      onBlur={() => {
+        if (draft !== null) {
+          const parsed = parseTimecode(draft, fps);
+          if (parsed !== null) onSeek(parsed);
+        }
+        setDraft(null);
+      }}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+        if (e.key === 'Escape') {
+          setDraft(null);
+          e.currentTarget.blur();
+        }
+      }}
+      title="Timecode MM:SS:FF — type to jump"
+    />
+  );
+}
 
 export function PreviewPanel() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -29,6 +67,10 @@ export function PreviewPanel() {
     if (!canvas) return;
     const engine = new PlaybackEngine(canvas);
     engineRef.current = engine;
+    if (import.meta.env.DEV) {
+      // Dev handle: lets a browser-driven check read the live audio graph.
+      (window as unknown as { __engine?: PlaybackEngine }).__engine = engine;
+    }
     engine.setCallbacks(
       (t) => setPlayhead(t),
       () => setPlaying(false),
@@ -80,10 +122,12 @@ export function PreviewPanel() {
     <section className="preview-area">
       <div className="preview-wrap">
         <canvas ref={canvasRef} />
+        <MaskOverlay canvasRef={canvasRef} />
       </div>
       <div className="transport">
         <button
           type="button"
+          title="Go to start (Home)"
           onClick={() => {
             setPlayhead(0);
             setPlaying(false);
@@ -93,10 +137,51 @@ export function PreviewPanel() {
         </button>
         <button
           type="button"
-          onClick={() => setPlaying(!isPlaying)}
+          title="Previous frame (,)"
+          onClick={() => {
+            setPlaying(false);
+            setPlayhead(playhead - 1 / settings.fps);
+          }}
         >
+          ◀|
+        </button>
+        <button type="button" className="transport-play" onClick={() => setPlaying(!isPlaying)}>
           {isPlaying ? 'Pause' : 'Play'}
         </button>
+        <button
+          type="button"
+          title="Next frame (.)"
+          onClick={() => {
+            setPlaying(false);
+            setPlayhead(playhead + 1 / settings.fps);
+          }}
+        >
+          |▶
+        </button>
+
+        <TimecodeField
+          playhead={playhead}
+          fps={settings.fps}
+          onSeek={(t) => {
+            setPlaying(false);
+            setPlayhead(t);
+          }}
+        />
+        <span className="transport-duration">/ {formatTimecode(duration, settings.fps)}</span>
+
+        <input
+          className="transport-scrub"
+          type="range"
+          min={0}
+          max={duration}
+          step={1 / settings.fps}
+          value={playhead}
+          onChange={(e) => {
+            setPlaying(false);
+            setPlayhead(Number(e.target.value));
+          }}
+        />
+
         <button
           type="button"
           title="Save current preview frame to Media Library"
@@ -105,20 +190,6 @@ export function PreviewPanel() {
         >
           {capturing ? 'Saving…' : 'Save frame'}
         </button>
-        <span>
-          {formatTimecode(playhead)} / {formatTimecode(duration)}
-        </span>
-        <input
-          type="range"
-          min={0}
-          max={duration}
-          step={0.01}
-          value={playhead}
-          onChange={(e) => {
-            setPlaying(false);
-            setPlayhead(Number(e.target.value));
-          }}
-        />
       </div>
     </section>
   );

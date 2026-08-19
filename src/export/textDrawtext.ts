@@ -10,6 +10,8 @@ export function drawtextFilter(
   enable: string,
   inputLabel: string,
   textFrame: NormalizedRect = DEFAULT_FULL_FRAME,
+  /** Optional drawtext `alpha` expression (already comma-escaped) for clip fades. */
+  alphaExpr?: string,
 ): { filter: string; outLabel: string } {
   const escaped = text.replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, "\\'");
   const outLabel = `vtxt_${Math.random().toString(36).slice(2, 8)}`;
@@ -48,6 +50,7 @@ export function drawtextFilter(
       break;
   }
 
-  const filter = `[${inputLabel}]drawtext=fontfile=${fontfile}:text='${escaped}':fontsize=${fontSize}:fontcolor=${fontColor}:x=${x}:y=${y}${box}${shadow}:enable='${enable}'[${outLabel}]`;
+  const alpha = alphaExpr ? `:alpha='${alphaExpr}'` : '';
+  const filter = `[${inputLabel}]drawtext=fontfile=${fontfile}:text='${escaped}':fontsize=${fontSize}:fontcolor=${fontColor}:x=${x}:y=${y}${box}${shadow}${alpha}:enable='${enable}'[${outLabel}]`;
   return { filter, outLabel };
 }

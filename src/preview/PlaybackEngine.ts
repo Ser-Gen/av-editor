@@ -1,13 +1,13 @@
-import type { Clip, EditorState, MediaAsset } from '../types/editor';
+import type { Clip, EditorState, MediaAsset, VisualClip } from '../types/editor';
 import { resolutionToSize } from '../utils/resolution';
-import {
-  drawOverlaySource,
-  imageTransformForClip,
-  normalizeOverlayTransform,
-} from '../utils/overlayTransform';
+import { drawOverlaySource, normalizeOverlayTransform } from '../utils/overlayTransform';
 import { textFrameForClip } from '../utils/overlayTransform';
-import { getAudioTrackVolume } from '../utils/trackVolume';
+import { audibleClips, compositeLayers, compositeOrderedClips } from '../utils/compositeOrder';
+import { activeEffects, enabledEffects, fadeGainAt, transformAt } from '../utils/clipRender';
+import { transitionStateAt } from '../utils/transitions';
 import { clipDuration } from '../utils/time';
+import { GLCompositor } from '../render/GLCompositor';
+import { MediaElementPool } from './mediaElements';
 import { drawTextClip } from './textRenderer';
 
 type StoreSlice = Pick<EditorState, 'clips' | 'mediaLibrary' | 'settings' | 'tracks' | 'trimPreview'>;
@@ -23,11 +23,11 @@ interface ClipAudioRoute {
 export class PlaybackEngine {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  private compositor: GLCompositor;
   private audioCtx: AudioContext | null = null;
-  private videoCache = new Map<string, HTMLVideoElement>();
-  private imageCache = new Map<string, HTMLImageElement>();
-  private audioCache = new Map<string, HTMLAudioElement>();
-  /** One MediaElementSource per asset — cannot be created twice on the same element. */
+  /** Owns every media element: which clip gets which, their volume, and what stays running. */
+  private pool = new MediaElementPool();
+  /** One MediaElementSource per element key — cannot be created twice on the same element. */
   private mediaSources = new Map<string, MediaElementAudioSourceNode>();
   private clipRoutes = new Map<string, ClipAudioRoute>();
   private raf = 0;
@@ -35,6 +35,7 @@ export class PlaybackEngine {
   private anchorTime = 0;
   private playing = false;
   private renderGeneration = 0;
+  private warnedNoEffects2D = false;
   private onTime?: (t: number) => void;
   private onEnded?: () => void;
 
@@ -43,6 +44,16 @@ export class PlaybackEngine {
     const ctx = canvas.getContext('2d');
     if (!ctx) throw new Error('Canvas 2D unavailable');
     this.ctx = ctx;
+    // The compositor owns its own offscreen canvas, so this 2D context stays usable
+    // as the fallback when WebGL2 is missing or its context is lost.
+    this.compositor = new GLCompositor();
+  }
+
+  /** Live per-clip output gain — the fade envelope as the mixer currently sees it. */
+  get audioGains(): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const [clipId, route] of this.clipRoutes) out[clipId] = route.gain.gain.value;
+    return out;
   }
 
   setCallbacks(onTime: (t: number) => void, onEnded: () => void): void {
@@ -55,42 +66,20 @@ export class PlaybackEngine {
     return this.audioCtx;
   }
 
-  private getVideo(asset: MediaAsset): HTMLVideoElement {
-    let v = this.videoCache.get(asset.id);
-    if (!v) {
-      v = document.createElement('video');
-      v.src = asset.blobUrl;
-      v.muted = false;
-      v.volume = 0;
-      v.playsInline = true;
-      v.preload = 'auto';
-      v.crossOrigin = 'anonymous';
-      this.videoCache.set(asset.id, v);
-    }
-    return v;
+  private elementKey(clip: Clip, state: StoreSlice): string {
+    return this.pool.keyFor(clip, state.clips);
   }
 
-  private getAudio(asset: MediaAsset): HTMLAudioElement {
-    let a = this.audioCache.get(asset.id);
-    if (!a) {
-      a = document.createElement('audio');
-      a.src = asset.blobUrl;
-      a.preload = 'auto';
-      a.crossOrigin = 'anonymous';
-      this.audioCache.set(asset.id, a);
-    }
-    return a;
+  private getVideo(asset: MediaAsset, key: string = asset.id): HTMLVideoElement {
+    return this.pool.video(asset, key);
+  }
+
+  private getAudio(asset: MediaAsset, key: string = asset.id): HTMLAudioElement {
+    return this.pool.audio(asset, key);
   }
 
   private getImage(asset: MediaAsset): HTMLImageElement {
-    let img = this.imageCache.get(asset.id);
-    if (!img) {
-      img = new Image();
-      img.src = asset.blobUrl;
-      img.crossOrigin = 'anonymous';
-      this.imageCache.set(asset.id, img);
-    }
-    return img;
+    return this.pool.image(asset);
   }
 
   private isActive(clip: Clip, t: number, state: StoreSlice): boolean {
@@ -135,14 +124,9 @@ export class PlaybackEngine {
     }
   }
 
-  private sortedClips(state: StoreSlice): Clip[] {
-    const layer = (clip: Clip): number => {
-      if (clip.kind === 'video') return clip.overlayMode ? 2 : 0;
-      if (clip.kind === 'image') return 1;
-      if (clip.kind === 'text') return 3;
-      return 4;
-    };
-    return [...state.clips].sort((a, b) => layer(a) - layer(b));
+  /** Paint order comes from the track stack — same function the exporter uses. */
+  private sortedClips(state: StoreSlice): VisualClip[] {
+    return compositeOrderedClips(state.clips, state.tracks);
   }
 
   private drawLetterbox(
@@ -166,6 +150,104 @@ export class PlaybackEngine {
     if (this.canvas.width !== width) this.canvas.width = width;
     if (this.canvas.height !== height) this.canvas.height = height;
 
+    if (this.compositor.available && this.drawFrameGL(state, t, width, height)) return;
+    this.drawFrame2D(state, t, width, height);
+  }
+
+  /** GPU path. Returns false if the compositor bailed and the 2D path should run. */
+  private drawFrameGL(state: StoreSlice, t: number, width: number, height: number): boolean {
+    const gl = this.compositor;
+    if (!gl.beginFrame(width, height)) return false;
+
+    // Track by track, bottom-up: draw the track's clips, then run any grade attached to
+    // that track over everything accumulated so far.
+    for (const layer of compositeLayers(state.clips, state.tracks)) {
+      this.drawTrackClipsGL(state, t, layer.clips);
+      if (layer.track.effects?.length) {
+        gl.applyToScene(enabledEffects(layer.track.effects));
+      }
+      for (const adjustment of layer.adjustments) {
+        if (!this.isActive(adjustment, t, state)) continue;
+        gl.applyToScene(activeEffects(adjustment, t));
+      }
+    }
+
+    gl.endFrame();
+    this.ctx.drawImage(gl.canvas, 0, 0);
+    return true;
+  }
+
+  private drawTrackClipsGL(state: StoreSlice, t: number, clips: VisualClip[]): void {
+    const gl = this.compositor;
+    for (const clip of clips) {
+      if (!this.isActive(clip, t, state)) continue;
+
+      // While scrubbing a trim handle the clip is drawn outside its own time range,
+      // where the fade curve is undefined — show it at full strength instead.
+      const scrubbing = state.trimPreview?.clipId === clip.id;
+      const transition = scrubbing
+        ? { alpha: 1, gain: 1, wipe: null }
+        : transitionStateAt(clip, state.clips, t);
+      const fade = (scrubbing ? 1 : fadeGainAt(clip, t)) * transition.alpha;
+      const effects = activeEffects(clip, t);
+
+      if (clip.kind === 'text') {
+        gl.withEffects(
+          effects,
+          fade,
+          (alpha, flip) => gl.drawTextClip(clip, alpha, flip),
+          transition.wipe,
+        );
+        continue;
+      }
+
+      const asset = state.mediaLibrary[clip.assetId];
+      if (!asset) continue;
+
+      if (clip.kind === 'video') {
+        if (clip.hideVideo) continue;
+        const key = this.elementKey(clip, state);
+        const video = this.getVideo(asset, key);
+        if (video.readyState < 2 || video.videoWidth === 0) continue;
+        gl.withEffects(
+          effects,
+          fade,
+          (alpha, flip) =>
+            gl.drawSource(
+              key,
+              video,
+              video.videoWidth,
+              video.videoHeight,
+              transformAt(clip, t),
+              alpha,
+              flip,
+            ),
+          transition.wipe,
+        );
+        continue;
+      }
+
+      const img = this.getImage(asset);
+      if (!img.complete || img.naturalWidth === 0) continue;
+      gl.withEffects(
+        effects,
+        fade,
+        (alpha, flip) =>
+          gl.drawSource(
+            asset.id,
+            img,
+            img.naturalWidth,
+            img.naturalHeight,
+            transformAt(clip, t),
+            alpha,
+            flip,
+          ),
+        transition.wipe,
+      );
+    }
+  }
+
+  private drawFrame2D(state: StoreSlice, t: number, width: number, height: number): void {
     const ctx = this.ctx;
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, width, height);
@@ -173,74 +255,77 @@ export class PlaybackEngine {
     for (const clip of this.sortedClips(state)) {
       if (!this.isActive(clip, t, state)) continue;
 
-      if (clip.kind === 'video' && !clip.hideVideo && !clip.overlayMode) {
+      // Fades are cheap enough to honour here; shader effects are not, so the fallback
+      // shows the unfiltered clip and says so once rather than silently lying.
+      ctx.globalAlpha =
+        state.trimPreview?.clipId === clip.id
+          ? 1
+          : fadeGainAt(clip, t) * transitionStateAt(clip, state.clips, t).alpha;
+      if (activeEffects(clip).length > 0 && !this.warnedNoEffects2D) {
+        this.warnedNoEffects2D = true;
+        console.warn('[Preview] Canvas2D fallback cannot run shader effects — showing the source.');
+      }
+
+      if (clip.kind === 'video') {
+        if (clip.hideVideo) continue;
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
-        const video = this.getVideo(asset);
-        if (video.readyState >= 2 && video.videoWidth > 0) {
-          this.drawLetterbox(
-            ctx,
-            video,
-            video.videoWidth,
-            video.videoHeight,
-            width,
-            height,
-          );
-        }
+        const video = this.getVideo(asset, this.elementKey(clip, state));
+        if (video.readyState < 2 || video.videoWidth === 0) continue;
+        this.drawVisual(ctx, video, video.videoWidth, video.videoHeight, clip, t, width, height);
+        continue;
       }
 
       if (clip.kind === 'image') {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
         const img = this.getImage(asset);
-        if (img.complete && img.naturalWidth > 0) {
-          drawOverlaySource(
-            ctx,
-            img,
-            img.naturalWidth,
-            img.naturalHeight,
-            imageTransformForClip(clip.overlayTransform, img.naturalWidth, img.naturalHeight),
-            width,
-            height,
-          );
-        }
+        if (!img.complete || img.naturalWidth === 0) continue;
+        this.drawVisual(ctx, img, img.naturalWidth, img.naturalHeight, clip, t, width, height);
+        continue;
       }
 
-      if (clip.kind === 'video' && !clip.hideVideo && clip.overlayMode) {
-        const asset = state.mediaLibrary[clip.assetId];
-        if (!asset) continue;
-        const video = this.getVideo(asset);
-        if (video.readyState >= 2 && video.videoWidth > 0) {
-          drawOverlaySource(
-            ctx,
-            video,
-            video.videoWidth,
-            video.videoHeight,
-            normalizeOverlayTransform(clip.overlayTransform),
-            width,
-            height,
-          );
-        }
-      }
-
-      if (clip.kind === 'text') {
-        drawTextClip(ctx, clip.template, clip.text, width, height, textFrameForClip(clip.textFrame));
-      }
+      drawTextClip(ctx, clip.template, clip.text, width, height, textFrameForClip(clip.textFrame));
     }
+    ctx.globalAlpha = 1;
   }
 
-  private primeVideoElements(state: StoreSlice, t: number): Promise<void>[] {
-    const seeks: Promise<void>[] = [];
+  /** No transform = fit the whole frame; a transform means crop + placement (PiP). */
+  private drawVisual(
+    ctx: CanvasRenderingContext2D,
+    source: CanvasImageSource,
+    sw: number,
+    sh: number,
+    clip: Extract<VisualClip, { kind: 'video' | 'image' }>,
+    t: number,
+    width: number,
+    height: number,
+  ): void {
+    const transform = transformAt(clip, t);
+    if (!transform) {
+      this.drawLetterbox(ctx, source, sw, sh, width, height);
+      return;
+    }
+    drawOverlaySource(ctx, source, sw, sh, normalizeOverlayTransform(transform), width, height);
+  }
+
+  /** The video elements a frame at `t` needs, paired with the source time each must show. */
+  private activeVideos(state: StoreSlice, t: number): { video: HTMLVideoElement; at: number }[] {
+    const out: { video: HTMLVideoElement; at: number }[] = [];
     for (const clip of this.sortedClips(state)) {
       if (!this.isActive(clip, t, state)) continue;
       if (clip.kind === 'video' && !clip.hideVideo) {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
-        const video = this.getVideo(asset);
-        seeks.push(this.seekElement(video, this.sourceTime(clip, t, state)));
+        const video = this.getVideo(asset, this.elementKey(clip, state));
+        out.push({ video, at: this.sourceTime(clip, t, state) });
       }
     }
-    return seeks;
+    return out;
+  }
+
+  private primeVideoElements(state: StoreSlice, t: number): Promise<void>[] {
+    return this.activeVideos(state, t).map(({ video, at }) => this.seekElement(video, at));
   }
 
   async renderFrameAsync(state: StoreSlice, t: number): Promise<void> {
@@ -248,6 +333,29 @@ export class PlaybackEngine {
     await Promise.all(this.primeVideoElements(state, t));
     if (gen !== this.renderGeneration) return;
     this.drawFrameContents(state, t);
+    this.repaintWhenReady(state, t, gen);
+  }
+
+  /**
+   * A seek gives up after a short deadline so scrubbing stays responsive. That deadline
+   * also expires on the very first frame after an import, before the file has decoded
+   * anything — and nothing would repaint it, because no store change follows an import
+   * that has already added the clip. So the preview sat black until the user touched
+   * something. Repaint once the elements that missed the deadline become usable.
+   */
+  private repaintWhenReady(state: StoreSlice, t: number, gen: number): void {
+    for (const { video } of this.activeVideos(state, t)) {
+      if (video.readyState >= 2 && video.videoWidth > 0) continue;
+      const retry = () => {
+        video.removeEventListener('loadeddata', retry);
+        video.removeEventListener('seeked', retry);
+        // A newer frame has been requested since; it owns the canvas now.
+        if (gen !== this.renderGeneration) return;
+        void this.renderFrameAsync(state, t);
+      };
+      video.addEventListener('loadeddata', retry);
+      video.addEventListener('seeked', retry);
+    }
   }
 
   /** Fast path during playback — draw current frames without blocking on seek. */
@@ -257,7 +365,7 @@ export class PlaybackEngine {
       if (clip.kind === 'video' && !clip.hideVideo) {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
-        const video = this.getVideo(asset);
+        const video = this.getVideo(asset, this.elementKey(clip, state));
         const st = this.sourceTime(clip, t, state);
         this.nudgeElement(video, st);
         if (video.paused) void video.play().catch(() => undefined);
@@ -267,51 +375,51 @@ export class PlaybackEngine {
     this.syncAudio(state, t, true);
   }
 
-  private clipHasAudio(clip: Clip): boolean {
-    if (clip.kind === 'audio') return true;
-    if (clip.kind === 'video') return !clip.muteAudio;
-    return false;
-  }
-
-  private getAudioElement(clip: Clip, state: StoreSlice): HTMLMediaElement | null {
+  private getAudioElement(clip: Clip, state: StoreSlice): { el: HTMLMediaElement; key: string } | null {
     if (clip.kind === 'audio' || clip.kind === 'video') {
       const asset = state.mediaLibrary[clip.assetId];
       if (!asset) return null;
-      return clip.kind === 'video' ? this.getVideo(asset) : this.getAudio(asset);
+      const key = this.elementKey(clip, state);
+      return {
+        el: clip.kind === 'video' ? this.getVideo(asset, key) : this.getAudio(asset, key),
+        key,
+      };
     }
     return null;
   }
 
-  private getOrCreateMediaSource(assetId: string, el: HTMLMediaElement): MediaElementAudioSourceNode {
-    let source = this.mediaSources.get(assetId);
+  /** One source node per *element*; creating two on one element throws. */
+  private getOrCreateMediaSource(key: string, el: HTMLMediaElement): MediaElementAudioSourceNode {
+    let source = this.mediaSources.get(key);
     if (!source) {
       source = this.ensureAudioCtx().createMediaElementSource(el);
-      this.mediaSources.set(assetId, source);
+      this.mediaSources.set(key, source);
     }
     return source;
   }
 
+  /**
+   * Routes audio for the clips audible at `t`, then hands the pool the frame's demand:
+   * which elements are being listened to, and which are being drawn from. Nothing here
+   * pauses an element or sets a volume — that is the pool's single decision, made once it
+   * knows both answers.
+   */
   private syncAudio(state: StoreSlice, t: number, duringPlay: boolean): void {
     const ctx = this.ensureAudioCtx();
     const shouldBeActive = new Set<string>();
     const existingClipIds = new Set(state.clips.map((c) => c.id));
+    const listening = new Set<HTMLMediaElement>();
+    const drawing = new Set<HTMLMediaElement>(this.activeVideos(state, t).map((v) => v.video));
 
-    for (const clipId of this.clipRoutes.keys()) {
-      if (!existingClipIds.has(clipId)) {
-        const route = this.clipRoutes.get(clipId)!;
-        route.gain.disconnect();
-        route.element.pause();
-        this.clipRoutes.delete(clipId);
-      }
-    }
-
-    for (const clip of state.clips) {
-      if (!this.clipHasAudio(clip) || !this.isActive(clip, t, state)) continue;
+    for (const { clip, gain: clipGain } of audibleClips(state.clips, state.tracks)) {
+      if (!this.isActive(clip, t, state)) continue;
       if (clip.kind !== 'audio' && clip.kind !== 'video') continue;
 
       shouldBeActive.add(clip.id);
-      const el = this.getAudioElement(clip, state);
-      if (!el) continue;
+      const routed = this.getAudioElement(clip, state);
+      if (!routed) continue;
+      const el = routed.el;
+      listening.add(el);
 
       const st = this.sourceTime(clip, t, state);
       if (duringPlay) {
@@ -321,8 +429,18 @@ export class PlaybackEngine {
       }
 
       let route = this.clipRoutes.get(clip.id);
+      if (route && route.element !== el) {
+        // The clip's element key changed under us — dragging a clip into or out of an
+        // overlap with another clip of the same asset does exactly that. The old route
+        // still points at the old element, so rebuild rather than drive a stale one. The
+        // abandoned element needs no attention here: it simply stops being claimed, and the
+        // pool settles it below like anything else nothing wants.
+        route.gain.disconnect();
+        this.clipRoutes.delete(clip.id);
+        route = undefined;
+      }
       if (!route) {
-        const source = this.getOrCreateMediaSource(clip.assetId, el);
+        const source = this.getOrCreateMediaSource(routed.key, el);
         const gain = ctx.createGain();
         source.connect(gain);
         gain.connect(ctx.destination);
@@ -339,23 +457,30 @@ export class PlaybackEngine {
         route.connectedToDest = true;
       }
 
-      const track = state.tracks.find((tr) => tr.id === clip.trackId);
-      route.gain.gain.value = getAudioTrackVolume(track);
+      // syncAudio runs every frame while playing, so sampling the envelope here gives a
+      // smooth fade without scheduling ramps that would fight with scrubbing.
+      route.gain.gain.value =
+        clipGain * fadeGainAt(clip, t) * transitionStateAt(clip, state.clips, t).gain;
 
       if (this.playing && el.paused) {
         void el.play().catch(() => undefined);
       }
     }
 
+    // Disconnect the routes that are not sounding, and drop the ones whose clip is gone.
+    // This is about the audio graph only; the elements underneath are the pool's business.
     for (const [clipId, route] of this.clipRoutes) {
-      if (!shouldBeActive.has(clipId)) {
-        if (route.connectedToDest) {
-          route.gain.disconnect();
-          route.connectedToDest = false;
-        }
-        route.element.pause();
+      const gone = !existingClipIds.has(clipId);
+      if (!gone && shouldBeActive.has(clipId)) continue;
+
+      if (route.connectedToDest) {
+        route.gain.disconnect();
+        route.connectedToDest = false;
       }
+      if (gone) this.clipRoutes.delete(clipId);
     }
+
+    this.pool.settle(listening, drawing);
   }
 
   private tick = (state: StoreSlice, duration: number): void => {
@@ -381,12 +506,12 @@ export class PlaybackEngine {
     void (async () => {
       await Promise.all(this.primeVideoElements(state, startTime));
       this.syncAudio(state, startTime, false);
-      for (const clip of state.clips) {
+      for (const clip of this.sortedClips(state)) {
         if (!this.isActive(clip, startTime, state)) continue;
         if (clip.kind === 'video' && !clip.hideVideo) {
           const asset = state.mediaLibrary[clip.assetId];
           if (!asset) continue;
-          const video = this.getVideo(asset);
+          const video = this.getVideo(asset, this.elementKey(clip, state));
           void video.play().catch(() => undefined);
         }
       }
@@ -398,15 +523,7 @@ export class PlaybackEngine {
   pause(): void {
     this.playing = false;
     cancelAnimationFrame(this.raf);
-    for (const video of this.videoCache.values()) {
-      video.pause();
-    }
-    for (const audio of this.audioCache.values()) {
-      audio.pause();
-    }
-    for (const { element } of this.clipRoutes.values()) {
-      element.pause();
-    }
+    this.pool.pauseAll();
   }
 
   seek(state: StoreSlice, t: number): Promise<void> {
@@ -421,10 +538,9 @@ export class PlaybackEngine {
     }
     this.clipRoutes.clear();
     this.mediaSources.clear();
+    this.compositor.dispose();
     void this.audioCtx?.close();
     this.audioCtx = null;
-    this.videoCache.clear();
-    this.audioCache.clear();
-    this.imageCache.clear();
+    this.pool.clear();
   }
 }

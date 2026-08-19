@@ -1,11 +1,12 @@
-import { useRef } from 'react';
-import { useMicrophoneRecorder } from '../hooks/useMicrophoneRecorder';
+import { useRef, useState } from 'react';
+import { useCaptureSession } from '../capture/useCaptureSession';
+import { RecordPanel } from './RecordPanel';
 import { useEditorStore } from '../store/editorStore';
 import { isAssetInUse } from '../store/clipFactory';
 import type { AssetType } from '../types/editor';
 import { inferAssetKind } from '../utils/assetKind';
 import { VideoPoster } from './VideoPoster';
-import { formatTimecode } from '../utils/time';
+import { formatDuration } from '../utils/time';
 
 const TYPE_LABEL: Record<AssetType, string> = {
   video: 'Video',
@@ -22,7 +23,13 @@ export function MediaLibrary() {
   const addAssetToTimeline = useEditorStore((s) => s.addAssetToTimeline);
   const removeLibraryItem = useEditorStore((s) => s.removeLibraryItem);
   const libraryNotice = useEditorStore((s) => s.libraryNotice);
-  const { recording, busy, elapsed, toggleRecording } = useMicrophoneRecorder();
+  const capture = useCaptureSession();
+  const recording = capture.phase === 'recording';
+  const busy = capture.phase !== 'idle';
+  // The panel stays open while a recording or a recovery offer is live, so neither can be
+  // hidden by a stray click.
+  const [panelOpen, setPanelOpen] = useState(false);
+  const showPanel = panelOpen || busy || capture.orphans.length > 0;
 
   const onFiles = async (list: FileList | null) => {
     if (!list || list.length === 0) return;
@@ -46,11 +53,11 @@ export function MediaLibrary() {
         <button
           type="button"
           className={recording ? 'btn-record-active' : undefined}
-          disabled={busy && !recording}
-          title="Record microphone (works during playback)"
-          onClick={() => toggleRecording()}
+          aria-expanded={showPanel}
+          title="Record screen, microphone and system audio (works during playback)"
+          onClick={() => setPanelOpen((open) => !open)}
         >
-          {recording ? 'Stop' : 'Record'}
+          {recording ? 'Recording' : 'Record'}
         </button>
         <input
           ref={fileRef}
@@ -63,12 +70,7 @@ export function MediaLibrary() {
       </div>
 
       <p className="hint">Import once, add to timeline many times.</p>
-      {recording && (
-        <p className="media-library-recording">
-          <span className="media-library-recording-dot" />
-          Recording {formatTimecode(elapsed).slice(0, 8)}
-        </p>
-      )}
+      {showPanel && <RecordPanel capture={capture} />}
       {libraryNotice && <p className="media-library-notice">{libraryNotice}</p>}
 
       <ul className="media-library-list">
@@ -79,8 +81,7 @@ export function MediaLibrary() {
           const asset = mediaLibrary[id];
           if (!asset) return null;
           const inUse = isAssetInUse(id, clips);
-          const duration =
-            asset.type === 'image' ? '5s' : formatTimecode(asset.duration).slice(0, 8);
+          const duration = asset.type === 'image' ? '5s' : formatDuration(asset.duration);
 
           return (
             <li key={id} className={`media-library-item media-library-item--${asset.type}`}>

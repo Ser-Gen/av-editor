@@ -1,8 +1,11 @@
 import type { Clip, EditorState, MediaAsset } from '../types/editor';
 import { resolutionToSize } from '../utils/resolution';
-import { imageTransformForClip, overlayTransformToPixels } from '../utils/overlayTransform';
-import { getAudioTrackVolume } from '../utils/trackVolume';
+import { overlayTransformToPixels } from '../utils/overlayTransform';
+import { audibleClips, compositeLayers } from '../utils/compositeOrder';
+import { activeEffects, enabledEffects, isAnimated, transformAt } from '../utils/clipRender';
+import { ffmpegChain } from '../render/effects/registry';
 import { clipDuration } from '../utils/time';
+import { incomingTransition, outgoingTransition } from '../utils/transitions';
 import { drawtextFilter } from './textDrawtext';
 
 export interface ExportInputSpec {
@@ -18,6 +21,8 @@ export interface ExportPlan {
   videoOut: string;
   audioOut: string;
   duration: number;
+  /** Things this pipeline cannot reproduce, for the caller to show the user. */
+  warnings: string[];
 }
 
 function extFromName(name: string): string {
@@ -35,16 +40,106 @@ function safeId(id: string): string {
   return id.replace(/[^a-zA-Z0-9]/g, '');
 }
 
-export function buildExportPlan(state: Pick<EditorState, 'clips' | 'mediaLibrary' | 'settings' | 'tracks'>): ExportPlan {
+/**
+ * `fade` filters for a clip's head and tail, in the layer's timebase — which after the
+ * `setpts` shift is timeline time. `alpha=1` fades the layer's transparency rather than
+ * its colour, matching what the WebGL compositor does.
+ */
+function fadeFilters(clip: Clip): string[] {
+  const fadeIn = clip.fadeIn ?? 0;
+  const fadeOut = clip.fadeOut ?? 0;
+  const out: string[] = [];
+  if (fadeIn > 0) {
+    out.push(`fade=t=in:st=${clip.timelineStart}:d=${fadeIn}:alpha=1`);
+  }
+  if (fadeOut > 0) {
+    const start = clip.timelineStart + clipDuration(clip) - fadeOut;
+    out.push(`fade=t=out:st=${start}:d=${fadeOut}:alpha=1`);
+  }
+  return out;
+}
+
+/** The same envelope as a drawtext `alpha` expression, for text clips. */
+function fadeAlphaExpr(clip: Clip): string | undefined {
+  const fadeIn = clip.fadeIn ?? 0;
+  const fadeOut = clip.fadeOut ?? 0;
+  const terms: string[] = [];
+  if (fadeIn > 0) terms.push(`(t-${clip.timelineStart})/${fadeIn}`);
+  if (fadeOut > 0) {
+    terms.push(`(${clip.timelineStart + clipDuration(clip)}-t)/${fadeOut}`);
+  }
+  if (terms.length === 0) return undefined;
+  const inner = terms.length === 1 ? terms[0] : `min(${terms[0]}\\,${terms[1]})`;
+  return `max(0\\,min(1\\,${inner}))`;
+}
+
+/**
+ * A transition is an alpha ramp on the incoming clip over the outgoing one — exactly what
+ * the compositor does — so `fade` expresses it and `xfade` is not needed. Wipes have no
+ * equivalent and are reported instead.
+ */
+function transitionFilters(clip: Clip, clips: Clip[]): { filters: string[]; unsupported: string[] } {
+  const filters: string[] = [];
+  const unsupported: string[] = [];
+
+  const incoming = incomingTransition(clip, clips);
+  if (incoming) {
+    const span = incoming.end - incoming.start;
+    if (incoming.type === 'wipeL' || incoming.type === 'wipeR') {
+      unsupported.push('a wipe transition');
+    } else if (incoming.type === 'dipToBlack') {
+      // Second half only: the frame is fully black at the midpoint.
+      filters.push(`fade=t=in:st=${incoming.start + span / 2}:d=${span / 2}:alpha=1`);
+    } else {
+      filters.push(`fade=t=in:st=${incoming.start}:d=${span}:alpha=1`);
+    }
+  }
+
+  const outgoing = outgoingTransition(clip, clips);
+  if (outgoing && outgoing.type === 'dipToBlack') {
+    const span = outgoing.end - outgoing.start;
+    filters.push(`fade=t=out:st=${outgoing.start}:d=${span / 2}:alpha=1`);
+  }
+  return { filters, unsupported };
+}
+
+/** Audio side of a transition: a linear cross-fade over the same window. */
+function transitionAfades(clip: Clip, clips: Clip[]): string[] {
+  const out: string[] = [];
+  const incoming = incomingTransition(clip, clips);
+  if (incoming) {
+    out.push(`afade=t=in:st=0:d=${incoming.end - incoming.start}`);
+  }
+  const outgoing = outgoingTransition(clip, clips);
+  if (outgoing) {
+    const span = outgoing.end - outgoing.start;
+    out.push(`afade=t=out:st=${Math.max(0, clipDuration(clip) - span)}:d=${span}`);
+  }
+  return out;
+}
+
+/** `afade` filters for a clip's own timeline, applied before the delay shift. */
+function afadeFilters(clip: Clip): string[] {
+  const fadeIn = clip.fadeIn ?? 0;
+  const fadeOut = clip.fadeOut ?? 0;
+  const out: string[] = [];
+  if (fadeIn > 0) out.push(`afade=t=in:st=0:d=${fadeIn}`);
+  if (fadeOut > 0) {
+    out.push(`afade=t=out:st=${Math.max(0, clipDuration(clip) - fadeOut)}:d=${fadeOut}`);
+  }
+  return out;
+}
+
+export function buildExportPlan(
+  state: Pick<EditorState, 'clips' | 'mediaLibrary' | 'settings' | 'tracks'>,
+): ExportPlan {
   const { width, height } = resolutionToSize(state.settings.resolution);
   const fps = state.settings.fps;
-  const duration = Math.max(
-    0.1,
-    ...state.clips.map((c) => c.timelineStart + clipDuration(c)),
-  );
+  const duration = Math.max(0.1, ...state.clips.map((c) => c.timelineStart + clipDuration(c)));
 
   const inputSpecs: ExportInputSpec[] = [];
   const filters: string[] = [];
+  const warnings: string[] = [];
   let inputIndex = 0;
   const assetInputMap = new Map<string, number>();
 
@@ -60,123 +155,187 @@ export function buildExportPlan(state: Pick<EditorState, 'clips' | 'mediaLibrary
   filters.push(`color=c=black:s=${width}x${height}:d=${duration}:r=${fps},format=yuv420p[base]`);
   let videoLabel = 'base';
 
-  const baseVideoClips = state.clips.filter(
-    (c): c is Extract<Clip, { kind: 'video' }> =>
-      c.kind === 'video' && !c.hideVideo && !c.overlayMode,
-  );
-  const overlayVideoClips = state.clips.filter(
-    (c): c is Extract<Clip, { kind: 'video' }> =>
-      c.kind === 'video' && !c.hideVideo && !!c.overlayMode,
-  );
-  const imageClips = state.clips.filter((c): c is Extract<Clip, { kind: 'image' }> => c.kind === 'image');
-  const textClips = state.clips.filter((c): c is Extract<Clip, { kind: 'text' }> => c.kind === 'text');
+  /** Runs an effect chain over the accumulated frame — a track grade or an adjustment. */
+  const gradeAccumulated = (
+    effects: ReturnType<typeof activeEffects>,
+    tag: string,
+    enable?: string,
+  ): void => {
+    const chain = ffmpegChain(effects, { width, height });
+    warnings.push(...chain.unsupported.map((label) => `FFmpeg cannot reproduce ${label}.`));
+    if (chain.segments.length === 0) return;
 
-  for (const clip of baseVideoClips) {
-    const asset = state.mediaLibrary[clip.assetId];
-    if (!asset) continue;
-    const idx = registerAsset(asset);
-    const vLabel = `v${safeId(clip.id)}`;
-    const out = `vo${safeId(clip.id)}`;
-    const delay = clip.timelineStart;
+    // Ranged grades branch: the untouched frame is kept and the graded copy is overlaid
+    // only inside the range. `enable` on the overlay works for every filter, unlike the
+    // per-filter timeline option, which not all of them support.
+    const entry = enable ? `g${tag}in` : videoLabel;
+    if (enable) filters.push(`[${videoLabel}]split[g${tag}keep][${entry}]`);
 
-    filters.push(
-      `[${idx}:v]trim=start=${clip.sourceTrimIn}:end=${clip.sourceTrimOut},setpts=PTS-STARTPTS,setpts=PTS+${delay}/TB,scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p[${vLabel}]`,
-    );
-    filters.push(
-      `[${videoLabel}][${vLabel}]overlay=x=0:y=0:enable='${between(clip)}':eof_action=pass[${out}]`,
-    );
-    videoLabel = out;
-  }
+    let cursor = entry;
+    chain.segments.forEach((segment, index) => {
+      const next = `g${tag}_${index}`;
+      filters.push(segment(cursor, next, `${tag}_${index}`));
+      cursor = next;
+    });
 
-  for (const clip of imageClips) {
-    const asset = state.mediaLibrary[clip.assetId];
-    if (!asset) continue;
-    const idx = registerAsset(asset, ['-loop', '1', '-framerate', String(fps)]);
-    const trimLabel = `imgtrim${safeId(clip.id)}`;
-    const scaledLabel = `img${safeId(clip.id)}`;
-    const out = `io${safeId(clip.id)}`;
-    const delay = clip.timelineStart;
-    const clipDur = clipDuration(clip);
-    const sw = asset.width ?? width;
-    const sh = asset.height ?? height;
-    const transform = imageTransformForClip(clip.overlayTransform, sw, sh);
-    const px = overlayTransformToPixels(transform, sw, sh, width, height);
-
-    filters.push(
-      `[${idx}:v]trim=duration=${clipDur},setpts=PTS-STARTPTS,setpts=PTS+${delay}/TB[${trimLabel}]`,
-    );
-    filters.push(
-      `[${trimLabel}]crop=${px.cropW}:${px.cropH}:${px.cropX}:${px.cropY},scale=${px.frameW}:${px.frameH},format=yuv420p[${scaledLabel}]`,
-    );
-    filters.push(
-      `[${videoLabel}][${scaledLabel}]overlay=${px.frameX}:${px.frameY}:enable='${between(clip)}':eof_action=pass[${out}]`,
-    );
-    videoLabel = out;
-  }
-
-  for (const clip of overlayVideoClips) {
-    const asset = state.mediaLibrary[clip.assetId];
-    if (!asset) continue;
-    const idx = registerAsset(asset);
-    const trimLabel = `vtrim${safeId(clip.id)}`;
-    const scaledLabel = `vov${safeId(clip.id)}`;
-    const out = `vo${safeId(clip.id)}`;
-    const delay = clip.timelineStart;
-    const sw = asset.width ?? width;
-    const sh = asset.height ?? height;
-    const px = overlayTransformToPixels(clip.overlayTransform, sw, sh, width, height);
-
-    filters.push(
-      `[${idx}:v]trim=start=${clip.sourceTrimIn}:end=${clip.sourceTrimOut},setpts=PTS-STARTPTS,setpts=PTS+${delay}/TB[${trimLabel}]`,
-    );
-    filters.push(
-      `[${trimLabel}]crop=${px.cropW}:${px.cropH}:${px.cropX}:${px.cropY},scale=${px.frameW}:${px.frameH},format=yuv420p[${scaledLabel}]`,
-    );
-    filters.push(
-      `[${videoLabel}][${scaledLabel}]overlay=${px.frameX}:${px.frameY}:enable='${between(clip)}':eof_action=pass[${out}]`,
-    );
-    videoLabel = out;
-  }
-
-  for (const clip of textClips) {
-    const { filter, outLabel } = drawtextFilter(
-      clip.template,
-      clip.text,
-      width,
-      height,
-      '/font.ttf',
-      between(clip),
-      videoLabel,
-      clip.textFrame,
-    );
-    filters.push(filter);
-    videoLabel = outLabel;
-  }
-
-  const audioClips = state.clips.filter((c) => {
-    if (c.kind === 'audio') return true;
-    if (c.kind === 'video' && !c.muteAudio) {
-      const asset = state.mediaLibrary[c.assetId];
-      return asset?.hasAudio === true;
+    const out = `g${tag}out`;
+    if (enable) {
+      filters.push(`[g${tag}keep][${cursor}]overlay=0:0:enable='${enable}'[${out}]`);
+    } else {
+      filters.push(`[${cursor}]null[${out}]`);
     }
-    return false;
-  });
+    videoLabel = out;
+  };
+
+  // One ordered pass over the track stack, bottom-most video track first, so the last
+  // clip written wins. Preview walks the same structure.
+  for (const layer of compositeLayers(state.clips, state.tracks)) {
+    for (const clip of layer.clips) {
+      if (clip.kind === 'text') {
+        // drawtext burns straight into the base frame, so there is no layer to filter.
+        const effects = activeEffects(clip);
+        if (effects.length > 0) {
+          warnings.push(
+            `Effects on the text clip "${clip.text.slice(0, 20)}" cannot be rendered by FFmpeg.`,
+          );
+        }
+        const { filter, outLabel } = drawtextFilter(
+          clip.template,
+          clip.text,
+          width,
+          height,
+          '/font.ttf',
+          between(clip),
+          videoLabel,
+          clip.textFrame,
+          fadeAlphaExpr(clip),
+        );
+        filters.push(filter);
+        videoLabel = outLabel;
+        continue;
+      }
+
+      if (clip.kind === 'video' && clip.hideVideo) continue;
+
+      const asset = state.mediaLibrary[clip.assetId];
+      if (!asset) continue;
+
+      const isImage = clip.kind === 'image';
+      const idx = registerAsset(asset, isImage ? ['-loop', '1', '-framerate', String(fps)] : []);
+      const trimLabel = `t${safeId(clip.id)}`;
+      const layerLabel = `l${safeId(clip.id)}`;
+      const out = `o${safeId(clip.id)}`;
+      const delay = clip.timelineStart;
+
+      // Images loop a still, so they trim by duration; A/V trims by source range.
+      const trimFilter = isImage
+        ? `trim=duration=${clipDuration(clip)}`
+        : `trim=start=${clip.sourceTrimIn}:end=${clip.sourceTrimOut}`;
+      filters.push(
+        `[${idx}:v]${trimFilter},setpts=PTS-STARTPTS,setpts=PTS+${delay}/TB[${trimLabel}]`,
+      );
+
+      // An FFmpeg filter chain is static, so an animated parameter cannot be expressed.
+      // Freezing it at the clip's midpoint keeps the export sensible; the warning keeps
+      // the user from thinking the animation survived.
+      const midpoint = clip.timelineStart + clipDuration(clip) / 2;
+      const effects = activeEffects(clip, midpoint);
+      if (isAnimated(clip)) {
+        warnings.push('Keyframed parameters are frozen at the clip midpoint by FFmpeg.');
+      }
+
+      // Effects run on the placed layer, exactly as the compositor runs them on its
+      // layer framebuffer, so radii and block sizes mean the same thing in both paths.
+      const transition = transitionFilters(clip, state.clips);
+      warnings.push(...transition.unsupported.map((label) => `FFmpeg cannot reproduce ${label}.`));
+      const fades = [...fadeFilters(clip), ...transition.filters];
+      // Alpha fades need a pixel format that has an alpha plane to fade.
+      const pixelFormat = fades.length > 0 ? 'format=yuva420p' : 'format=yuv420p';
+
+      const id = safeId(clip.id);
+      let overlayAt = 'x=0:y=0';
+      let preSteps: string[];
+      let chain: ReturnType<typeof ffmpegChain>;
+
+      if (!clip.transform) {
+        // Full-frame: fit inside the canvas and letterbox, drawn at the origin.
+        preSteps = [
+          `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
+          `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
+        ];
+        chain = ffmpegChain(effects, { width, height });
+      } else {
+        const sw = asset.width ?? width;
+        const sh = asset.height ?? height;
+        const px = overlayTransformToPixels(
+          transformAt(clip, midpoint) ?? clip.transform,
+          sw,
+          sh,
+          width,
+          height,
+        );
+        preSteps = [
+          `crop=${px.cropW}:${px.cropH}:${px.cropX}:${px.cropY}`,
+          `scale=${px.frameW}:${px.frameH}`,
+        ];
+        chain = ffmpegChain(effects, { width: px.frameW, height: px.frameH });
+        overlayAt = `${px.frameX}:${px.frameY}`;
+      }
+      warnings.push(...chain.unsupported.map((label) => `FFmpeg cannot reproduce ${label}.`));
+
+      // Effects are emitted as labelled segments rather than one comma-joined chain: a
+      // masked effect has to branch through `split`/`overlay`, which a chain cannot do.
+      let cursor = `${layerLabel}p`;
+      filters.push(`[${trimLabel}]${preSteps.join(',')}[${cursor}]`);
+      chain.segments.forEach((segment, index) => {
+        const next = `${layerLabel}e${index}`;
+        filters.push(segment(cursor, next, `${id}_${index}`));
+        cursor = next;
+      });
+      filters.push(`[${cursor}]${[pixelFormat, ...fades].join(',')}[${layerLabel}]`);
+      filters.push(
+        `[${videoLabel}][${layerLabel}]overlay=${overlayAt}:enable='${between(clip)}':eof_action=pass[${out}]`,
+      );
+      videoLabel = out;
+    }
+
+    // Track grade, then any ranged adjustments — the order the compositor uses.
+    if (layer.track.effects?.length) {
+      gradeAccumulated(enabledEffects(layer.track.effects), `tr${safeId(layer.track.id)}`);
+    }
+    for (const adjustment of layer.adjustments) {
+      const mid = adjustment.timelineStart + clipDuration(adjustment) / 2;
+      if (isAnimated(adjustment)) {
+        warnings.push('Keyframed parameters are frozen at the clip midpoint by FFmpeg.');
+      }
+      gradeAccumulated(
+        activeEffects(adjustment, mid),
+        `ad${safeId(adjustment.id)}`,
+        between(adjustment),
+      );
+    }
+  }
 
   const audioLabels: string[] = [];
-  for (const clip of audioClips) {
+  for (const { clip, gain } of audibleClips(state.clips, state.tracks)) {
     if (clip.kind !== 'audio' && clip.kind !== 'video') continue;
     const asset = state.mediaLibrary[clip.assetId];
     if (!asset) continue;
+    if (clip.kind === 'video' && asset.hasAudio === false) continue;
+
     const idx = registerAsset(asset);
     const aLabel = `a${safeId(clip.id)}`;
     const delayMs = Math.round(clip.timelineStart * 1000);
-
-    const track = state.tracks.find((tr) => tr.id === clip.trackId);
-    const volume = getAudioTrackVolume(track);
-    const volumeFilter = volume !== 1 ? `,volume=${volume}` : '';
-    filters.push(
-      `[${idx}:a]atrim=start=${clip.sourceTrimIn}:end=${clip.sourceTrimOut},asetpts=PTS-STARTPTS,adelay=${delayMs}|${delayMs}${volumeFilter}[${aLabel}]`,
-    );
+    const steps = [
+      `atrim=start=${clip.sourceTrimIn}:end=${clip.sourceTrimOut}`,
+      'asetpts=PTS-STARTPTS',
+      // afade runs before the delay, so its timings are clip-relative.
+      ...afadeFilters(clip),
+      ...transitionAfades(clip, state.clips),
+      `adelay=${delayMs}|${delayMs}`,
+      ...(gain !== 1 ? [`volume=${gain}`] : []),
+    ];
+    filters.push(`[${idx}:a]${steps.join(',')}[${aLabel}]`);
     audioLabels.push(aLabel);
   }
 
@@ -186,8 +345,11 @@ export function buildExportPlan(state: Pick<EditorState, 'clips' | 'mediaLibrary
   } else if (audioLabels.length === 1) {
     audioOut = audioLabels[0];
   } else {
+    // normalize=0 is required: amix's default divides by the input count, so adding a
+    // second audio clip would quietly attenuate the whole mix. The preview sums clip
+    // gains straight into the destination, and the export has to match it.
     filters.push(
-      `${audioLabels.map((l) => `[${l}]`).join('')}amix=inputs=${audioLabels.length}:duration=longest:dropout_transition=0[amixed]`,
+      `${audioLabels.map((l) => `[${l}]`).join('')}amix=inputs=${audioLabels.length}:normalize=0:duration=longest:dropout_transition=0[amixed]`,
     );
     audioOut = 'amixed';
   }
@@ -198,6 +360,7 @@ export function buildExportPlan(state: Pick<EditorState, 'clips' | 'mediaLibrary
     videoOut: videoLabel,
     audioOut,
     duration,
+    warnings: [...new Set(warnings)],
   };
 }
 

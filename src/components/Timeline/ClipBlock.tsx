@@ -1,6 +1,5 @@
-import { useRef } from 'react';
-import type { Clip } from '../../types/editor';
-import { useEditorStore } from '../../store/editorStore';
+import { memo } from 'react';
+import type { Clip, MediaAsset } from '../../types/editor';
 import { clipDuration } from '../../utils/time';
 import { ClipFilmstrip } from './ClipFilmstrip';
 import { ClipWaveform } from './ClipWaveform';
@@ -8,123 +7,160 @@ import { ClipWaveform } from './ClipWaveform';
 interface Props {
   clip: Clip;
   pxPerSec: number;
+  fps: number;
+  trackHeight: number;
+  selected: boolean;
+  invalid: boolean;
+  locked: boolean;
+  asset: MediaAsset | undefined;
+  onPointerDown: (
+    e: React.PointerEvent,
+    clip: Clip,
+    mode: 'move' | 'left' | 'right' | 'fadeIn' | 'fadeOut',
+  ) => void;
 }
 
-export function ClipBlock({ clip, pxPerSec }: Props) {
-  const selectedClipId = useEditorStore((s) => s.selectedClipId);
-  const mediaLibrary = useEditorStore((s) => s.mediaLibrary);
-  const selectClip = useEditorStore((s) => s.selectClip);
-  const moveClip = useEditorStore((s) => s.moveClip);
-  const trimClip = useEditorStore((s) => s.trimClip);
-  const setTrimPreview = useEditorStore((s) => s.setTrimPreview);
-  const clearTrimPreview = useEditorStore((s) => s.clearTrimPreview);
-  const settings = useEditorStore((s) => s.settings);
+function clipLabel(clip: Clip, asset: MediaAsset | undefined): string {
+  if (clip.kind === 'text') return clip.text.slice(0, 40) || 'Text';
+  if (clip.kind === 'adjustment') return 'Adjustment';
+  return asset?.name ?? clip.kind;
+}
 
-  const dragRef = useRef<{ startX: number; startT: number } | null>(null);
-  const trimRef = useRef<{ edge: 'left' | 'right'; startX: number } | null>(null);
-
-  const dur = clipDuration(clip);
+export const ClipBlock = memo(function ClipBlock({
+  clip,
+  pxPerSec,
+  fps,
+  trackHeight,
+  selected,
+  invalid,
+  locked,
+  asset,
+  onPointerDown,
+}: Props) {
+  const duration = clipDuration(clip);
   const left = clip.timelineStart * pxPerSec;
-  const width = Math.max(24, dur * pxPerSec);
-  const audioAsset = clip.kind === 'audio' ? mediaLibrary[clip.assetId] : undefined;
-  const videoAsset =
-    clip.kind === 'video' && !clip.hideVideo ? mediaLibrary[clip.assetId] : undefined;
+  const width = Math.max(8, duration * pxPerSec);
+  const height = Math.max(20, trackHeight - 8);
+  const label = clipLabel(clip, asset);
+  const fadeIn = clip.fadeIn ?? 0;
+  const fadeOut = clip.fadeOut ?? 0;
+  const effectCount = (clip.effects ?? []).filter((e) => e.enabled).length;
 
-  let label: string;
-  switch (clip.kind) {
-    case 'text':
-      label = clip.text.slice(0, 24);
-      break;
-    case 'video':
-    case 'audio':
-    case 'image':
-      label = mediaLibrary[clip.assetId]?.name ?? clip.kind;
-      break;
-  }
+  // A video clip carries its own audio: picture on top, waveform underneath.
+  const showsAudioStrip =
+    clip.kind === 'audio' || (clip.kind === 'video' && clip.hasAudio && clip.audioEnabled);
+  const videoStripHeight =
+    clip.kind === 'video' && showsAudioStrip ? Math.round(height * 0.62) : height;
+  const audioStripHeight = clip.kind === 'video' ? height - videoStripHeight : height;
 
-  const onPointerDown = (e: React.PointerEvent, mode: 'move' | 'left' | 'right') => {
-    e.stopPropagation();
-    selectClip(clip.id);
-    (e.target as HTMLElement).setPointerCapture(e.pointerId);
-    if (mode === 'move') {
-      dragRef.current = { startX: e.clientX, startT: clip.timelineStart };
-    } else {
-      trimRef.current = { edge: mode, startX: e.clientX };
-    }
-  };
-
-  const onPointerMove = (e: React.PointerEvent) => {
-    if (dragRef.current) {
-      const dx = e.clientX - dragRef.current.startX;
-      moveClip(clip.id, dragRef.current.startT + dx / pxPerSec);
-    }
-    if (trimRef.current) {
-      const dx = e.clientX - trimRef.current.startX;
-      trimRef.current.startX = e.clientX;
-      const edge = trimRef.current.edge;
-      trimClip(clip.id, edge, dx / pxPerSec);
-
-      const updated = useEditorStore.getState().clips.find((c) => c.id === clip.id);
-      if (updated && (updated.kind === 'video' || updated.kind === 'audio')) {
-        const frame = 1 / settings.fps;
-        const sourceTime =
-          edge === 'left'
-            ? updated.sourceTrimIn
-            : Math.max(updated.sourceTrimIn, updated.sourceTrimOut - frame);
-        setTrimPreview(clip.id, sourceTime);
-      }
-    }
-  };
-
-  const onPointerUp = () => {
-    if (trimRef.current) clearTrimPreview();
-    dragRef.current = null;
-    trimRef.current = null;
-  };
+  const classes = [
+    'clip',
+    `clip--${clip.kind}`,
+    selected ? 'is-selected' : '',
+    invalid && selected ? 'is-invalid' : '',
+    locked ? 'is-locked' : '',
+    clip.kind === 'video' && clip.transform ? 'has-transform' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   return (
     <div
-      className={`clip-block ${clip.kind} ${selectedClipId === clip.id ? 'selected' : ''}`}
-      style={{ left, width }}
-      onPointerDown={(e) => onPointerDown(e, 'move')}
-      onPointerMove={onPointerMove}
-      onPointerUp={onPointerUp}
+      className={classes}
+      style={{ left, width, height, top: 4 }}
+      onPointerDown={(e) => onPointerDown(e, clip, 'move')}
       title={label}
     >
-      <span
-        className="clip-handle left"
-        onPointerDown={(e) => onPointerDown(e, 'left')}
-      />
-      {videoAsset && videoAsset.type === 'video' && (
-        <ClipFilmstrip
-          assetId={videoAsset.id}
-          blobUrl={videoAsset.blobUrl}
-          duration={videoAsset.duration}
-          sourceTrimIn={clip.sourceTrimIn}
-          sourceTrimOut={clip.sourceTrimOut}
-          width={width}
-          height={56}
+      {clip.kind === 'video' && !clip.hideVideo && asset && (
+        <div className="clip-visual" style={{ height: videoStripHeight }}>
+          <ClipFilmstrip
+            assetId={asset.id}
+            blobUrl={asset.blobUrl}
+            duration={asset.duration}
+            sourceTrimIn={clip.sourceTrimIn}
+            sourceTrimOut={clip.sourceTrimOut}
+            width={width}
+            height={videoStripHeight}
+          />
+        </div>
+      )}
+
+      {clip.kind === 'image' && asset && (
+        <div
+          className="clip-image-fill"
+          style={{ height, backgroundImage: `url(${asset.blobUrl})` }}
         />
       )}
-      {audioAsset && (
-        <ClipWaveform
-          assetId={audioAsset.id}
-          file={audioAsset.file}
-          duration={audioAsset.duration}
-          sourceTrimIn={clip.sourceTrimIn}
-          sourceTrimOut={clip.sourceTrimOut}
-          width={width}
-          height={56}
+
+      {showsAudioStrip && asset && (
+        <div
+          className="clip-audio"
+          style={{ height: audioStripHeight, top: clip.kind === 'video' ? videoStripHeight : 0 }}
+        >
+          <ClipWaveform
+            assetId={asset.id}
+            file={asset.file}
+            duration={asset.duration}
+            sourceTrimIn={clip.sourceTrimIn}
+            sourceTrimOut={clip.sourceTrimOut}
+            width={width}
+            height={audioStripHeight}
+          />
+        </div>
+      )}
+
+      {/* Fade ramps: the wedge is the envelope, drawn over whatever the clip shows. */}
+      {fadeIn > 0 && (
+        <span
+          className="clip-fade clip-fade--in"
+          style={{ width: Math.max(2, fadeIn * pxPerSec), height }}
         />
       )}
+      {fadeOut > 0 && (
+        <span
+          className="clip-fade clip-fade--out"
+          style={{ width: Math.max(2, fadeOut * pxPerSec), height }}
+        />
+      )}
+      {/* Length in frames, which is the unit the edit actually snaps to. */}
+      {fadeIn * pxPerSec > 30 && (
+        <span className="clip-fade-count clip-fade-count--in">{Math.round(fadeIn * fps)}f</span>
+      )}
+      {fadeOut * pxPerSec > 30 && (
+        <span className="clip-fade-count clip-fade-count--out">{Math.round(fadeOut * fps)}f</span>
+      )}
+
       <span className="clip-label">
-        {clip.kind === 'video' && clip.overlayMode ? 'PiP · ' : ''}
+        {clip.kind === 'video' && clip.transform ? '◱ ' : ''}
+        {clip.kind === 'video' && clip.hasAudio && !clip.audioEnabled ? '🔇 ' : ''}
+        {effectCount > 0 ? <span className="clip-fx-badge">fx{effectCount}</span> : null}
         {label}
       </span>
-      <span
-        className="clip-handle right"
-        onPointerDown={(e) => onPointerDown(e, 'right')}
-      />
+
+      {!locked && (
+        <>
+          <span
+            className="clip-handle clip-handle--left"
+            onPointerDown={(e) => onPointerDown(e, clip, 'left')}
+          />
+          <span
+            className="clip-handle clip-handle--right"
+            onPointerDown={(e) => onPointerDown(e, clip, 'right')}
+          />
+          <span
+            className="clip-fade-grip clip-fade-grip--in"
+            style={{ left: fadeIn * pxPerSec }}
+            title="Drag to fade in"
+            onPointerDown={(e) => onPointerDown(e, clip, 'fadeIn')}
+          />
+          <span
+            className="clip-fade-grip clip-fade-grip--out"
+            style={{ right: fadeOut * pxPerSec }}
+            title="Drag to fade out"
+            onPointerDown={(e) => onPointerDown(e, clip, 'fadeOut')}
+          />
+        </>
+      )}
     </div>
   );
-}
+});

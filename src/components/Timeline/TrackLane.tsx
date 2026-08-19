@@ -1,63 +1,99 @@
-import type { Track, Clip } from '../../types/editor';
-import { useEditorStore } from '../../store/editorStore';
-import { getAudioTrackVolume } from '../../utils/trackVolume';
+import { memo } from 'react';
+import type { Clip, MediaAsset, Track } from '../../types/editor';
+import { clipEnd } from '../../utils/time';
+import { TRANSITION_LABELS, allTransitions } from '../../utils/transitions';
 import { ClipBlock } from './ClipBlock';
-import { TRACK_LABEL_WIDTH } from './constants';
+import { KEYFRAME_ROW_HEIGHT, KeyframeStrip, keyframeRows } from './KeyframeStrip';
+import { CULL_MARGIN_PX } from './constants';
 
 interface Props {
   track: Track;
   clips: Clip[];
   pxPerSec: number;
-  onSeek: (t: number) => void;
+  fps: number;
+  scrollX: number;
+  viewportWidth: number;
+  selectedIds: string[];
+  dragInvalid: boolean;
+  mediaLibrary: Record<string, MediaAsset>;
+  onClipPointerDown: (
+    e: React.PointerEvent,
+    clip: Clip,
+    mode: 'move' | 'left' | 'right' | 'fadeIn' | 'fadeOut',
+  ) => void;
 }
 
-export function TrackLane({ track, clips, pxPerSec, onSeek }: Props) {
-  const setTrackVolume = useEditorStore((s) => s.setTrackVolume);
-  const trackClips = clips.filter((c) => c.trackId === track.id);
-  const volume = track.kind === 'audio' ? getAudioTrackVolume(track) : null;
-
-  const stopLaneClick = (e: React.SyntheticEvent) => {
-    e.stopPropagation();
-  };
+export const TrackLane = memo(function TrackLane({
+  track,
+  clips,
+  pxPerSec,
+  fps,
+  scrollX,
+  viewportWidth,
+  selectedIds,
+  dragInvalid,
+  mediaLibrary,
+  onClipPointerDown,
+}: Props) {
+  const from = scrollX - CULL_MARGIN_PX;
+  const to = scrollX + viewportWidth + CULL_MARGIN_PX;
 
   return (
     <div
-      className={`track-row${track.kind === 'audio' ? ' track-row--audio' : ''}${track.kind === 'video' ? ' track-row--video' : ''}`}
+      className={`lane lane--${track.kind}${track.locked ? ' is-locked' : ''}${
+        track.hidden ? ' is-hidden' : ''
+      }`}
+      style={{ height: track.height }}
+      data-track-id={track.id}
     >
-      <div className="track-label" style={{ width: TRACK_LABEL_WIDTH }}>
-        <span className="track-label-name">{track.label}</span>
-        {track.kind === 'audio' && volume !== null && (
-          <div
-            className="track-volume"
-            onPointerDown={stopLaneClick}
-            onClick={stopLaneClick}
-          >
-            <input
-              type="range"
-              min={0}
-              max={150}
-              step={1}
-              value={Math.round(volume * 100)}
-              onChange={(e) => setTrackVolume(track.id, Number(e.target.value) / 100)}
-              title="Track volume (0–150%)"
-            />
-            <span className="track-volume-value">{Math.round(volume * 100)}%</span>
-          </div>
-        )}
-      </div>
-      <div
-        className="track-lane"
-        style={{ minWidth: 0 }}
-        onClick={(e) => {
-          const rect = e.currentTarget.getBoundingClientRect();
-          const x = e.clientX - rect.left;
-          onSeek(x / pxPerSec);
-        }}
-      >
-        {trackClips.map((clip) => (
-          <ClipBlock key={clip.id} clip={clip} pxPerSec={pxPerSec} />
-        ))}
-      </div>
+      {clips.map((clip) => {
+        // Offscreen clips are not rendered at all — filmstrips and waveforms are expensive.
+        if (clipEnd(clip) * pxPerSec < from || clip.timelineStart * pxPerSec > to) return null;
+        return (
+          <ClipBlock
+            key={clip.id}
+            clip={clip}
+            pxPerSec={pxPerSec}
+            fps={fps}
+            trackHeight={track.height}
+            selected={selectedIds.includes(clip.id)}
+            invalid={dragInvalid}
+            locked={track.locked}
+            asset={'assetId' in clip ? mediaLibrary[clip.assetId] : undefined}
+            onPointerDown={onClipPointerDown}
+          />
+        );
+      })}
+
+      {/* A transition *is* the overlap, so it is drawn from the two clips' geometry. */}
+      {allTransitions(clips).map(({ clip, window }) => (
+        <div
+          key={`tr-${clip.id}`}
+          className="transition-bowtie"
+          style={{
+            left: window.start * pxPerSec,
+            width: Math.max(3, (window.end - window.start) * pxPerSec),
+            height: track.height - 8,
+          }}
+          title={`${TRANSITION_LABELS[window.type]} — drag either clip to change its length`}
+        />
+      ))}
+
+      {/* Keyframes for the selected clip only — one strip is informative, ten is noise. */}
+      {clips.map((clip) => {
+        if (!selectedIds.includes(clip.id)) return null;
+        if (clipEnd(clip) * pxPerSec < from || clip.timelineStart * pxPerSec > to) return null;
+        const rows = keyframeRows(clip).length;
+        if (rows === 0) return null;
+        return (
+          <KeyframeStrip
+            key={`kf-${clip.id}`}
+            clip={clip}
+            pxPerSec={pxPerSec}
+            top={Math.max(4, track.height - rows * KEYFRAME_ROW_HEIGHT - 4)}
+          />
+        );
+      })}
     </div>
   );
-}
+});

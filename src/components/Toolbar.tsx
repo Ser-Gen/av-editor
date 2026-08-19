@@ -1,6 +1,6 @@
 import { useRef } from 'react';
 import { useEditorStore } from '../store/editorStore';
-import { runExport } from '../export/runExport';
+import { cancelExport, runExport } from '../export/runExport';
 import { loadFfmpeg } from '../export/ffmpegLoader';
 import { formatExportError, logExportError } from '../export/exportLog';
 import type { ResolutionPreset } from '../types/editor';
@@ -18,11 +18,17 @@ export function Toolbar({ onAddText }: Props) {
   const ffmpegStatus = useEditorStore((s) => s.ffmpegStatus);
   const ffmpegError = useEditorStore((s) => s.ffmpegError);
   const exportProgress = useEditorStore((s) => s.exportProgress);
+  const exportEngine = useEditorStore((s) => s.exportEngine);
+  const exportNotice = useEditorStore((s) => s.exportNotice);
   const clips = useEditorStore((s) => s.clips);
 
   const setResolution = useEditorStore((s) => s.setResolution);
   const importFiles = useEditorStore((s) => s.importFiles);
   const setFfmpegStatus = useEditorStore((s) => s.setFfmpegStatus);
+  const undo = useEditorStore((s) => s.undo);
+  const redo = useEditorStore((s) => s.redo);
+  const undoLabel = useEditorStore((s) => s.past[s.past.length - 1]?.label ?? null);
+  const redoLabel = useEditorStore((s) => s.future[s.future.length - 1]?.label ?? null);
 
   const handlePreload = async () => {
     setFfmpegStatus('loading');
@@ -36,16 +42,21 @@ export function Toolbar({ onAddText }: Props) {
     }
   };
 
-  const handleExport = async () => {
+  const handleExport = async (forceFfmpeg = false) => {
     try {
-      await runExport();
+      await runExport({ forceFfmpeg });
     } catch (e) {
       logExportError(e, 'export (UI)');
     }
   };
 
-  const statusLabel =
-    ffmpegStatus === 'ready'
+  const exporting = exportProgress != null;
+  const engineLabel =
+    exportEngine === 'webcodecs' ? 'WebCodecs' : exportEngine === 'ffmpeg' ? 'FFmpeg' : null;
+
+  const statusLabel = exporting
+    ? `${engineLabel ?? 'Export'} ${exportProgress}%`
+    : ffmpegStatus === 'ready'
       ? 'FFmpeg: Ready'
       : ffmpegStatus === 'loading'
         ? 'FFmpeg: Loading…'
@@ -55,6 +66,23 @@ export function Toolbar({ onAddText }: Props) {
 
   return (
     <header className="toolbar">
+      <button
+        type="button"
+        disabled={!undoLabel}
+        title={undoLabel ? `Undo: ${undoLabel} (⌘Z)` : 'Nothing to undo'}
+        onClick={() => undo()}
+      >
+        ↶ Undo
+      </button>
+      <button
+        type="button"
+        disabled={!redoLabel}
+        title={redoLabel ? `Redo: ${redoLabel} (⇧⌘Z)` : 'Nothing to redo'}
+        onClick={() => redo()}
+      >
+        ↷ Redo
+      </button>
+      <span className="toolbar-divider" />
       <button type="button" onClick={() => videoRef.current?.click()}>
         + Video
       </button>
@@ -100,10 +128,13 @@ export function Toolbar({ onAddText }: Props) {
 
       <div className="spacer" />
 
-      <span className="status" title="Large exports may be slow and memory-limited in the browser">
+      <span
+        className="status"
+        title={exportNotice ?? 'Exports use WebCodecs when available, otherwise FFmpeg WASM'}
+      >
         {statusLabel}
-        {exportProgress != null ? ` · Export ${exportProgress}%` : ''}
       </span>
+      {exportNotice && !exporting && <span className="export-notice">{exportNotice}</span>}
 
       <button type="button" onClick={() => void handlePreload()} disabled={ffmpegStatus === 'loading'}>
         Load FFmpeg
@@ -124,12 +155,27 @@ export function Toolbar({ onAddText }: Props) {
 
       <button
         type="button"
-        className="primary"
-        onClick={() => void handleExport()}
-        disabled={clips.length === 0 || exportProgress != null}
+        title="Force the FFmpeg pipeline instead of WebCodecs"
+        onClick={() => void handleExport(true)}
+        disabled={clips.length === 0 || exporting}
       >
-        Export MP4
+        Export (FFmpeg)
       </button>
+
+      {exporting ? (
+        <button type="button" className="primary" onClick={() => cancelExport()}>
+          Cancel
+        </button>
+      ) : (
+        <button
+          type="button"
+          className="primary"
+          onClick={() => void handleExport()}
+          disabled={clips.length === 0}
+        >
+          Export MP4
+        </button>
+      )}
     </header>
   );
 }

@@ -69,7 +69,8 @@ export function ClipWaveform({
     const maxBarHeight = (h - 4) / 2;
     const barWidth = w / visiblePeaks.length;
 
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.42)';
+    // Light bars: the strip sits on dark blue (video clips) and dark green (audio clips).
+    ctx.fillStyle = 'rgba(226, 240, 255, 0.62)';
     for (let i = 0; i < visiblePeaks.length; i++) {
       const peak = visiblePeaks[i];
       const barH = Math.max(1, peak * maxBarHeight);
@@ -79,7 +80,12 @@ export function ClipWaveform({
     }
   }, [visiblePeaks, width, height]);
 
-  if (!visiblePeaks || visiblePeaks.length === 0) return null;
+  // Decode fails for some MP4/MOV audio depending on browser codec support —
+  // degrade to a flat ribbon so the clip still reads as "has audio".
+  if (visiblePeaks && visiblePeaks.length === 0) {
+    return <div className="clip-audio-flat" style={{ height }} aria-hidden />;
+  }
+  if (!visiblePeaks) return null;
 
   return <canvas ref={canvasRef} className="clip-waveform" aria-hidden />;
 }

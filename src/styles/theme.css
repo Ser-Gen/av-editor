@@ -14,6 +14,9 @@
   --clip-text: #9e3db5;
   --radius: 6px;
   --font: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --scrollbar-size: 10px;
+  --scrollbar-thumb: color-mix(in srgb, var(--text-muted) 26%, transparent);
+  --scrollbar-thumb-hover: color-mix(in srgb, var(--text-muted) 60%, transparent);
 }
 
 @font-face {
@@ -27,6 +30,49 @@
 *::before,
 *::after {
   box-sizing: border-box;
+}
+
+/*
+ * Scrollbars. A default light-theme scrollbar in a dark panel is the brightest thing in it,
+ * which is backwards — it is a position indicator, not content.
+ *
+ * Both syntaxes are here deliberately. Chrome 121+ and Firefox take the standard properties;
+ * older WebKit takes the pseudo-elements; a browser that understands both ignores the
+ * pseudo-elements entirely, so the two can never disagree on screen.
+ */
+html {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: var(--scrollbar-size);
+  height: var(--scrollbar-size);
+}
+
+*::-webkit-scrollbar-track,
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  /* The transparent border plus padding-box clipping is what insets the thumb from the
+     track, so it reads as a hint rather than as a bar down the edge of the panel. */
+  background: var(--scrollbar-thumb);
+  background-clip: padding-box;
+  border: 3px solid transparent;
+  border-radius: 999px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+
+/* Quiet until you are actually in the panel that scrolls. */
+.inspector:hover,
+.media-library-list:hover {
+  scrollbar-color: var(--scrollbar-thumb-hover) transparent;
 }
 
 html,
@@ -97,6 +143,14 @@ label {
   overflow: hidden;
 }
 
+/* Set for the length of a timeline drag. Scrubbing the playhead should move the playhead,
+   not highlight the panels the pointer passes over. */
+body.is-dragging,
+body.is-dragging * {
+  user-select: none;
+  -webkit-user-select: none;
+}
+
 .toolbar {
   display: flex;
   align-items: center;
@@ -128,6 +182,18 @@ label {
 .toolbar .status {
   color: var(--text-muted);
   font-size: 12px;
+  white-space: nowrap;
+}
+
+/* Why the fast export path was declined, or how the last export finished. */
+.toolbar .export-notice {
+  color: var(--text-muted);
+  font-size: 11px;
+  max-width: 340px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.85;
 }
 
 .toolbar-resolution {
@@ -175,26 +241,180 @@ label {
   color: #fff;
 }
 
-.media-library-recording {
+/* ------------------------------------------------------------------ record panel */
+
+.record-panel {
+  margin: 8px 12px 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: rgba(0, 0, 0, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.record-sources {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.record-source {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 8px 12px 0;
-  padding: 8px;
+  padding: 5px 8px;
   font-size: 11px;
-  color: #ffcdd2;
-  background: rgba(198, 40, 40, 0.2);
-  border: 1px solid rgba(229, 57, 53, 0.5);
-  border-radius: var(--radius);
+  text-align: left;
+  opacity: 0.55;
 }
 
-.media-library-recording-dot {
+.record-source.is-on {
+  opacity: 1;
+  border-color: #4a8cff;
+  background: rgba(74, 140, 255, 0.12);
+}
+
+.record-source-name {
+  flex: 1;
+}
+
+/* A dead microphone should be visible in the first second, not after the take. */
+.record-meter {
+  width: 54px;
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.record-meter-fill {
+  display: block;
+  height: 100%;
+  background: linear-gradient(90deg, #4caf50, #ffc107 70%, #ef5350);
+  transition: width 80ms linear;
+}
+
+.record-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.record-readout {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: #ffcdd2;
+}
+
+.record-dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
   background: #ef5350;
   flex-shrink: 0;
   animation: pulse-rec 1s ease-in-out infinite;
+}
+
+.record-disk {
+  margin: 0;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.record-disk.is-writing {
+  color: #ffd54f;
+}
+
+.record-engine {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--text-muted);
+  opacity: 0.85;
+}
+
+.record-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text);
+  cursor: pointer;
+}
+
+.record-option input {
+  margin: 1px 0 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+
+.record-option input:disabled,
+.record-option:has(input:disabled) {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.record-option-note {
+  display: block;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
+.record-option-note--block {
+  margin: 0;
+}
+
+.record-warning,
+.record-notice {
+  margin: 0;
+  font-size: 10px;
+  line-height: 1.45;
+  color: #ffcdd2;
+}
+
+.record-recovery {
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+  font-size: 11px;
+}
+
+.record-recovery-title {
+  margin: 0 0 6px;
+  color: #ffd54f;
+}
+
+.record-recovery ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.record-recovery li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.record-recovery-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.record-recovery-actions button {
+  font-size: 10px;
+  padding: 2px 6px;
 }
 
 @keyframes pulse-rec {
@@ -329,6 +549,7 @@ label {
 }
 
 .preview-wrap {
+  position: relative;
   flex: 1;
   display: flex;
   align-items: center;
@@ -336,6 +557,57 @@ label {
   background: #000;
   min-height: 0;
   padding: 12px;
+}
+
+.mask-layer {
+  position: absolute;
+  pointer-events: none;
+}
+
+.mask-box {
+  position: absolute;
+  border: 1px solid #ffd479;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6) inset;
+  background: rgba(255, 212, 121, 0.12);
+  cursor: move;
+  pointer-events: auto;
+}
+
+.mask-box--ellipse {
+  border-radius: 50%;
+}
+
+.mask-handle {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  background: #ffd479;
+  border: 1px solid rgba(0, 0, 0, 0.7);
+}
+
+.mask-handle--nw { left: -6px; top: -6px; cursor: nwse-resize; }
+.mask-handle--ne { right: -6px; top: -6px; cursor: nesw-resize; }
+.mask-handle--sw { left: -6px; bottom: -6px; cursor: nesw-resize; }
+.mask-handle--se { right: -6px; bottom: -6px; cursor: nwse-resize; }
+
+.effect-presets {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.effect-presets button {
+  padding: 1px 6px;
+  font-size: 11px;
+}
+
+.effect-region {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0;
+  border-top: 1px dashed var(--border);
 }
 
 .preview-wrap canvas {
@@ -365,6 +637,14 @@ label {
   display: flex;
   flex-direction: column;
   gap: 10px;
+  /* A flex item will not shrink below its content without this, which is how the effect
+     sections ended up extending underneath the timeline with no way to reach them. */
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* Reserve the gutter so the effect rows do not shift sideways the moment a stack grows
+     tall enough to scroll. */
+  scrollbar-gutter: stable;
 }
 
 .inspector h3 {
@@ -416,216 +696,6 @@ label {
   font-size: 11px;
 }
 
-.timeline-panel {
-  height: 240px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  border-top: 1px solid var(--border);
-  background: var(--surface);
-}
-
-.timeline-scroll {
-  flex: 1;
-  overflow: auto;
-  position: relative;
-}
-
-.timeline-inner {
-  position: relative;
-  min-width: 100%;
-}
-
-.ruler {
-  height: 28px;
-  position: sticky;
-  top: 0;
-  z-index: 2;
-  background: var(--surface2);
-  border-bottom: 1px solid var(--border);
-}
-
-.ruler-tick {
-  position: absolute;
-  top: 0;
-  height: 100%;
-  border-left: 1px solid var(--border);
-  font-size: 10px;
-  color: var(--text-muted);
-  padding-left: 4px;
-  padding-top: 4px;
-}
-
-.playhead-line {
-  position: absolute;
-  top: 0;
-  bottom: 0;
-  width: 2px;
-  background: var(--accent);
-  z-index: 5;
-  pointer-events: none;
-}
-
-.track-row {
-  display: flex;
-  height: 48px;
-  border-bottom: 1px solid var(--border);
-}
-
-.track-row--audio,
-.track-row--video {
-  height: 64px;
-}
-
-.track-label {
-  width: 140px;
-  flex-shrink: 0;
-  padding: 6px 8px;
-  font-size: 11px;
-  color: var(--text-muted);
-  border-right: 1px solid var(--border);
-  background: var(--surface2);
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  gap: 4px;
-  min-width: 0;
-}
-
-.track-label-name {
-  font-weight: 500;
-  color: var(--text);
-}
-
-.track-volume {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-}
-
-.track-volume input[type='range'] {
-  flex: 1;
-  min-width: 0;
-  margin: 0;
-}
-
-.track-volume-value {
-  width: 34px;
-  flex-shrink: 0;
-  font-size: 10px;
-  text-align: right;
-  color: var(--text-muted);
-}
-
-.track-lane {
-  flex: 1;
-  position: relative;
-  background: var(--bg);
-}
-
-.clip-block {
-  position: absolute;
-  top: 6px;
-  height: 36px;
-  border-radius: 4px;
-  padding: 0 8px;
-  display: flex;
-  align-items: center;
-  font-size: 11px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-  cursor: grab;
-  user-select: none;
-  border: 2px solid transparent;
-}
-
-.clip-block.selected {
-  border-color: #fff;
-  box-shadow: 0 0 0 1px var(--accent);
-}
-
-.clip-block.video {
-  background: color-mix(in srgb, var(--clip-video) 55%, #1a2030);
-  align-items: stretch;
-  padding: 0;
-}
-
-.track-row:not(.track-row--audio) .clip-block.video {
-  top: 4px;
-  height: 56px;
-}
-
-.clip-filmstrip {
-  position: absolute;
-  inset: 0;
-  display: flex;
-  overflow: hidden;
-  pointer-events: none;
-  border-radius: inherit;
-}
-
-.clip-filmstrip-tile {
-  flex: 0 0 auto;
-  object-fit: cover;
-  display: block;
-  border-right: 1px solid rgba(0, 0, 0, 0.25);
-}
-
-.clip-filmstrip-tile:last-child {
-  border-right: none;
-}
-.clip-block.audio {
-  background: color-mix(in srgb, var(--clip-audio) 72%, #0d1f17);
-  align-items: stretch;
-  padding: 0;
-}
-.clip-block.image { background: var(--clip-image); }
-.clip-block.text { background: var(--clip-text); }
-
-.track-row--audio .clip-block.audio {
-  top: 4px;
-  height: 56px;
-}
-
-.clip-waveform {
-  position: absolute;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  pointer-events: none;
-  border-radius: inherit;
-}
-
-.clip-label {
-  position: relative;
-  z-index: 1;
-  align-self: flex-start;
-  max-width: calc(100% - 16px);
-  margin: 3px 8px 0;
-  padding: 1px 4px;
-  font-size: 10px;
-  line-height: 1.2;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  border-radius: 2px;
-  background: rgba(0, 0, 0, 0.35);
-  color: #e8fff4;
-}
-
-.clip-handle {
-  position: absolute;
-  top: 0;
-  width: 8px;
-  height: 100%;
-  cursor: ew-resize;
-  z-index: 2;
-}
-
-.clip-handle.left { left: 0; }
-.clip-handle.right { right: 0; }
 
 .modal-backdrop {
   position: fixed;
@@ -663,4 +733,883 @@ label {
   color: var(--text-muted);
   font-size: 11px;
   line-height: 1.4;
+}
+
+/* ------------------------------------------------------------------ layout */
+
+.panel-splitter {
+  height: 6px;
+  flex-shrink: 0;
+  background: var(--border);
+  cursor: row-resize;
+}
+
+.panel-splitter:hover {
+  background: var(--accent);
+}
+
+body.is-resizing {
+  cursor: row-resize;
+  user-select: none;
+}
+
+.timeline-slot {
+  flex-shrink: 0;
+  min-height: 140px;
+  display: flex;
+}
+
+.toolbar-divider {
+  width: 1px;
+  align-self: stretch;
+  margin: 0 4px;
+  background: var(--border);
+}
+
+/* ---------------------------------------------------------------- timeline */
+
+.timeline {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface);
+  border-top: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.timeline-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 10px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.timeline-toolbar button {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.timeline-toolbar button.is-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 26%, var(--surface2));
+  color: #fff;
+}
+
+.zoom-readout {
+  min-width: 66px;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.timeline-hint {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Grid: [headers | ruler] over [headers | lanes], plus a scrollbar strip. */
+.timeline-body {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: var(--header-width, 172px) 1fr;
+  grid-template-rows: auto 1fr auto;
+}
+
+.timeline-corner {
+  grid-column: 1;
+  grid-row: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  color: var(--text-muted);
+  background: var(--surface2);
+  border-right: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.ruler-viewport {
+  grid-column: 2;
+  grid-row: 1;
+  position: relative;
+  overflow: hidden;
+  background: var(--surface2);
+  border-bottom: 1px solid var(--border);
+  cursor: ew-resize;
+}
+
+.ruler-shift,
+.ruler-inner {
+  position: absolute;
+  inset: 0;
+  will-change: transform;
+}
+
+.ruler-tick {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.ruler-tick--major {
+  background: var(--border);
+}
+
+.ruler-label {
+  position: absolute;
+  left: 4px;
+  top: 7px;
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
+/* Headers never scroll horizontally — track identity stays put. */
+.track-headers {
+  grid-column: 1;
+  grid-row: 2;
+  overflow: hidden;
+  background: var(--surface2);
+  border-right: 1px solid var(--border);
+}
+
+.track-headers-shift {
+  will-change: transform;
+}
+
+.track-header {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.track-header--video {
+  background: color-mix(in srgb, var(--clip-video) 9%, transparent);
+}
+
+.track-header--audio {
+  background: color-mix(in srgb, var(--clip-audio) 9%, transparent);
+}
+
+.track-header-top {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.track-name {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  padding: 1px 4px;
+  border: 1px solid transparent;
+  background: transparent;
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.track-name-input {
+  flex: 1;
+  min-width: 0;
+  padding: 1px 4px;
+  font-size: 12px;
+}
+
+.track-order {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.track-order button {
+  padding: 0 4px;
+  font-size: 8px;
+  line-height: 1.1;
+  border-radius: 3px;
+}
+
+.track-header-controls {
+  display: flex;
+  gap: 3px;
+}
+
+.track-header-controls button {
+  padding: 1px 6px;
+  font-size: 10px;
+  line-height: 1.5;
+  border-radius: 3px;
+}
+
+.track-header-controls button.is-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 30%, var(--surface2));
+  color: #fff;
+}
+
+.track-header.is-compact .track-header-controls {
+  display: none;
+}
+
+.track-volume {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: auto;
+}
+
+.track-volume input[type='range'] {
+  flex: 1;
+  min-width: 0;
+  height: 14px;
+  margin: 0;
+}
+
+.track-volume span {
+  width: 34px;
+  font-size: 10px;
+  text-align: right;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.track-resize {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -2px;
+  height: 5px;
+  cursor: ns-resize;
+}
+
+.track-resize:hover {
+  background: var(--accent);
+}
+
+/* The timeline owns its scrolling: no browser scroll, ever. */
+.lanes-viewport {
+  grid-column: 2;
+  grid-row: 2;
+  position: relative;
+  overflow: hidden;
+  background: var(--bg);
+  overscroll-behavior: contain;
+  touch-action: none;
+}
+
+.lanes-content {
+  position: relative;
+  will-change: transform;
+}
+
+/* Scrolling room past the last clip. Dimmed so the drawn width is never mistaken for
+   project length — export stops at the line on its left edge. */
+.lanes-beyond {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+  border-left: 1px solid color-mix(in srgb, var(--text-muted) 45%, transparent);
+}
+
+.lane {
+  position: relative;
+  border-bottom: 1px solid var(--border);
+}
+
+.lane--video {
+  background: linear-gradient(color-mix(in srgb, var(--clip-video) 5%, transparent), transparent);
+}
+
+.lane--audio {
+  background: linear-gradient(color-mix(in srgb, var(--clip-audio) 5%, transparent), transparent);
+}
+
+.lane.is-hidden {
+  opacity: 0.45;
+}
+
+.lane.is-locked {
+  background-image: repeating-linear-gradient(
+    45deg,
+    transparent,
+    transparent 6px,
+    rgba(255, 255, 255, 0.03) 6px,
+    rgba(255, 255, 255, 0.03) 12px
+  );
+}
+
+/* ------------------------------------------------------------------- clips */
+
+.clip {
+  position: absolute;
+  border-radius: 5px;
+  overflow: hidden;
+  cursor: grab;
+  user-select: none;
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.4);
+}
+
+.clip--video {
+  background: color-mix(in srgb, var(--clip-video) 55%, #1a2030);
+}
+
+.clip--audio {
+  background: color-mix(in srgb, var(--clip-audio) 60%, #0d1f17);
+}
+
+.clip--image {
+  background: var(--clip-image);
+}
+
+.clip--text {
+  background: var(--clip-text);
+}
+
+.clip.is-selected {
+  border-color: #fff;
+  box-shadow: 0 0 0 1px var(--accent), 0 2px 6px rgba(0, 0, 0, 0.5);
+  z-index: 3;
+}
+
+.clip.is-invalid {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px var(--danger);
+}
+
+.clip.is-locked {
+  cursor: default;
+}
+
+.clip-visual,
+.clip-audio {
+  position: absolute;
+  left: 0;
+  right: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.clip-visual {
+  top: 0;
+}
+
+.clip-audio {
+  background: rgba(0, 0, 0, 0.22);
+  border-top: 1px solid rgba(0, 0, 0, 0.35);
+}
+
+.clip-image-fill {
+  position: absolute;
+  inset: 0;
+  background-size: cover;
+  background-position: center;
+  opacity: 0.75;
+  pointer-events: none;
+}
+
+.clip-audio-flat {
+  width: 100%;
+  background: repeating-linear-gradient(
+    90deg,
+    rgba(255, 255, 255, 0.22) 0 2px,
+    transparent 2px 5px
+  );
+  opacity: 0.5;
+}
+
+.clip-filmstrip {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.clip-filmstrip-tile {
+  flex: 0 0 auto;
+  object-fit: cover;
+  display: block;
+  border-right: 1px solid rgba(0, 0, 0, 0.25);
+}
+
+.clip-filmstrip-tile:last-child {
+  border-right: none;
+}
+
+.clip-waveform {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.clip-label {
+  position: absolute;
+  top: 2px;
+  left: 3px;
+  max-width: calc(100% - 12px);
+  padding: 1px 4px;
+  font-size: 10px;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: 3px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #f0f4ff;
+  pointer-events: none;
+}
+
+.clip-handle {
+  position: absolute;
+  top: 0;
+  width: 8px;
+  height: 100%;
+  cursor: ew-resize;
+  z-index: 2;
+}
+
+.clip-handle:hover {
+  background: rgba(255, 255, 255, 0.35);
+}
+
+.clip-handle--left { left: 0; }
+.clip-handle--right { right: 0; }
+
+/* Fade ramps: the wedge shows the envelope, the grip at its apex drags it. */
+/* The overlap between two clips, drawn as the transition it is. */
+.transition-bowtie {
+  position: absolute;
+  top: 4px;
+  z-index: 3;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    -45deg,
+    rgba(255, 255, 255, 0.28),
+    rgba(255, 255, 255, 0.28) 4px,
+    rgba(0, 0, 0, 0.3) 4px,
+    rgba(0, 0, 0, 0.3) 8px
+  );
+  border-left: 1px solid rgba(255, 255, 255, 0.6);
+  border-right: 1px solid rgba(255, 255, 255, 0.6);
+}
+
+/* An adjustment has no picture of its own — stripes say "this is a grade, not content". */
+.clip--adjustment {
+  background: repeating-linear-gradient(
+    45deg,
+    rgba(200, 160, 255, 0.35),
+    rgba(200, 160, 255, 0.35) 6px,
+    rgba(120, 90, 170, 0.35) 6px,
+    rgba(120, 90, 170, 0.35) 12px
+  );
+  border-color: rgba(200, 160, 255, 0.7);
+}
+
+.clip-fade {
+  position: absolute;
+  top: 0;
+  pointer-events: none;
+  z-index: 1;
+}
+
+.clip-fade--in {
+  left: 0;
+  background: linear-gradient(to right, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0));
+  clip-path: polygon(0 0, 100% 0, 0 100%);
+}
+
+.clip-fade--out {
+  right: 0;
+  background: linear-gradient(to left, rgba(0, 0, 0, 0.8), rgba(0, 0, 0, 0));
+  clip-path: polygon(100% 0, 100% 100%, 0 0);
+}
+
+.clip-fade-grip {
+  position: absolute;
+  top: 0;
+  width: 12px;
+  height: 12px;
+  z-index: 3;
+  cursor: ew-resize;
+  background: rgba(255, 255, 255, 0.55);
+  border: 1px solid rgba(0, 0, 0, 0.5);
+}
+
+.clip-fade-grip:hover {
+  background: var(--accent, #6aa9ff);
+}
+
+.clip-fade-grip--in {
+  clip-path: polygon(0 0, 100% 0, 0 100%);
+  margin-left: -6px;
+}
+
+.clip-fade-grip--out {
+  clip-path: polygon(100% 0, 100% 100%, 0 0);
+  margin-right: -6px;
+}
+
+.clip-fade-count {
+  position: absolute;
+  bottom: 2px;
+  padding: 0 3px;
+  font-size: 9px;
+  border-radius: 2px;
+  background: rgba(0, 0, 0, 0.6);
+  color: #dce6ff;
+  pointer-events: none;
+  z-index: 3;
+  font-variant-numeric: tabular-nums;
+}
+
+.clip-fade-count--in { left: 3px; }
+.clip-fade-count--out { right: 3px; }
+
+/* ------------------------------------------------------------ keyframe strip */
+
+.kf-strip {
+  position: absolute;
+  z-index: 4;
+  pointer-events: none;
+}
+
+.kf-row {
+  position: relative;
+  height: 13px;
+  background: rgba(8, 12, 22, 0.72);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.kf-row-label {
+  position: absolute;
+  left: 3px;
+  top: 1px;
+  font-size: 8px;
+  line-height: 11px;
+  color: rgba(220, 230, 255, 0.65);
+  white-space: nowrap;
+  pointer-events: none;
+}
+
+.kf-key {
+  position: absolute;
+  top: 3px;
+  width: 7px;
+  height: 7px;
+  margin-left: -3.5px;
+  transform: rotate(45deg);
+  background: #ffd479;
+  border: 1px solid rgba(0, 0, 0, 0.6);
+  cursor: ew-resize;
+  pointer-events: auto;
+}
+
+.kf-key:hover {
+  background: #fff;
+}
+
+/* Interpolation is readable at a glance: filled = linear, round = smooth, square = hold. */
+.kf-key--smooth {
+  border-radius: 50%;
+}
+
+.kf-key--hold {
+  transform: none;
+  margin-left: -3px;
+  width: 6px;
+  background: #9fd0ff;
+}
+
+.clip-fx-badge {
+  display: inline-block;
+  margin-right: 4px;
+  padding: 0 3px;
+  border-radius: 2px;
+  background: rgba(120, 190, 255, 0.85);
+  color: #06101f;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+/* ------------------------------------------------------- playhead & guides */
+
+.playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 2px;
+  margin-left: -1px;
+  background: var(--accent);
+  pointer-events: none;
+  z-index: 6;
+  will-change: transform;
+}
+
+.playhead--ruler {
+  background: #fff;
+}
+
+.playhead-grip {
+  position: absolute;
+  top: 0;
+  left: -5px;
+  width: 12px;
+  height: 10px;
+  background: #fff;
+  clip-path: polygon(0 0, 100% 0, 50% 100%);
+}
+
+.snap-line {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: #ffd166;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.marquee {
+  position: absolute;
+  border: 1px solid var(--accent);
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  pointer-events: none;
+  z-index: 4;
+}
+
+.h-scrollbar {
+  grid-column: 2;
+  grid-row: 3;
+  position: relative;
+  height: 10px;
+  background: var(--surface2);
+  border-top: 1px solid var(--border);
+}
+
+.h-scrollbar-thumb {
+  position: absolute;
+  top: 2px;
+  height: 6px;
+  border-radius: 3px;
+  background: #4a4a58;
+  cursor: grab;
+  will-change: transform;
+}
+
+.h-scrollbar-thumb:hover {
+  background: var(--accent);
+}
+
+/* --------------------------------------------------------------- inspector */
+
+.inspector-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.inspector-kind {
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--surface2);
+  color: var(--text);
+  text-transform: capitalize;
+}
+
+.inspector-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0;
+  font-size: 11px;
+}
+
+.inspector-facts div {
+  display: flex;
+  flex-direction: column;
+}
+
+.inspector-facts dt {
+  color: var(--text-muted);
+  text-transform: uppercase;
+  font-size: 9px;
+  letter-spacing: 0.05em;
+}
+
+.inspector-facts dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.inspector-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 12px;
+  color: var(--text);
+}
+
+.slider-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.slider-row input[type='range'] {
+  flex: 1;
+  min-width: 0;
+}
+
+.slider-row span {
+  width: 40px;
+  text-align: right;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ----------------------------------------------------------- effect stack */
+
+.effect-add {
+  display: flex;
+  gap: 6px;
+}
+
+.effect-add select {
+  flex: 1;
+  min-width: 0;
+}
+
+.effect-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.effect-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.effect-row.is-disabled {
+  opacity: 0.5;
+}
+
+.effect-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.effect-actions {
+  display: flex;
+  gap: 2px;
+}
+
+.effect-actions button {
+  padding: 0 5px;
+  font-size: 11px;
+  line-height: 18px;
+}
+
+.stopwatch {
+  flex: none;
+  width: 22px;
+  padding: 0;
+  font-size: 11px;
+  line-height: 18px;
+  opacity: 0.55;
+}
+
+.stopwatch.is-armed {
+  opacity: 1;
+  background: #ffd479;
+  color: #1a1206;
+  border-color: #ffd479;
+}
+
+.effect-param-label {
+  width: 62px;
+  flex: none;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.effect-param span:last-child {
+  width: 46px;
+}
+
+/* --------------------------------------------------------------- transport */
+
+.transport-timecode {
+  width: 84px;
+  padding: 3px 6px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.transport-duration {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.transport-play {
+  min-width: 64px;
+}
+
+.transport-scrub {
+  flex: 1;
+  min-width: 60px;
 }

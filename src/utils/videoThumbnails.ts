@@ -37,7 +37,9 @@ function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
       resolve();
       return;
     }
+    let timer = 0;
     const done = () => {
+      window.clearTimeout(timer);
       video.removeEventListener('seeked', done);
       video.removeEventListener('loadeddata', done);
       resolve();
@@ -45,7 +47,14 @@ function seekVideo(video: HTMLVideoElement, time: number): Promise<void> {
     video.addEventListener('seeked', done);
     video.addEventListener('loadeddata', done);
     video.currentTime = clamped;
-    window.setTimeout(done, 120);
+
+    // Give up only once there is decoded data — resolving early captures a black frame.
+    const deadline = performance.now() + SEEK_TIMEOUT_MS;
+    const poll = () => {
+      if (video.readyState >= 2 || performance.now() > deadline) done();
+      else timer = window.setTimeout(poll, 40);
+    };
+    timer = window.setTimeout(poll, 120);
   });
 }
 

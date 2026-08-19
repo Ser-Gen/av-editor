@@ -1,98 +1,298 @@
 import { useEditorStore } from '../store/editorStore';
-import { clipDuration } from '../utils/time';
-import type { OverlayTransform, TextTemplate } from '../types/editor';
-import { imageTransformForClip, textFrameForClip } from '../utils/overlayTransform';
+import { clipDuration, formatTimecode } from '../utils/time';
+import type { OverlayTransform, TextTemplate, TransitionType } from '../types/editor';
+import {
+  DEFAULT_OVERLAY_TRANSFORM,
+  normalizeOverlayTransform,
+  textFrameForClip,
+} from '../utils/overlayTransform';
+import { TRANSFORM_CHANNELS, maxFade, transformAt } from '../utils/clipRender';
+import { TRANSITION_LABELS, incomingTransition } from '../utils/transitions';
+import { EffectStack } from './EffectStack';
 import { MediaOverlayEditor } from './MediaOverlayEditor';
 import { TextPlacementEditor } from './TextPlacementEditor';
 
 export function Inspector() {
-  const selectedClipId = useEditorStore((s) => s.selectedClipId);
+  const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const clips = useEditorStore((s) => s.clips);
+  const tracks = useEditorStore((s) => s.tracks);
   const mediaLibrary = useEditorStore((s) => s.mediaLibrary);
+  const fps = useEditorStore((s) => s.settings.fps);
   const updateVideoFlags = useEditorStore((s) => s.updateVideoFlags);
-  const updateImageTransform = useEditorStore((s) => s.updateImageTransform);
+  const updateClipTransform = useEditorStore((s) => s.updateClipTransform);
   const updateTextClip = useEditorStore((s) => s.updateTextClip);
+  const setClipGain = useEditorStore((s) => s.setClipGain);
+  const setClipFade = useEditorStore((s) => s.setClipFade);
+  const detachAudio = useEditorStore((s) => s.detachAudio);
+  const toggleChannelArmed = useEditorStore((s) => s.toggleChannelArmed);
+  const playhead = useEditorStore((s) => s.playhead);
+  const setTransitionType = useEditorStore((s) => s.setTransitionType);
 
-  const clip = clips.find((c) => c.id === selectedClipId);
+  if (selectedClipIds.length > 1) {
+    return (
+      <aside className="inspector">
+        <h3>Inspector</h3>
+        <p className="hint">{selectedClipIds.length} clips selected.</p>
+        <p className="hint">
+          Drag to move them together, ⌫ to delete, ⇧⌫ to ripple delete, arrows to nudge.
+        </p>
+      </aside>
+    );
+  }
+
+  const clip = clips.find((c) => c.id === selectedClipIds[0]);
 
   if (!clip) {
     return (
       <aside className="inspector">
         <h3>Inspector</h3>
-        <p className="hint">Select a clip to edit properties.</p>
+        <p className="hint">Select a clip to edit its properties.</p>
       </aside>
     );
   }
 
-  const dur = clipDuration(clip);
-  const videoAsset = clip.kind === 'video' ? mediaLibrary[clip.assetId] : undefined;
-  const imageAsset = clip.kind === 'image' ? mediaLibrary[clip.assetId] : undefined;
+  const track = tracks.find((t) => t.id === clip.trackId);
+  const transition = incomingTransition(clip, clips);
+  const asset = 'assetId' in clip ? mediaLibrary[clip.assetId] : undefined;
+  const duration = clipDuration(clip);
+  const hasTransform = (clip.kind === 'video' || clip.kind === 'image') && !!clip.transform;
+  const placementAnimated = TRANSFORM_CHANNELS.some(
+    (ch) => (clip.transformKeyframes?.[ch]?.length ?? 0) > 0,
+  );
+  // With placement animated the editor shows the rectangle at the playhead, so dragging
+  // it edits the pose you are actually looking at.
+  const editedTransform =
+    clip.kind === 'video' || clip.kind === 'image' ? transformAt(clip, playhead) : undefined;
 
   return (
     <aside className="inspector">
       <h3>Inspector</h3>
-      <p className="hint">
-        {clip.kind} · {dur.toFixed(2)}s
-      </p>
 
-      {clip.kind === 'video' && (
-        <>
-          <label>
+      <div className="inspector-summary">
+        <span className="inspector-kind">{clip.kind}</span>
+        <span>{track?.label}</span>
+      </div>
+      <dl className="inspector-facts">
+        <div>
+          <dt>Start</dt>
+          <dd>{formatTimecode(clip.timelineStart, fps)}</dd>
+        </div>
+        <div>
+          <dt>Duration</dt>
+          <dd>{formatTimecode(duration, fps)}</dd>
+        </div>
+        {asset?.width && (
+          <div>
+            <dt>Source</dt>
+            <dd>
+              {asset.width}×{asset.height}
+            </dd>
+          </div>
+        )}
+      </dl>
+
+      {(clip.kind === 'video' || clip.kind === 'image') && (
+        <section className="inspector-section">
+          <label>Placement</label>
+          <label className="checkbox">
             <input
               type="checkbox"
-              checked={!!clip.overlayMode}
-              onChange={(e) => updateVideoFlags(clip.id, { overlayMode: e.target.checked })}
-            />{' '}
-            Use as overlay (PiP)
-          </label>
-          {clip.overlayMode && videoAsset && clip.overlayTransform && (
-            <MediaOverlayEditor
-              mediaKind="video"
-              blobUrl={videoAsset.blobUrl}
-              sourceWidth={videoAsset.width ?? 1920}
-              sourceHeight={videoAsset.height ?? 1080}
-              transform={clip.overlayTransform}
-              onChange={(overlayTransform: OverlayTransform) =>
-                updateVideoFlags(clip.id, { overlayTransform })
+              checked={hasTransform}
+              onChange={(e) =>
+                updateClipTransform(
+                  clip.id,
+                  e.target.checked
+                    ? normalizeOverlayTransform(DEFAULT_OVERLAY_TRANSFORM)
+                    : undefined,
+                )
               }
             />
-          )}
-          <label>
-            <input
-              type="checkbox"
-              checked={clip.muteAudio}
-              onChange={(e) => updateVideoFlags(clip.id, { muteAudio: e.target.checked })}
-            />{' '}
-            Mute audio
+            Custom placement (crop / picture-in-picture)
           </label>
-          <label>
+          <p className="hint">
+            {hasTransform
+              ? 'Layer order comes from the track stack — move the clip to a higher track to put it in front.'
+              : 'Filling the frame. Higher tracks draw over lower ones.'}
+          </p>
+          {hasTransform && clip.transform && (
+            <label className="checkbox">
+              <button
+                type="button"
+                className={`stopwatch${placementAnimated ? ' is-armed' : ''}`}
+                title="Animate placement: moving the box writes a keyframe at the playhead"
+                onClick={() => {
+                  // One toggle arms all eight channels, because a travelling
+                  // picture-in-picture is only ever wanted as a whole rectangle.
+                  for (const channel of TRANSFORM_CHANNELS) {
+                    toggleChannelArmed(clip.id, { effectId: null, param: channel });
+                  }
+                }}
+              >
+                ⏱
+              </button>
+              Animate placement
+            </label>
+          )}
+          {hasTransform && clip.transform && asset && (
+            <MediaOverlayEditor
+              mediaKind={clip.kind === 'video' ? 'video' : 'image'}
+              blobUrl={asset.blobUrl}
+              sourceWidth={asset.width ?? 1920}
+              sourceHeight={asset.height ?? 1080}
+              transform={editedTransform ?? clip.transform}
+              onChange={(transform: OverlayTransform) => updateClipTransform(clip.id, transform)}
+            />
+          )}
+        </section>
+      )}
+
+      <section className="inspector-section">
+        <label>Fade</label>
+        <div className="slider-row">
+          <span className="effect-param-label">In</span>
+          <input
+            type="range"
+            min={0}
+            max={maxFade(clip, 'in')}
+            step={1 / fps}
+            value={clip.fadeIn ?? 0}
+            onChange={(e) => setClipFade(clip.id, 'in', Number(e.target.value))}
+          />
+          <span>{formatTimecode(clip.fadeIn ?? 0, fps)}</span>
+        </div>
+        <div className="slider-row">
+          <span className="effect-param-label">Out</span>
+          <input
+            type="range"
+            min={0}
+            max={maxFade(clip, 'out')}
+            step={1 / fps}
+            value={clip.fadeOut ?? 0}
+            onChange={(e) => setClipFade(clip.id, 'out', Number(e.target.value))}
+          />
+          <span>{formatTimecode(clip.fadeOut ?? 0, fps)}</span>
+        </div>
+        <p className="hint">
+          {clip.kind === 'audio'
+            ? 'Fades to silence.'
+            : 'Or drag the triangles in the clip’s top corners.'}
+        </p>
+      </section>
+
+      {transition && (
+        <section className="inspector-section">
+          <label>Transition in</label>
+          <select
+            value={clip.transitionIn ?? 'dissolve'}
+            onChange={(e) => setTransitionType(clip.id, e.target.value as TransitionType)}
+          >
+            {Object.entries(TRANSITION_LABELS).map(([value, text]) => (
+              <option key={value} value={value}>
+                {text}
+              </option>
+            ))}
+          </select>
+          <p className="hint">
+            {formatTimecode(transition.end - transition.start, fps)} overlap with the previous
+            clip. Drag either clip to change it; pull them apart to remove it.
+          </p>
+        </section>
+      )}
+
+      {clip.kind !== 'audio' && (
+        <EffectStack
+          target={clip.id}
+          effects={clip.effects ?? []}
+          clipStart={clip.timelineStart}
+          label={clip.kind === 'adjustment' ? 'Adjustment effects' : 'Effects'}
+        />
+      )}
+
+      {track?.kind === 'video' && (
+        <EffectStack
+          target={{ kind: 'track', id: track.id }}
+          effects={track.effects ?? []}
+          label={`Grade on ${track.label}`}
+        />
+      )}
+      {track?.kind === 'video' && (track.effects?.length ?? 0) > 0 && (
+        <p className="hint">
+          A track grade applies to everything composited up to and including {track.label} —
+          tracks above it are unaffected. Hiding the track disables it.
+        </p>
+      )}
+
+      {clip.kind === 'video' && (
+        <section className="inspector-section">
+          <label>Audio</label>
+          {clip.hasAudio ? (
+            <>
+              <label className="checkbox">
+                <input
+                  type="checkbox"
+                  checked={clip.audioEnabled}
+                  onChange={(e) => updateVideoFlags(clip.id, { audioEnabled: e.target.checked })}
+                />
+                Audio on
+              </label>
+              <div className="slider-row">
+                <input
+                  type="range"
+                  min={0}
+                  max={150}
+                  value={Math.round(clip.gain * 100)}
+                  disabled={!clip.audioEnabled}
+                  onChange={(e) => setClipGain(clip.id, Number(e.target.value) / 100)}
+                />
+                <span>{Math.round(clip.gain * 100)}%</span>
+              </div>
+              <button
+                type="button"
+                disabled={!clip.audioEnabled}
+                title="Move this clip's audio onto its own audio track"
+                onClick={() => detachAudio(clip.id)}
+              >
+                Detach audio
+              </button>
+            </>
+          ) : (
+            <p className="hint">This file has no audio track.</p>
+          )}
+        </section>
+      )}
+
+      {clip.kind === 'video' && (
+        <section className="inspector-section">
+          <label className="checkbox">
             <input
               type="checkbox"
               checked={clip.hideVideo}
               onChange={(e) => updateVideoFlags(clip.id, { hideVideo: e.target.checked })}
-            />{' '}
+            />
             Hide video
           </label>
-        </>
+        </section>
       )}
 
-      {clip.kind === 'image' && imageAsset && (
-        <MediaOverlayEditor
-          mediaKind="image"
-          blobUrl={imageAsset.blobUrl}
-          sourceWidth={imageAsset.width ?? 1920}
-          sourceHeight={imageAsset.height ?? 1080}
-          transform={imageTransformForClip(
-            clip.overlayTransform,
-            imageAsset.width ?? 1920,
-            imageAsset.height ?? 1080,
-          )}
-          onChange={(overlayTransform) => updateImageTransform(clip.id, overlayTransform)}
-        />
+      {clip.kind === 'audio' && (
+        <section className="inspector-section">
+          <label>Volume</label>
+          <div className="slider-row">
+            <input
+              type="range"
+              min={0}
+              max={150}
+              value={Math.round(clip.gain * 100)}
+              onChange={(e) => setClipGain(clip.id, Number(e.target.value) / 100)}
+            />
+            <span>{Math.round(clip.gain * 100)}%</span>
+          </div>
+          <p className="hint">Multiplied by the {track?.label} track volume.</p>
+        </section>
       )}
 
       {clip.kind === 'text' && (
-        <>
+        <section className="inspector-section">
           <label>Text</label>
           <textarea
             rows={3}
@@ -102,9 +302,7 @@ export function Inspector() {
           <label>Template</label>
           <select
             value={clip.template}
-            onChange={(e) =>
-              updateTextClip(clip.id, clip.text, e.target.value as TextTemplate)
-            }
+            onChange={(e) => updateTextClip(clip.id, clip.text, e.target.value as TextTemplate)}
           >
             <option value="lowerThird">Lower third</option>
             <option value="centerTitle">Center title</option>
@@ -116,7 +314,7 @@ export function Inspector() {
             textFrame={textFrameForClip(clip.textFrame)}
             onChange={(textFrame) => updateTextClip(clip.id, clip.text, clip.template, textFrame)}
           />
-        </>
+        </section>
       )}
     </aside>
   );

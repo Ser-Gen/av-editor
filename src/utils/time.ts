@@ -1,23 +1,75 @@
-export function formatTimecode(seconds: number): string {
-  const s = Math.max(0, seconds);
-  const m = Math.floor(s / 60);
-  const sec = Math.floor(s % 60);
-  const ms = Math.floor((s % 1) * 100);
-  return `${String(m).padStart(2, '0')}:${String(sec).padStart(2, '0')}.${String(ms).padStart(2, '0')}`;
+export const MIN_CLIP_DURATION = 0.1;
+export const DEFAULT_FPS = 30;
+
+/** All edits land on frame boundaries so preview and FFmpeg agree. */
+export function quantizeToFrame(t: number, fps: number = DEFAULT_FPS): number {
+  const rate = fps > 0 ? fps : DEFAULT_FPS;
+  return Math.round(t * rate) / rate;
+}
+
+export function frameDuration(fps: number = DEFAULT_FPS): number {
+  return 1 / (fps > 0 ? fps : DEFAULT_FPS);
+}
+
+/** MM:SS:FF — frames, not centiseconds. */
+export function formatTimecode(seconds: number, fps: number = DEFAULT_FPS): string {
+  const rate = fps > 0 ? fps : DEFAULT_FPS;
+  const total = Math.max(0, Math.round(seconds * rate));
+  const frames = total % rate;
+  const totalSeconds = Math.floor(total / rate);
+  const secs = totalSeconds % 60;
+  const mins = Math.floor(totalSeconds / 60);
+  return `${pad(mins)}:${pad(secs)}:${pad(frames)}`;
+}
+
+/** Compact duration label for the media library: MM:SS. */
+export function formatDuration(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
+}
+
+function pad(n: number): string {
+  return String(n).padStart(2, '0');
+}
+
+/**
+ * Accepts `MM:SS:FF`, `SS:FF`, `MM:SS.mmm` or a bare seconds count.
+ * Returns null when unparseable so callers can leave the field alone.
+ */
+export function parseTimecode(input: string, fps: number = DEFAULT_FPS): number | null {
+  const text = input.trim();
+  if (text === '') return null;
+  const rate = fps > 0 ? fps : DEFAULT_FPS;
+
+  if (/^\d+(\.\d+)?$/.test(text)) return Number(text);
+
+  const parts = text.split(':');
+  if (parts.length < 2 || parts.length > 3) return null;
+  if (parts.some((p) => !/^\d+(\.\d+)?$/.test(p.trim()))) return null;
+
+  const nums = parts.map((p) => Number(p.trim()));
+  if (nums.some((n) => !Number.isFinite(n))) return null;
+
+  if (nums.length === 3) {
+    const [mins, secs, frames] = nums;
+    return mins * 60 + secs + frames / rate;
+  }
+  const [secs, frames] = nums;
+  return secs + frames / rate;
 }
 
 export function clipDuration(clip: { sourceTrimIn: number; sourceTrimOut: number }): number {
-  return Math.max(0.1, clip.sourceTrimOut - clip.sourceTrimIn);
+  return Math.max(MIN_CLIP_DURATION, clip.sourceTrimOut - clip.sourceTrimIn);
 }
 
-export function clipEnd(clip: { timelineStart: number; sourceTrimIn: number; sourceTrimOut: number }): number {
+export function clipEnd(clip: {
+  timelineStart: number;
+  sourceTrimIn: number;
+  sourceTrimOut: number;
+}): number {
   return clip.timelineStart + clipDuration(clip);
 }
 
-export const MIN_CLIP_DURATION = 0.1;
-export const SNAP_GRID = 0.1;
-
-export function snapTime(t: number, enabled = true): number {
-  if (!enabled) return t;
-  return Math.round(t / SNAP_GRID) * SNAP_GRID;
+export function rangesOverlap(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
+  return aStart < bEnd - 1e-6 && bStart < aEnd - 1e-6;
 }

@@ -25,21 +25,54 @@ Open the dev server URL. COOP/COEP headers are required for FFmpeg WASM (configu
 ## Quick start
 
 1. Import media from the toolbar or **Media Library** (left panel).
-2. Drag clips on the timeline; trim with edge handles.
+2. Drag clips along the timeline or between tracks; trim with edge handles.
 3. Add text with templates (lower third, center title, subtitle).
-4. Preview with transport controls; adjust audio lane volume as needed.
+4. Preview with transport controls; adjust clip and track volume as needed.
 5. **Load FFmpeg**, then **Export MP4** (480p / 720p / 1080p / 4K).
+
+### Timeline navigation
+
+The timeline owns its own scrolling — it never rides browser scroll.
+
+| Input | Action |
+|-------|--------|
+| **Wheel** | Pan (vertical scrolls tracks, horizontal scrolls time) |
+| **⇧ Wheel** | Pan horizontally with a mouse wheel |
+| **⌘/Ctrl + wheel**, **trackpad pinch** | Zoom, anchored under the cursor |
+| **Middle-drag** | Grab and pan |
+| **Drag on ruler** | Scrub the playhead |
+| **Drag on empty lane** | Marquee-select clips |
 
 ### Keyboard shortcuts
 
 | Key | Action |
 |-----|--------|
 | **Space** | Play / pause |
-| **S** | Split selected clip at playhead |
-| **⌘D** / **Ctrl+D** | Duplicate selected clip |
-| **Delete** / **Backspace** | Remove selected clip |
+| **⌘Z** / **Ctrl+Z** | Undo (⇧⌘Z or Ctrl+Y to redo) |
+| **S** | Split selected clips at playhead |
+| **⌘D** / **Ctrl+D** | Duplicate selection |
+| **⌘A** / **Ctrl+A** | Select all clips |
+| **Delete** / **Backspace** | Delete selection (leaves a gap) |
+| **⇧Delete** | Ripple delete — closes the gap on that track |
+| **← →** | Nudge selection 1 frame (**⇧** for 1 second) |
+| **, .** | Step the playhead 1 frame (**⇧** for 1 second) |
+| **Home** / **End** | Jump to project start / end |
+| **⌘+** / **⌘−** | Zoom in / out |
+| **Z** / **⇧Z** | Zoom to selection / fit project |
+| **N** | Toggle snapping |
+| **⌥ (hold)** | Bypass snapping during a drag |
 
-Inspector (right panel): mute audio / hide video on selected video clips.
+Selection is multi-clip: **⇧-click** or **⌘-click** to add and remove, or marquee-drag
+across empty lane space. Moves, trims and deletes are undoable, and a whole drag
+collapses into a single undo step.
+
+### Snapping
+
+Clip edges snap to the playhead, to other clips' edges, and to `0:00`, with a
+threshold measured in pixels — so it feels the same at every zoom level. An amber
+line marks the engaged target. Hold **⌥** to bypass, or turn **Snap** off in the
+timeline toolbar. All edits quantize to frame boundaries (`1 / fps`), which keeps
+the preview and the FFmpeg export in agreement.
 
 ---
 
@@ -53,9 +86,9 @@ The **Media Library** panel stores all imported media for reuse. Files are refer
 | **+ Import** | Media Library | File → library only |
 | **+** on a library item | Media Library | Same asset added to timeline at playhead |
 | **×** on a library item | Media Library | Remove from library (disabled while used on timeline) |
-| **Record** / **Stop** | Media Library | Microphone → library (see below) |
+| **Record** | Media Library | Opens the capture panel: screen, microphone, system audio (see below) |
 
-Video files with an audio track create two clips on toolbar import: a video clip (embedded audio muted) and a matching audio clip on an audio lane.
+A video file imports as **one clip** that carries its own audio — it moves, trims, splits and deletes as a single object. Use **Detach audio** in the Inspector to move that audio onto its own audio track when you need to slide it against the picture.
 
 Status messages (import, URL load, recording, frame capture) appear briefly in the library panel.
 
@@ -104,37 +137,47 @@ Remote hosts must allow [CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP
 
 ## Timeline & audio
 
-### Tracks
+### Tracks are an ordered layer stack
 
-| Lane | Purpose |
-|------|---------|
-| Overlay 1, Overlay 2, … | Images and text (parallel layers) |
-| Video 1 | Video clips |
-| Audio 1, Audio 2, … | Audio clips (parallel mixing) |
+The project starts with one video track (**V1**) and one audio track (**A1**).
 
-### Parallel overlay lanes
+Video tracks composite **bottom-up**: a clip on **V2** draws over a clip on **V1**,
+exactly as the track order shows. Move a clip to a higher track to put it in front —
+there is no separate "overlay" concept and no layering checkbox. Video, image and
+text clips live on video tracks; audio clips live on audio tracks. The preview and
+the FFmpeg export share one ordering function (`src/utils/compositeOrder.ts`), so
+what you see is what you get.
 
-The timeline starts with **Overlay 1** and **Overlay 2**. Images and text are placed at the playhead on the first overlay lane free at that time. Add an image on **Overlay 1**, then text at the same playhead — it lands on **Overlay 2**. Use **+ Overlay track** to add more lanes.
+| Track control | Effect |
+|---------------|--------|
+| **▲ ▼** | Reorder within its own group — changes layering for video tracks |
+| **👁** (video) | Hide the layer in preview and export |
+| **M** / **S** (audio) | Mute / solo. An active solo also silences video-clip audio |
+| **🔒** | Lock — clips on the track can't be moved or trimmed |
+| **✕** | Delete the track and its clips (undoable; last track of a kind is kept) |
+| Double-click name | Rename |
+| Drag bottom edge | Resize the lane |
 
-### Parallel audio lanes
+New clips land on the first lane with room at the playhead. Video imports fill the
+base lane as a sequence; text prefers the topmost lane so it lands over the picture.
+A new lane is created automatically only when nothing free exists.
 
-The timeline starts with **Audio 1** and **Audio 2**. New audio is placed at the playhead on the first lane with no time overlap at that position. If both lanes are occupied, **Audio N** is created automatically.
+### Volume
 
-- **+ Audio track** (timeline toolbar) — add an empty lane manually.
-- Preview and export **mix** all active audio clips (`amix` in FFmpeg).
+Two stages, multiplied together:
 
-### Per-lane volume
+- **Per clip** — Inspector slider, **0–150%**. This is where a video clip's own audio is controlled.
+- **Per audio track** — slider in the track header, **0–150%**. Applies to audio clips on that track. (Video clips sit on video tracks, so no track volume applies to them.)
 
-Each audio lane has a slider in the track label: **0–150%** (100% = unchanged, up to 150% = boost).
+Both affect preview (Web Audio `GainNode`) and export (FFmpeg `volume` filter).
+Preview and export mix all audible clips (`amix` in FFmpeg).
 
-- Applies to **all clips** on that lane.
-- Affects preview (Web Audio `GainNode`) and export (FFmpeg `volume` filter).
+### Placement (video, image, text)
 
-### Overlay placement (video, image, text)
-
-**Video (PiP):** enable **Use as overlay (PiP)** on a video clip.
-
-**Image:** select any image clip on the overlay track — the placement editor opens automatically.
+Every visual clip fills the frame by default (fit and letterbox). Tick
+**Custom placement (crop / picture-in-picture)** in the Inspector to crop the source
+and position it on the canvas; untick to return to full frame. Layer order is *not*
+part of placement — that comes from the track stack.
 
 **Text:** select a text clip — use **Text box on screen** to move and resize the area where the template is drawn.
 
@@ -143,7 +186,7 @@ All editors share the same interaction model:
 - **Position on screen** — drag the frame or set X/Y/W/H (% of canvas)
 - **Crop source** (video & image only) — drag the crop region on the source or set X/Y/W/H (% of source)
 
-Video PiP defaults to the top-right. New images start letterboxed to fit. New text uses the full canvas until you resize the box. Preview and export use the same transforms (canvas + FFmpeg `crop` / `scale` / `overlay` for media; framed `drawtext` for text).
+Custom placement defaults to the top-right. New text uses the full canvas until you resize the box. Preview and export use the same transforms (canvas + FFmpeg `crop` / `scale` / `overlay` for media; framed `drawtext` for text).
 
 ### Video thumbnails
 
@@ -156,9 +199,11 @@ Thumbnails are extracted in the browser (canvas + `<video>`), cached per `assetI
 
 ### Waveforms
 
-Audio clips display a **waveform** inside the clip block:
+Audio clips display a **waveform** inside the clip block; video clips carrying audio
+show a waveform ribbon under their filmstrip.
 
 - Generated on first display via Web Audio `decodeAudioData`.
+- When a container's audio can't be decoded (AAC-in-MP4 support varies by browser), the clip falls back to a flat ribbon rather than hiding the audio.
 - Cached per `assetId` (reused across clips and timeline zoom).
 - Trim handles update the visible region (`sourceTrimIn` / `sourceTrimOut`).
 - Works for imported audio, microphone recordings, and audio extracted from video.
@@ -166,17 +211,67 @@ Audio clips display a **waveform** inside the clip block:
 
 ---
 
-## Microphone recording
+## Recording
 
-**Record** in the Media Library header starts capturing the default microphone. **Stop** saves the file to the library.
+**Record** in the Media Library header opens the capture panel. Tick any of **Screen**,
+**Microphone** and **System audio**, press **Record**, and press **Stop** when done. Each
+source becomes its own file, its own library asset and its own timeline track.
 
 | Topic | Detail |
 |-------|--------|
-| During playback | Recording works while the project plays — suitable for voiceover |
-| Timeline | Not auto-placed; use **+** on the library item to add at playhead |
-| Permission | Browser prompts on first use |
-| Format | Browser-dependent (usually WebM/Opus); named `mic-recording_<timestamp>.webm` |
-| Processing | Echo cancellation and noise suppression enabled |
+| Tracks | Screen → first free video lane, microphone → A1, system audio → A2 |
+| Alignment | All sources share one time anchor and are placed frame-aligned (measured at 17 ms across three sources, against a 33 ms frame) |
+| During playback | Recording works while the project plays — suitable for voiceover and for capturing a playthrough |
+| Undo | A whole session is one undo step |
+| Memory | Nothing is buffered in RAM. Encoded media streams to disk (OPFS) as it is produced, so a thirty-minute capture costs no more heap than a thirty-second one — measured at 30 minutes of 1080p: 100 MB on disk, heap bounded under 20 MB and back to its starting point afterwards |
+| Seeking | Recordings carry a real duration and scrub as soon as they stop — see below |
+| Dropped frames | Reported live while recording. A 1080p60 capture drops none |
+| Permission | The browser prompts for the screen picker and the microphone on first use |
+| Format | H.264/AAC in a fragmented MP4 (`.m4a` for audio-only sources), named `<source>-recording_<timestamp>_<length>.mp4`. Browsers without the WebCodecs pipeline fall back to WebM — see below |
+| Processing | Echo cancellation and noise suppression enabled on the microphone |
+
+### How recordings are written
+
+Frames are read off the stream, encoded with WebCodecs and muxed to disk as the recording
+runs, so the file is finished the moment you press Stop — no rebuild step, and stopping a
+half-hour take costs under a millisecond.
+
+The container is a **fragmented** MP4, which matters for one reason: it is a run of
+self-contained fragments, so whatever reached the disk is a valid file on its own. A tab
+killed mid-recording leaves something that plays immediately, rather than a recording whose
+index never got written.
+
+The capture's own clock is stored on the asset as well, so the editor never has to trust the
+container.
+
+**Where this is not available**, the panel says so and falls back to `MediaRecorder`. That
+writes a *live* container — no duration, no seek index, `duration = Infinity` in a browser
+and `N/A` in `ffprobe` — so those recordings are remuxed on stop, codecs copied untouched,
+to fill in the duration and the index. The panel names which engine is in use before you
+press Record.
+
+### System audio
+
+Availability is a platform matter, and the panel says so **before** you record rather than
+leaving you with a silent track:
+
+- **Tab audio** works broadly in Chrome.
+- **Window or whole-screen audio** needs Windows or ChromeOS, or macOS 14.2+ with Chrome 141+.
+- **Firefox and Safari** ignore the request entirely.
+
+If the picker returns without an audio track, no system-audio file is created and the panel
+tells you why.
+
+### If a recording is interrupted
+
+Because bytes are on disk as they are captured, a crashed or closed tab leaves a real file
+rather than nothing. On the next launch the capture panel offers it under **A recording was
+interrupted**, with **Restore** and **Delete** per source.
+
+Such a file already plays — it is complete up to its last whole fragment, so an eight-second
+take killed without warning comes back as a seven-second recording. **Restore** rebuilds it
+anyway, which takes tens of milliseconds and replaces the fragment-rounded length with an
+exact one.
 
 ---
 
@@ -184,7 +279,9 @@ Audio clips display a **waveform** inside the clip block:
 
 ### Transport
 
-Play / pause, seek slider, and timecode. **Save frame** captures the composited preview at the current playhead.
+Play / pause, frame-step buttons, seek slider, and an **editable `MM:SS:FF` timecode** —
+type a timecode and press Enter to jump. **Save frame** captures the composited preview
+at the current playhead.
 
 ### Save frame
 

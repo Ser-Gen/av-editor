@@ -1,37 +1,67 @@
+import { useMemo } from 'react';
 import { formatTimecode } from '../../utils/time';
-import { TRACK_LABEL_WIDTH } from './constants';
 
 interface Props {
-  duration: number;
   pxPerSec: number;
-  playhead: number;
-  onSeek: (t: number) => void;
+  scrollX: number;
+  viewportWidth: number;
+  duration: number;
+  fps: number;
 }
 
-export function Ruler({ duration, pxPerSec, playhead, onSeek }: Props) {
-  const width = Math.max(800, duration * pxPerSec + 200);
-  const step = pxPerSec >= 60 ? 1 : pxPerSec >= 30 ? 2 : 5;
-  const ticks: number[] = [];
-  for (let t = 0; t <= duration + step; t += step) ticks.push(t);
+/** Tick spacing that keeps labels ~80px apart at any zoom, down to single frames. */
+function chooseStep(pxPerSec: number, fps: number): number {
+  const candidates = [
+    1 / fps,
+    2 / fps,
+    5 / fps,
+    0.5,
+    1,
+    2,
+    5,
+    10,
+    15,
+    30,
+    60,
+    120,
+    300,
+    600,
+    1800,
+  ];
+  return candidates.find((step) => step * pxPerSec >= 80) ?? candidates[candidates.length - 1];
+}
 
-  const labelWidth = TRACK_LABEL_WIDTH;
+export function Ruler({ pxPerSec, scrollX, viewportWidth, duration, fps }: Props) {
+  const ticks = useMemo(() => {
+    const step = chooseStep(pxPerSec, fps);
+    const startTime = Math.max(0, scrollX / pxPerSec - step);
+    const endTime = (scrollX + viewportWidth) / pxPerSec + step;
+    const firstIndex = Math.max(0, Math.floor(startTime / step));
+    const out: { t: number; major: boolean }[] = [];
+    // Index, not accumulated time. Frame-sized steps like 1/30 have no exact float
+    // representation, so `t += step` drifts and `t % (step * 2)` starts missing majors —
+    // which silently drops ruler labels. Counting ticks keeps the parity exact, and
+    // multiplying instead of accumulating keeps each tick on its true time.
+    for (let i = 0; i < 400; i++) {
+      const index = firstIndex + i;
+      const t = index * step;
+      if (t > endTime) break;
+      out.push({ t, major: index % 2 === 0 });
+    }
+    return out;
+  }, [pxPerSec, scrollX, viewportWidth, fps]);
 
   return (
-    <div
-      className="ruler"
-      style={{ width }}
-      onClick={(e) => {
-        const rect = e.currentTarget.getBoundingClientRect();
-        const x = e.clientX - rect.left - labelWidth;
-        if (x >= 0) onSeek(x / pxPerSec);
-      }}
-    >
-      {ticks.map((t) => (
-        <div key={t} className="ruler-tick" style={{ left: labelWidth + t * pxPerSec }}>
-          {t % (step * 2) === 0 ? formatTimecode(t).slice(0, 5) : ''}
+    <div className="ruler-inner" style={{ width: Math.max(0, duration * pxPerSec) }}>
+      {ticks.map(({ t, major }) => (
+        <div
+          key={t.toFixed(4)}
+          className={`ruler-tick${major ? ' ruler-tick--major' : ''}`}
+          style={{ left: t * pxPerSec }}
+        >
+          {major && <span className="ruler-label">{formatTimecode(t, fps)}</span>}
         </div>
       ))}
-      <div className="playhead-line" style={{ left: labelWidth + playhead * pxPerSec }} />
     </div>
   );
 }
