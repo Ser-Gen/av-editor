@@ -8,10 +8,11 @@
  * file rather than an anonymous one.
  */
 
-export type CaptureSourceKind = 'screen' | 'mic' | 'system';
+export type CaptureSourceKind = 'screen' | 'camera' | 'mic' | 'system';
 
 export const SOURCE_LABELS: Record<CaptureSourceKind, string> = {
   screen: 'Screen',
+  camera: 'Camera',
   mic: 'Microphone',
   system: 'System audio',
 };
@@ -43,6 +44,16 @@ export interface RecordingMeta {
   engine?: 'webcodecs' | 'mediarecorder';
   /** Measured from the time anchor, so the editor never has to trust the container. */
   durationSeconds?: number;
+  /**
+   * What the source actually negotiated, read off the track rather than requested. Video
+   * only; recorded so a recovered file can still say what it is.
+   */
+  format?: { width: number; height: number; frameRate: number };
+  /**
+   * Why this source stopped before the session did — an unplugged camera, Chrome's "Stop
+   * sharing" bar. Absent on a source that ran to the end of the take.
+   */
+  endedReason?: string;
   rawFile: string;
   readyFile?: string;
   bytes?: number;
@@ -55,10 +66,20 @@ export interface RecordedSource {
   /** Seconds after the session anchor — preserved on the timeline so sources stay aligned. */
   startOffset: number;
   duration: number;
+  /** The negotiated video format, where there was one. Drives PiP framing and project fps. */
+  format?: { width: number; height: number; frameRate: number };
 }
 
-/** Which lane each source prefers: screen on the base video lane, mic A1, system A2. */
-export const SOURCE_LANE: Record<CaptureSourceKind, number> = { screen: 0, mic: 0, system: 1 };
+/**
+ * Which lane each source prefers, counting from the base of its own group: screen on the
+ * base video lane, camera one above it so it composites over the screen, mic A1, system A2.
+ */
+export const SOURCE_LANE: Record<CaptureSourceKind, number> = {
+  screen: 0,
+  camera: 1,
+  mic: 0,
+  system: 1,
+};
 
 const DIR = 'recordings';
 

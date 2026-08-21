@@ -169,18 +169,7 @@ export function PreviewPanel() {
         />
         <span className="transport-duration">/ {formatTimecode(duration, settings.fps)}</span>
 
-        <input
-          className="transport-scrub"
-          type="range"
-          min={0}
-          max={duration}
-          step={1 / settings.fps}
-          value={playhead}
-          onChange={(e) => {
-            setPlaying(false);
-            setPlayhead(Number(e.target.value));
-          }}
-        />
+        <span className="transport-spacer" />
 
         <button
           type="button"

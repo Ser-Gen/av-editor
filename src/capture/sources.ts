@@ -75,6 +75,7 @@ export function pickAudioMime(): MimeChoice {
 
 export interface AcquiredSources {
   screen: MediaStream | null;
+  camera: MediaStream | null;
   /** Only present when the platform really handed one over. */
   systemAudio: MediaStream | null;
   mic: MediaStream | null;
@@ -82,14 +83,19 @@ export interface AcquiredSources {
   systemAudioMissing: string | null;
   /** Set when the microphone was asked for and refused, and other sources still recorded. */
   micMissing: string | null;
+  /** Set when the camera was asked for and could not be opened, and the rest still recorded. */
+  cameraMissing: string | null;
   /** Set when the platform processed system audio anyway — see `unexpectedProcessing`. */
   systemAudioProcessed: string | null;
 }
 
 export interface SourceRequest {
   screen: boolean;
+  camera: boolean;
   mic: boolean;
   systemAudio: boolean;
+  /** Which camera, from `listCameras()`. Undefined lets the browser pick its default. */
+  cameraDeviceId?: string;
   /**
    * Echo cancellation, noise suppression and automatic gain on the *microphone*.
    *
@@ -144,6 +150,89 @@ function unexpectedProcessing(stream: MediaStream | null): string | null {
 }
 
 /**
+ * What both video sources ask for, and why the numbers are these numbers.
+ *
+ * 60 rather than 30 because the engine is proven there — phase 15's 1080p60 capture ran at
+ * 59.9 fps with no drops — and because a screen recording of anything scrolling looks
+ * broken at 30. It is asked for as `ideal`: a camera that only offers 30 must record at 30,
+ * not fail to open.
+ *
+ * 1280×720 for the camera rather than matching the screen. That is not a compromise made
+ * for the encoder's sake, although it helps — a typical USB camera offers 720p60 or
+ * 1080p30 and not both, and between smooth motion and more lines on a face that will be a
+ * quarter of the frame wide, the frame rate is worth more. The panel shows what was
+ * actually granted, so a camera that gives something else does not do so quietly.
+ */
+export const TARGET_FPS = 60;
+export const CAMERA_WIDTH = 1280;
+export const CAMERA_HEIGHT = 720;
+
+export function cameraConstraints(deviceId?: string): MediaTrackConstraints {
+  return {
+    // `ideal`, so a remembered camera that has since been unplugged opens the default one
+    // instead of throwing. `resolveCameraChoice` already drops ids that are not present.
+    ...(deviceId ? { deviceId: { ideal: deviceId } } : {}),
+    width: { ideal: CAMERA_WIDTH },
+    height: { ideal: CAMERA_HEIGHT },
+    frameRate: { ideal: TARGET_FPS },
+  };
+}
+
+/**
+ * Why the camera would not open, said in terms of the thing to go and fix.
+ *
+ * `NotReadableError` is by far the most common of these and the least self-explanatory:
+ * the camera opened fine, another application is simply holding it. A generic "recording
+ * failed" sends people to their permissions settings, which is the wrong place entirely.
+ */
+export function cameraFailure(e: unknown): string {
+  const name = e instanceof DOMException ? e.name : '';
+  if (name === 'NotAllowedError') {
+    return 'Camera permission was refused, so no camera track was recorded.';
+  }
+  if (name === 'NotReadableError' || name === 'TrackStartError') {
+    return 'The camera is in use by another application — Zoom, Teams, Photo Booth or another browser tab. Close it and start again; the rest was recorded without it.';
+  }
+  if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+    return 'No camera was found, so no camera track was recorded.';
+  }
+  if (name === 'OverconstrainedError') {
+    return 'That camera could not provide any usable format, so no camera track was recorded.';
+  }
+  const why = e instanceof Error ? e.message : 'the browser refused it';
+  return `The camera could not be opened (${why}), so no camera track was recorded.`;
+}
+
+export interface VideoFormat {
+  width: number;
+  height: number;
+  frameRate: number;
+}
+
+/**
+ * The format a video track actually negotiated.
+ *
+ * Read from the track rather than from the request, which is the same rule system audio
+ * follows: what a camera returns from a 1080p60 request is routinely 720p30, and a panel
+ * echoing the request back would be describing a file that does not exist.
+ */
+export function trackFormat(stream: MediaStream | null): VideoFormat | null {
+  const settings = stream?.getVideoTracks()[0]?.getSettings();
+  if (!settings) return null;
+  return {
+    width: settings.width ?? 0,
+    height: settings.height ?? 0,
+    frameRate: Math.round(settings.frameRate ?? 0),
+  };
+}
+
+export function formatLabel(format: VideoFormat | null): string {
+  if (!format || !format.width || !format.height) return 'format unknown';
+  const rate = format.frameRate > 0 ? ` · ${format.frameRate} fps` : '';
+  return `${format.width} × ${format.height}${rate}`;
+}
+
+/**
  * Injectable so tests can drive `CaptureSession` with synthetic streams instead of a
  * picker dialog. The alignment and container work is what needs testing, not the two
  * `navigator.mediaDevices` calls.
@@ -168,6 +257,7 @@ export const browserSources: SourceProvider = {
 export type CaptureStep =
   | 'choosing-engine'
   | 'screen-picker'
+  | 'camera'
   | 'microphone'
   | 'opening-files'
   | 'starting-encoders';
@@ -175,6 +265,7 @@ export type CaptureStep =
 export const CAPTURE_STEP_LABELS: Record<CaptureStep, string> = {
   'choosing-engine': 'Checking what this browser can encode…',
   'screen-picker': 'Waiting for you to choose a screen, window or tab…',
+  camera: 'Opening the camera — look for the browser’s prompt.',
   microphone: 'Waiting for microphone permission — look for the browser’s prompt.',
   'opening-files': 'Opening the recording files on disk…',
   'starting-encoders': 'Starting the encoders…',
@@ -189,17 +280,21 @@ export async function acquireSources(
 ): Promise<AcquiredSources> {
   const result: AcquiredSources = {
     screen: null,
+    camera: null,
     systemAudio: null,
     mic: null,
     systemAudioMissing: null,
     micMissing: null,
+    cameraMissing: null,
     systemAudioProcessed: null,
   };
 
   if (request.screen || request.systemAudio) {
     onStep('screen-picker');
     const display = await provider.getDisplayMedia({
-      video: request.screen ? { frameRate: 30 } : true,
+      // `ideal`, never `exact`: a display that cannot deliver 60 should hand back 30, not
+      // throw `OverconstrainedError` and record nothing at all.
+      video: request.screen ? { frameRate: { ideal: TARGET_FPS } } : true,
       // Not a bare `true`: that hands the browser its own defaults, which on Chrome means a
       // soundtrack captured through echo cancellation and automatic gain.
       audio: request.systemAudio ? UNPROCESSED_AUDIO : false,
@@ -222,6 +317,19 @@ export async function acquireSources(
       result.screen = new MediaStream(display.getVideoTracks());
     } else {
       for (const track of display.getVideoTracks()) track.stop();
+    }
+  }
+
+
+  if (request.camera) {
+    // Video only. The camera's own microphone is not taken here: with both camera and mic
+    // ticked that would capture the same voice twice and put a duplicate on the timeline.
+    try {
+      onStep('camera');
+      result.camera = await provider.getUserMedia({ video: cameraConstraints(request.cameraDeviceId) });
+    } catch (e) {
+      if (!result.screen && !result.systemAudio && !request.mic) throw e;
+      result.cameraMissing = cameraFailure(e);
     }
   }
 

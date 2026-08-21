@@ -3,22 +3,30 @@ import type {
   AssetType,
   AudioClip,
   Clip,
+  ImageClip,
+  VideoClip,
   EditorDoc,
   EditorState,
   EffectInstance,
-  EffectType,
+  BuiltinEffectType,
   Interp,
   Keyframe,
+  ExportSettings,
   MediaAsset,
   NormalizedRect,
   OverlayTransform,
   ProjectSettings,
-  ResolutionPreset,
   TextTemplate,
   Track,
   TrackKind,
   TransitionType,
+  ProcessRequest,
+  DerivedFrom,
 } from '../types/editor';
+import { BAKE_ID, bakedName, derivedName, findPreset, replaceRefusal } from '../tools/presets';
+import { bakeClip } from '../tools/bakeClip';
+import { runPreset } from '../tools/runPreset';
+import { formatExportError } from '../export/exportLog';
 import {
   buildClipsForAsset,
   buildRecordingClips,
@@ -34,16 +42,23 @@ import {
   nextTrackLabel,
   trackHasOverlap,
 } from './clipFactory';
+import type { RecordingPlacement } from './clipFactory';
 import { docEquals, docSnapshot, pruneSelection, pushEntry } from './history';
 import { SOURCE_LANE } from '../capture/recordingStore';
 import type { RecordedSource } from '../capture/recordingStore';
+import { fastestRate, frameRateDecision } from '../capture/frameRate';
+import { pictureInPictureTransform } from '../capture/pip';
 import {
   DEFAULT_REGION,
   EFFECTS,
   REGION_CHANNELS,
   REGION_MODE,
+  customDescriptor,
   defaultParams,
+  defaultParamsFor,
+  descriptorFor,
 } from '../render/effects/registry';
+import { clearShaderFailure } from '../render/effects/shaderStats';
 import { TRANSFORM_CHANNELS, clampFade } from '../utils/clipRender';
 import {
   channelTimes,
@@ -58,6 +73,10 @@ import { audioTracks, videoTracks } from '../utils/compositeOrder';
 import { inferAssetKind } from '../utils/assetKind';
 import { uid } from '../utils/id';
 import { probeMediaFile } from '../utils/probeMedia';
+import { clampDimension, clampFps, DEFAULT_SETTINGS, sameAspect } from '../utils/resolution';
+import { DEFAULT_EXPORT_SETTINGS } from '../utils/exportSettings';
+import { reframeClips, reframeTracks } from '../utils/reframe';
+import { requantizeClips } from '../utils/requantize';
 import { fetchUrlAsFile } from '../utils/urlMedia';
 import { clearVideoThumbnailCache } from '../utils/videoThumbnailCache';
 import { clearWaveformCache } from '../utils/waveformCache';
@@ -224,7 +243,8 @@ function playheadInRange(clips: Clip[], playhead: number): number | null {
 }
 
 const initialState: EditorState = {
-  settings: { resolution: '1080p', fps: 30 },
+  settings: { ...DEFAULT_SETTINGS },
+  exportSettings: { ...DEFAULT_EXPORT_SETTINGS },
   tracks: defaultTracks(),
   clips: [],
   libraryOrder: [],
@@ -249,6 +269,7 @@ const initialState: EditorState = {
   exportEngine: null,
   exportNotice: null,
   libraryNotice: null,
+  processJob: null,
 };
 
 interface EditorActions {
@@ -261,7 +282,15 @@ interface EditorActions {
   redoLabel: () => string | null;
 
   // Session
-  setResolution: (resolution: ResolutionPreset) => void;
+  /**
+   * The whole composition at once: size in pixels and frame rate. An aspect change re-anchors
+   * existing geometry and a rate change re-quantizes the timeline, both inside this one step.
+   */
+  setProjectSettings: (settings: ProjectSettings) => void;
+  /** Encoder choices for the next export. Undoable like everything else in the document. */
+  setExportSettings: (settings: ExportSettings) => void;
+  setCanvasSize: (width: number, height: number) => void;
+  setFps: (fps: number) => void;
   setPlayhead: (t: number) => void;
   setPlaying: (playing: boolean) => void;
   setFfmpegStatus: (status: EditorState['ffmpegStatus'], error?: string | null) => void;
@@ -306,7 +335,28 @@ interface EditorActions {
   addAssetToTimeline: (assetId: string) => void;
   removeLibraryItem: (assetId: string) => void;
   /** Imports one capture session and lays its sources out keeping their measured offsets. */
-  importRecordings: (recordings: RecordedSource[]) => Promise<string[]>;
+  /**
+   * Adds a finished capture session. The notice is anything the user has to be told about
+   * the project itself — today, whether its frame rate moved to match the recording.
+   */
+  importRecordings: (
+    recordings: RecordedSource[],
+  ) => Promise<{ assetIds: string[]; notice: string | null }>;
+  /** Runs one preset over a whole asset or one excerpt of it, adding the result as a new asset. */
+  startProcess: (request: ProcessRequest) => Promise<void>;
+  cancelProcess: () => void;
+  /**
+   * Points a clip at a different asset, keeping the edit and taking the new file whole.
+   * `clearEffects` drops the chain, which a bake must do — the effects are in the file now.
+   * Returns a sentence describing what changed, or null when it could not be done.
+   */
+  replaceClipSource: (
+    clipId: string,
+    assetId: string,
+    options?: { clearEffects?: boolean },
+  ) => string | null;
+  /** Renders one clip's effect chain to a new file on the GPU, through the export path. */
+  startBake: (clipId: string, replace: boolean) => Promise<void>;
 
   // Clips
   addTextClip: (text: string, template: TextTemplate) => void;
@@ -325,7 +375,11 @@ interface EditorActions {
   detachAudio: (id: string) => void;
 
   // Effects and fades. `target` is a clip id, or { kind: 'track', id } for a track grade.
-  addEffect: (target: EffectTargetRef, type: EffectType) => void;
+  addEffect: (target: EffectTargetRef, type: BuiltinEffectType) => void;
+  /** Adds a user-supplied shader as an effect, with its annotated parameters. */
+  addCustomEffect: (target: EffectTargetRef, source: string) => void;
+  /** Replaces a custom effect's source, keeping the parameters that still exist. */
+  setEffectShader: (target: EffectTargetRef, effectId: string, source: string) => void;
   removeEffect: (target: EffectTargetRef, effectId: string) => void;
   moveEffect: (target: EffectTargetRef, effectId: string, direction: -1 | 1) => void;
   toggleEffect: (target: EffectTargetRef, effectId: string) => void;
@@ -335,7 +389,7 @@ interface EditorActions {
   /** Moves or resizes the mask box, writing keyframes when the region is armed. */
   setRegionRect: (target: EffectTargetRef, effectId: string, rect: NormalizedRect) => void;
   /** Adds an effect already configured with a region — the one-click masking presets. */
-  addRegionEffect: (target: EffectTargetRef, type: EffectType) => void;
+  addRegionEffect: (target: EffectTargetRef, type: BuiltinEffectType) => void;
   resetEffect: (target: EffectTargetRef, effectId: string) => void;
   setClipFade: (clipId: string, edge: 'in' | 'out', seconds: number) => void;
   /** Adds a ranged grade: a clip with no picture that affects everything below it. */
@@ -364,6 +418,9 @@ interface EditorActions {
 
 type Store = EditorState & EditorActions;
 
+/** The running preset job, so `cancelProcess` has something to abort. One at a time. */
+let activeProcess: AbortController | null = null;
+
 async function createAssetFromFile(file: File, kind: AssetType): Promise<MediaAsset> {
   const probe = await probeMediaFile(file, kind);
   return {
@@ -384,6 +441,32 @@ function assetDurationFor(clip: Clip, mediaLibrary: Record<string, MediaAsset>):
   if (!('assetId' in clip)) return Infinity;
   const asset = mediaLibrary[clip.assetId];
   return asset?.duration ?? clip.sourceTrimOut;
+}
+
+/**
+ * The same clip, reading from a different file, starting at its beginning.
+ *
+ * Everything that describes the *edit* survives: where the clip sits, its effect chain and
+ * keyframes, its placement, its fades. Only what describes the *source* is rewritten. Fades
+ * are clamped because the new file may be shorter than the old excerpt, and a video's audio
+ * flags follow the new file — a preset that strips audio has to leave a clip that knows it.
+ */
+function swapSource(clip: VideoClip | AudioClip | ImageClip, asset: MediaAsset): Clip {
+  const duration = asset.duration;
+  const fadeIn = Math.min(clip.fadeIn ?? 0, duration);
+  const fadeOut = Math.min(clip.fadeOut ?? 0, Math.max(0, duration - fadeIn));
+  const common = {
+    assetId: asset.id,
+    sourceTrimIn: 0,
+    sourceTrimOut: duration,
+    fadeIn: fadeIn > 0 ? fadeIn : undefined,
+    fadeOut: fadeOut > 0 ? fadeOut : undefined,
+  };
+  if (clip.kind === 'video') {
+    const hasAudio = asset.hasAudio ?? false;
+    return { ...clip, ...common, hasAudio, audioEnabled: clip.audioEnabled && hasAudio };
+  }
+  return { ...clip, ...common };
 }
 
 /** Rewrites one clip's effect chain, leaving the array identity alone when nothing changed. */
@@ -408,6 +491,36 @@ export const useEditorStore = create<Store>((set, get) => {
   /** Interaction in progress: intermediate mutations don't push history. */
   let interaction: { label: string; doc: EditorDoc } | null = null;
   let lastCoalesce: { label: string; at: number } | null = null;
+
+  /**
+   * Everything that happens once a job has produced a file: probe it, put it in the library
+   * beside its source, and — when asked — point a clip at it.
+   *
+   * Shared by both producers, because where a result goes is a property of the library and
+   * the timeline, not of whether FFmpeg or the GPU made it.
+   */
+  async function adoptProduced(
+    produced: File,
+    kind: AssetType,
+    name: string,
+    derivedFrom: DerivedFrom,
+    replace?: { clipId: string; clearEffects?: boolean },
+  ): Promise<{ asset: MediaAsset; swapped: string | null }> {
+    const created = await createAssetFromFile(new File([produced], name, { type: produced.type }), kind);
+    const asset: MediaAsset = { ...created, derivedFrom };
+
+    set((s) => {
+      const libraryOrder = [...s.libraryOrder];
+      const at = libraryOrder.indexOf(derivedFrom.assetId);
+      libraryOrder.splice(at < 0 ? libraryOrder.length : at + 1, 0, asset.id);
+      return { mediaLibrary: { ...s.mediaLibrary, [asset.id]: asset }, libraryOrder };
+    });
+
+    const swapped = replace
+      ? get().replaceClipSource(replace.clipId, asset.id, { clearEffects: replace.clearEffects })
+      : null;
+    return { asset, swapped };
+  }
 
   /** Push an undo entry, then apply. Coalesces repeats of the same label within 500ms. */
   function commit(label: string, updater: (state: Store) => Partial<EditorState>, coalesce = false): void {
@@ -525,10 +638,59 @@ export const useEditorStore = create<Store>((set, get) => {
 
     // ---------------------------------------------------------------- session
 
-    setResolution: (resolution) =>
-      commit('Change resolution', (s) => ({
-        settings: { ...s.settings, resolution } as ProjectSettings,
-      })),
+    /**
+     * Resizing and reshaping are the same action but not the same edit.
+     *
+     * At a constant aspect a normalized rect still means what it meant, so 1080p → 4K only
+     * writes two numbers. A change of *shape* moves every explicit placement, and a change of
+     * frame rate moves every clip edge onto the new grid. All of it belongs to one commit: the
+     * setting and the consequences it forced are a single history entry, so one undo puts back
+     * both. Undoing a canvas change and finding the overlays still moved would be the worst of
+     * both.
+     */
+    setProjectSettings: (requested) => {
+      const size = {
+        width: clampDimension(requested.width),
+        height: clampDimension(requested.height),
+      };
+      const fps = clampFps(requested.fps);
+      const current = get().settings;
+      const resized = size.width !== current.width || size.height !== current.height;
+      const rateChanged = fps !== current.fps;
+      if (!resized && !rateChanged) return;
+
+      const from = { width: current.width, height: current.height };
+      const reshaped = resized && !sameAspect(from, size);
+      const label =
+        resized && rateChanged
+          ? 'Change project settings'
+          : reshaped
+            ? 'Change canvas shape'
+            : resized
+              ? 'Change resolution'
+              : 'Change frame rate';
+
+      commit(label, (s) => {
+        let clips = s.clips;
+        if (reshaped) clips = reframeClips(clips, s.mediaLibrary, from, size);
+        // Existing edges were snapped to the old grid and are now between frames. Leaving
+        // them there is not neutral: export samples the nearest frame either way, so the
+        // choice is between moving them visibly now or invisibly at export.
+        if (rateChanged && clips.length > 0) clips = requantizeClips(clips, fps);
+        return {
+          settings: { ...size, fps },
+          clips,
+          ...(reshaped ? { tracks: reframeTracks(s.tracks, from, size) } : {}),
+        };
+      });
+    },
+
+    setExportSettings: (next) => commit('Change export settings', () => ({ exportSettings: next })),
+
+    setCanvasSize: (width, height) =>
+      get().setProjectSettings({ ...get().settings, width, height }),
+
+    setFps: (fps) => get().setProjectSettings({ ...get().settings, fps }),
 
     setPlayhead: (t) => {
       const max = get().getProjectDuration();
@@ -765,10 +927,13 @@ export const useEditorStore = create<Store>((set, get) => {
      * recording one track at a time would be a strange thing to make someone do.
      */
     importRecordings: async (recordings) => {
-      const placements: { assetId: string; asset: MediaAsset; startOffset: number; lane: number }[] = [];
+      const placements: RecordingPlacement[] = [];
+      // A camera composites over a screen; on its own it is simply the picture, full frame.
+      const overScreen = recordings.some((r) => r.kind === 'screen');
 
       for (const recording of recordings) {
-        const kind: AssetType = recording.kind === 'screen' ? 'video' : 'audio';
+        const visual = recording.kind === 'screen' || recording.kind === 'camera';
+        const kind: AssetType = visual ? 'video' : 'audio';
         const asset = await createAssetFromFile(recording.file, kind);
         // Prefer the length the capture reported. `probeMediaFile` substitutes a flat 10s
         // whenever a container says `Infinity`, which is exactly the state an unrepaired
@@ -787,21 +952,230 @@ export const useEditorStore = create<Store>((set, get) => {
           asset: resolved,
           startOffset: recording.startOffset,
           lane: SOURCE_LANE[recording.kind],
+          ...(recording.kind === 'camera' && overScreen
+            ? {
+                transform: pictureInPictureTransform(
+                  recording.format ?? { width: resolved.width ?? 0, height: resolved.height ?? 0 },
+                  get().settings,
+                ),
+              }
+            : {}),
         });
       }
 
-      if (placements.length === 0) return [];
+      if (placements.length === 0) return { assetIds: [], notice: null };
 
+      // Decided against the timeline as it was *before* this recording landed: the whole
+      // question is whether there were already clips whose edges a rate change would move.
+      const rate = frameRateDecision(
+        fastestRate(recordings.map((r) => r.format)),
+        get().settings,
+        get().clips.length,
+        DEFAULT_SETTINGS.fps,
+      );
+
+      // One history entry for the whole thing, frame rate included. Undoing a recording one
+      // track — or one setting — at a time would be a strange thing to make someone do.
       commit('Add recording', (s) => {
-        const placed = buildRecordingClips(placements, s.tracks, s.clips, s.playhead, s.settings.fps);
+        const fps = rate.fps ?? s.settings.fps;
+        const placed = buildRecordingClips(placements, s.tracks, s.clips, s.playhead, fps);
         return {
           tracks: placed.tracks,
           clips: [...s.clips, ...placed.clips],
           selectedClipIds: placed.selectedClipId ? [placed.selectedClipId] : [],
+          ...(rate.fps ? { settings: { ...s.settings, fps: rate.fps } } : {}),
         } as Partial<EditorState>;
       });
 
-      return placements.map((p) => p.assetId);
+      return { assetIds: placements.map((p) => p.assetId), notice: rate.notice };
+    },
+
+    /**
+     * Runs a library preset over one asset.
+     *
+     * Never in place: the result enters the library beside its source, so the two can be
+     * compared and the slow ones can be thrown away. Not a history entry either — like every
+     * other import, it changes what is available to edit with rather than the edit itself.
+     */
+    startProcess: async ({ presetId, assetId, range, replaceClipId }) => {
+      const state = get();
+      if (state.processJob) return;
+      if (state.exportProgress !== null) {
+        set({
+          libraryNotice:
+            'An export is running. Presets share the same FFmpeg, so this has to wait for it.',
+        });
+        return;
+      }
+
+      const asset = state.mediaLibrary[assetId];
+      const preset = findPreset(presetId);
+      if (!asset || !preset) return;
+      // Checked here as well as in the dialog: the dialog is one caller, not the contract.
+      const refusal = replaceClipId ? replaceRefusal(preset) : null;
+      if (refusal) {
+        set({ libraryNotice: refusal });
+        return;
+      }
+
+      const controller = new AbortController();
+      activeProcess = controller;
+      const label = `${preset.label} · ${asset.name}`;
+      set({
+        processJob: { assetId, presetId, label, phase: 'loading', progress: 0 },
+        libraryNotice: null,
+      });
+
+      try {
+        const produced = await runPreset(
+          asset,
+          preset,
+          range,
+          ({ phase, progress }) => {
+            const job = get().processJob;
+            if (job) set({ processJob: { ...job, phase, progress } });
+          },
+          controller.signal,
+        );
+
+        // A GIF is an image as far as the rest of the app is concerned; everything else
+        // the presets write is an mp4. The library entry is added either way, and outside the
+        // history entry — so undoing the replacement puts the clip back without throwing away
+        // a file that took minutes to make.
+        const kind: AssetType = preset.ext === 'gif' ? 'image' : 'video';
+        const { asset: derived, swapped } = await adoptProduced(
+          produced,
+          kind,
+          derivedName(asset.name, preset, range),
+          { assetId, presetId, presetLabel: preset.label, range },
+          replaceClipId ? { clipId: replaceClipId } : undefined,
+        );
+        set({
+          libraryNotice: swapped
+            ? `${preset.label}: ${swapped} Undo restores the clip; “${derived.name}” stays in the library.`
+            : `${preset.label}: added “${derived.name}”. The original is untouched.`,
+        });
+      } catch (e) {
+        if (controller.signal.aborted) {
+          set({ libraryNotice: `${preset.label} cancelled — nothing was added.` });
+        } else {
+          console.error('[Tools] preset failed:', presetId, e);
+          set({ libraryNotice: `${preset.label} failed: ${formatExportError(e)}` });
+        }
+      } finally {
+        activeProcess = null;
+        set({ processJob: null });
+      }
+    },
+
+    /**
+     * Renders one clip's effect chain to a new file on the GPU.
+     *
+     * The counterpart to `startProcess`, and the fast one: it goes through the WebCodecs
+     * export path, so the compositor that drew the preview draws the file and the hardware
+     * encoder writes it. That is why it is not another implementation of any effect — it is
+     * the same one, which is the only way "what you see is what you get" survives a bake.
+     */
+    startBake: async (clipId, replace) => {
+      const state = get();
+      if (state.processJob) return;
+      if (state.exportProgress !== null) {
+        set({ libraryNotice: 'An export is already running. One encode at a time.' });
+        return;
+      }
+
+      const clip = state.clips.find((c) => c.id === clipId);
+      if (!clip || !('assetId' in clip)) return;
+      const asset = state.mediaLibrary[clip.assetId];
+      if (!asset) return;
+
+      const controller = new AbortController();
+      activeProcess = controller;
+      const label = `Bake effects · ${asset.name}`;
+      set({
+        processJob: { assetId: asset.id, presetId: BAKE_ID, label, phase: 'running', progress: 0 },
+        libraryNotice: null,
+      });
+
+      try {
+        const result = await bakeClip(
+          clip,
+          asset,
+          state.settings,
+          state.exportSettings,
+          (fraction) => {
+            const job = get().processJob;
+            if (job) set({ processJob: { ...job, progress: Math.round(fraction * 100) } });
+          },
+          controller.signal,
+        );
+
+        const range = { start: clip.sourceTrimIn, duration: clipDuration(clip) };
+        const { asset: derived, swapped } = await adoptProduced(
+          result.file,
+          'video',
+          bakedName(asset.name, range),
+          { assetId: asset.id, presetId: BAKE_ID, presetLabel: 'Baked effects', range },
+          replace ? { clipId, clearEffects: true } : undefined,
+        );
+
+        const speed = result.seconds > 0 ? range.duration / result.seconds : 0;
+        const rate = `${result.frames} frames in ${result.seconds.toFixed(1)}s (${speed.toFixed(1)}× realtime)`;
+        set({
+          libraryNotice: swapped
+            ? `Baked ${rate}: ${swapped} Undo restores the clip; “${derived.name}” stays in the library.`
+            : `Baked ${rate} — added “${derived.name}”.`,
+        });
+      } catch (e) {
+        if (controller.signal.aborted) {
+          set({ libraryNotice: 'Bake cancelled — nothing was added.' });
+        } else {
+          console.error('[Tools] bake failed:', clipId, e);
+          set({ libraryNotice: `Bake failed: ${formatExportError(e)}` });
+        }
+      } finally {
+        activeProcess = null;
+        set({ processJob: null });
+      }
+    },
+
+    cancelProcess: () => {
+      activeProcess?.abort(new DOMException('Preset cancelled', 'AbortError'));
+    },
+
+    replaceClipSource: (clipId, assetId, options) => {
+      const clip = get().clips.find((c) => c.id === clipId);
+      const asset = get().mediaLibrary[assetId];
+      if (!clip || !asset || !('assetId' in clip)) return null;
+
+      const was = clipDuration(clip);
+      const now = asset.duration;
+      const baked = options?.clearEffects === true && (clip.effects?.length ?? 0) > 0;
+      commit(baked ? 'Bake effects' : 'Replace clip source', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId
+            ? { ...swapSource(clip, asset), ...(options?.clearEffects ? { effects: undefined } : {}) }
+            : c,
+        ),
+      }));
+
+      // Said out loud because leaving the chain on the clip would apply every effect twice —
+      // once from the file and once from the renderer — and the picture would only look
+      // wrong to someone who knew what it was supposed to look like.
+      const chain = baked ? ' Its effect chain moved into the file and is off the clip.' : '';
+
+      // Under a frame is rounding, not a length change worth reporting.
+      if (Math.abs(now - was) < 1 / get().settings.fps) {
+        return `the clip now plays the processed version.${chain}`;
+      }
+      const tail =
+        now < was
+          ? `so there is a ${(was - now).toFixed(1)}s gap after it`
+          : `so it now reaches ${(now - was).toFixed(1)}s further right`;
+      return (
+        `the clip now plays the processed version and runs ${now.toFixed(1)}s instead of ` +
+        `${was.toFixed(1)}s, ${tail} — nothing later on the track moved.${chain}`
+      );
     },
 
     removeLibraryItem: (assetId) => {
@@ -945,6 +1319,50 @@ export const useEditorStore = create<Store>((set, get) => {
         ]),
       ),
 
+    addCustomEffect: (target, source) => {
+      const seed: EffectInstance = {
+        id: uid('fx'),
+        type: 'custom',
+        enabled: true,
+        params: {},
+        shader: source,
+      };
+      const effect: EffectInstance = { ...seed, params: defaultParamsFor(seed) };
+      commit(`Add ${customDescriptor(source).label}`, (s) =>
+        applyEffects(s, target, (effects) => [...effects, effect]),
+      );
+    },
+
+    setEffectShader: (target, effectId, source) => {
+      // Editing the source is the user saying "try again" — a shader that took the GPU
+      // down last time deserves another run now that it is different.
+      clearShaderFailure(effectId);
+      commit('Edit shader', (s) =>
+        applyEffects(s, target, (effects) =>
+          effects.map((e) => {
+            if (e.id !== effectId) return e;
+            const next: EffectInstance = { ...e, shader: source };
+            const names = new Set((descriptorFor(next)?.params ?? []).map((p) => p.name));
+            // A parameter that survived the edit keeps its value and its animation; one
+            // the new source no longer declares takes its keyframes with it, rather than
+            // lingering invisibly in the document.
+            const params = { ...regionOnly(e.params), ...defaultParamsFor(next) };
+            for (const [name, value] of Object.entries(e.params)) {
+              if (names.has(name)) params[name] = value;
+            }
+            const kept = Object.entries(e.keyframes ?? {}).filter(
+              ([name]) => names.has(name) || name.startsWith('region.'),
+            );
+            return {
+              ...next,
+              params,
+              keyframes: kept.length > 0 ? Object.fromEntries(kept) : undefined,
+            };
+          }),
+        ),
+      );
+    },
+
     removeEffect: (target, effectId) =>
       commit('Remove effect', (s) =>
         applyEffects(s, target, (effects) => effects.filter((e) => e.id !== effectId)),
@@ -963,12 +1381,16 @@ export const useEditorStore = create<Store>((set, get) => {
         }),
       ),
 
-    toggleEffect: (target, effectId) =>
+    toggleEffect: (target, effectId) => {
+      // Switching a custom shader back on clears the strike against it: if the GPU
+      // dropped the context last time, the user has had the chance to lower its cost.
+      clearShaderFailure(effectId);
       commit('Toggle effect', (s) =>
         applyEffects(s, target, (effects) =>
           effects.map((e) => (e.id === effectId ? { ...e, enabled: !e.enabled } : e)),
         ),
-      ),
+      );
+    },
 
     /**
      * Writes a keyframe at the playhead when the parameter is armed, otherwise sets the
@@ -1066,7 +1488,7 @@ export const useEditorStore = create<Store>((set, get) => {
         applyEffects(s, target, (effects) =>
           effects.map((e) =>
             e.id === effectId
-              ? { ...e, params: { ...regionOnly(e.params), ...defaultParams(e.type) } }
+              ? { ...e, params: { ...regionOnly(e.params), ...defaultParamsFor(e) } }
               : e,
           ),
         ),

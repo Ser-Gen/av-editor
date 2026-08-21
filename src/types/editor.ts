@@ -4,7 +4,49 @@ export type TrackKind = 'video' | 'audio';
 export type TextTemplate = 'lowerThird' | 'centerTitle' | 'subtitle';
 export type AssetType = 'video' | 'audio' | 'image';
 
+/**
+ * The composition itself: how big a frame is and how many of them there are per second.
+ *
+ * Stored as pixels rather than as a preset name so a project can be any shape — vertical,
+ * square, or something a phone produced. Presets are a convenience in the settings dialog
+ * that write these numbers; they are not the storage. `ResolutionPreset` survives only so
+ * a project written by an older build can still be read.
+ */
 export interface ProjectSettings {
+  /** Even numbers only: H.264 refuses an odd dimension. */
+  width: number;
+  height: number;
+  fps: number;
+}
+
+/** How much the exporter spends on quality. Presets set every field below at once. */
+export type ExportQuality = 'master' | 'web' | 'small';
+
+/**
+ * How the project is encoded on the way out.
+ *
+ * Separate from `ProjectSettings` because they answer different questions: the project is what
+ * the composition *is*, and these are what one particular file made from it should be. That is
+ * why the size override lives here — a 1080p web copy of a 4K project is an export, not an edit.
+ */
+export interface ExportSettings {
+  quality: ExportQuality;
+  /** Bits per second. Null follows the preset, scaled to the frame size and rate. */
+  videoBitrate: number | null;
+  /** Seconds between keyframes. Shorter seeks better and costs size. */
+  keyframeInterval: number;
+  audioBitrate: number;
+  /** 1 = mono, 2 = stereo. */
+  audioChannels: number;
+  /** Output size. Null follows the project. Must be the project's aspect — scale, not reshape. */
+  width: number | null;
+  height: number | null;
+  /** Output frame rate. Null follows the project. */
+  fps: number | null;
+}
+
+/** The shape of `ProjectSettings` before sizes became pixels. Read on load, never written. */
+export interface LegacyProjectSettings {
   resolution: ResolutionPreset;
   fps: number;
 }
@@ -31,8 +73,8 @@ export interface Track {
   effects?: EffectInstance[];
 }
 
-/** Every shader effect the registry knows how to render. */
-export type EffectType =
+/** Every shader effect the registry ships with. */
+export type BuiltinEffectType =
   | 'eq'
   | 'cinematic'
   | 'blackWhite'
@@ -44,6 +86,14 @@ export type EffectType =
   | 'flip'
   | 'fill'
   | 'colorBalance';
+
+/**
+ * An effect is either one of the built-ins or a shader the user pasted in. A custom
+ * effect carries its own source and its own parameter list, so it is a *type* only in
+ * the sense that the renderer dispatches on it — every instance can be a different
+ * shader.
+ */
+export type EffectType = BuiltinEffectType | 'custom';
 
 /** How two overlapping clips blend. Stored on the *incoming* clip. */
 export type TransitionType = 'dissolve' | 'dipToBlack' | 'wipeL' | 'wipeR';
@@ -67,6 +117,12 @@ export interface EffectInstance {
   enabled: boolean;
   params: Record<string, number>;
   keyframes?: Record<string, Keyframe[]>;
+  /**
+   * GLSL source, for `type: 'custom'` only. The annotated text exactly as the author
+   * left it: it is both what compiles and what the shader editor reopens, so a shader
+   * survives a round trip through the document unchanged.
+   */
+  shader?: string;
 }
 
 export interface BaseClip {
@@ -173,6 +229,51 @@ export interface MediaAsset {
   height?: number;
   /** False when a video file has no audio track (export skips its audio branch). */
   hasAudio?: boolean;
+  /** Present when a library preset made this asset out of another one. */
+  derivedFrom?: DerivedFrom;
+}
+
+/**
+ * The recipe that produced a processed asset.
+ *
+ * Kept on the asset rather than in a log because the question it answers — "which of these
+ * four near-identical files is the stabilized one?" — is asked weeks later, in the library,
+ * about a file whose name has since been changed by whoever exported it.
+ */
+export interface DerivedFrom {
+  /** The asset it was made from. May since have been removed from the library. */
+  assetId: string;
+  presetId: string;
+  presetLabel: string;
+  /** The excerpt of the source it was made from, in source seconds. Absent = all of it. */
+  range?: { start: number; duration: number };
+}
+
+/**
+ * What one preset run was asked to do.
+ *
+ * The same action serves both entry points: the library processes a whole file, the timeline
+ * processes the cut a split produced. The difference is entirely in `range` — a clip already
+ * knows its excerpt as two numbers, so nothing has to be measured or re-derived.
+ */
+export interface ProcessRequest {
+  presetId: string;
+  /** The library asset the media comes from. */
+  assetId: string;
+  /** The excerpt to process. Absent = the whole file. */
+  range?: { start: number; duration: number };
+  /** When set, the finished excerpt takes this clip's place on the timeline. */
+  replaceClipId?: string;
+}
+
+/** A library preset running over one asset. One at a time, session-only. */
+export interface ProcessJob {
+  assetId: string;
+  presetId: string;
+  /** "Stabilize · holiday.mov", for the progress row. */
+  label: string;
+  phase: 'loading' | 'writing' | 'running' | 'reading';
+  progress: number;
 }
 
 /** While dragging a trim handle: preview this source timestamp without moving playhead. */
@@ -184,6 +285,7 @@ export interface TrimPreview {
 /** Undoable document state. Everything else in the store is session-only. */
 export interface EditorDoc {
   settings: ProjectSettings;
+  exportSettings: ExportSettings;
   tracks: Track[];
   clips: Clip[];
   libraryOrder: string[];
@@ -222,4 +324,6 @@ export interface EditorState extends EditorDoc {
   exportNotice: string | null;
   /** Short-lived status after URL-based library import. */
   libraryNotice: string | null;
+  /** The library preset currently running, if any. */
+  processJob: ProcessJob | null;
 }

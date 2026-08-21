@@ -1,4 +1,5 @@
 import type { Clip, EffectInstance, OverlayTransform, VisualClip } from '../types/editor';
+import type { EffectClock } from '../render/effects/types';
 import { evaluateChannel } from './keyframes';
 import { clipDuration } from './time';
 
@@ -74,6 +75,23 @@ export function activeEffects(clip: Clip, t?: number): EffectInstance[] {
     }
     return animated ? { ...effect, params } : effect;
   });
+}
+
+/**
+ * The clock a clip's custom shaders run on: seconds since the clip began.
+ *
+ * Clip-relative, so a shader's animation moves with the clip the way its keyframes do,
+ * and a copy of the clip elsewhere on the timeline looks the same rather than sampling a
+ * different moment of the effect.
+ */
+export function clipClock(clip: Clip, t: number, fps: number): EffectClock {
+  const time = Math.max(0, t - clip.timelineStart);
+  return { time, frame: Math.round(time * fps), fps };
+}
+
+/** A track grade has no clip to belong to, so its clock is the timeline's. */
+export function timelineClock(t: number, fps: number): EffectClock {
+  return { time: Math.max(0, t), frame: Math.round(Math.max(0, t) * fps), fps };
 }
 
 /** True when any effect parameter or the placement is animated. */

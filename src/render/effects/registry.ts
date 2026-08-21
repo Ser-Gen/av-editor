@@ -1,4 +1,10 @@
-import type { EffectInstance, EffectType } from '../../types/editor';
+import type { BuiltinEffectType, EffectInstance, EffectType } from '../../types/editor';
+import type { EffectDescriptor, EffectParam, LayerSize } from './types';
+import { customDescriptor } from './customShader';
+
+export type { EffectDescriptor, EffectParam, LayerSize } from './types';
+export { customDescriptor, parseShader } from './customShader';
+export { EFFECT_PRELUDE, MAX_EFFECT_PARAMS, packParams } from './types';
 
 /**
  * The effect library.
@@ -11,72 +17,6 @@ import type { EffectInstance, EffectType } from '../../types/editor';
  * Shaders receive the shared prelude below, so a `frag` body is just `main()`.
  */
 
-export const MAX_EFFECT_PARAMS = 8;
-
-export interface EffectParam {
-  name: string;
-  label: string;
-  min: number;
-  max: number;
-  step: number;
-  defaultValue: number;
-  /** Toggles render as a checkbox and are stored as 0 / 1. */
-  control?: 'slider' | 'toggle';
-  /** Label for the current value; defaults to the raw number. */
-  format?: (v: number) => string;
-}
-
-export interface EffectDescriptor {
-  type: EffectType;
-  label: string;
-  /** Shown under the effect header — used to be honest about approximations. */
-  note?: string;
-  params: EffectParam[];
-  /**
-   * Geometric effects change *where* pixels are sampled, not their colour, so they are
-   * folded into the draw call instead of costing a full-frame pass.
-   */
-  geometric?: boolean;
-  /** Fragment shader body. Absent for geometric effects. */
-  frag?: string;
-  /** Full-frame passes; the shader gets `uPass` as the 0-based index. */
-  passes?: number;
-  /**
-   * FFmpeg filter for the fallback export, given the layer's pixel size. `null` means
-   * there is no equivalent and the fallback must warn; `''` means this particular
-   * configuration is a no-op.
-   */
-  ffmpeg: ((p: Record<string, number>, layer: LayerSize) => string) | null;
-}
-
-/** Size in pixels of the layer an FFmpeg filter chain will run on. */
-export interface LayerSize {
-  width: number;
-  height: number;
-}
-
-/** Shared prelude prepended to every effect shader. */
-export const EFFECT_PRELUDE = `#version 300 es
-precision highp float;
-
-in vec2 vUv;
-uniform sampler2D uTex;
-uniform vec2 uResolution;  // layer size in pixels
-uniform vec2 uTexel;       // 1.0 / uResolution
-uniform float uPass;       // 0-based pass index
-uniform float uP[${MAX_EFFECT_PARAMS}];
-out vec4 outColor;
-
-// The layer is premultiplied. Colour maths has to run unpremultiplied or the operation
-// leaks into soft alpha edges — invisible on video, obvious on text.
-vec4 fetch(vec2 uv) {
-  vec4 c = texture(uTex, uv);
-  return c.a > 0.0 ? vec4(c.rgb / c.a, c.a) : vec4(0.0);
-}
-vec4 store(vec3 rgb, float a) { return vec4(clamp(rgb, 0.0, 1.0) * a, a); }
-float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
-`;
-
 function num(v: number): string {
   return Number(v.toFixed(4)).toString();
 }
@@ -84,7 +24,7 @@ function num(v: number): string {
 const percent = (v: number) => `${Math.round(v * 100)}%`;
 const pixels = (v: number) => `${Math.round(v)} px`;
 
-export const EFFECTS: Record<EffectType, EffectDescriptor> = {
+export const EFFECTS: Record<BuiltinEffectType, EffectDescriptor> = {
   // ---------------------------------------------------------------- eq / enhance
   eq: {
     type: 'eq',
@@ -456,12 +396,29 @@ export function regionOf(params: Record<string, number>): ResolvedRegion | null 
   };
 }
 
-/** Geometric effects reposition the whole layer, so masking them means nothing. */
-export function supportsRegion(type: EffectType): boolean {
-  return !EFFECTS[type]?.geometric;
+/** The built-in descriptor for a type, or null for a custom shader. */
+export function builtin(type: EffectType): EffectDescriptor | null {
+  return type === 'custom' ? null : (EFFECTS[type] ?? null);
 }
 
-export const EFFECT_ORDER: EffectType[] = [
+/**
+ * Everything about one effect *instance*.
+ *
+ * For a built-in this is the registry entry; for a custom shader it is built from the
+ * pasted source. Callers that only need to know what an effect looks like — the Inspector,
+ * the keyframe strip, the fallback exporter — go through here and never learn which it is.
+ */
+export function descriptorFor(effect: EffectInstance): EffectDescriptor | null {
+  if (effect.type !== 'custom') return EFFECTS[effect.type] ?? null;
+  return effect.shader ? customDescriptor(effect.shader) : null;
+}
+
+/** Geometric effects reposition the whole layer, so masking them means nothing. */
+export function supportsRegion(type: EffectType): boolean {
+  return !builtin(type)?.geometric;
+}
+
+export const EFFECT_ORDER: BuiltinEffectType[] = [
   'eq',
   'cinematic',
   'blackWhite',
@@ -475,21 +432,20 @@ export const EFFECT_ORDER: EffectType[] = [
   'flip',
 ];
 
-export function defaultParams(type: EffectType): Record<string, number> {
+export function defaultParams(type: BuiltinEffectType): Record<string, number> {
+  return paramDefaults(EFFECTS[type].params);
+}
+
+export function paramDefaults(params: EffectParam[]): Record<string, number> {
   const out: Record<string, number> = {};
-  for (const p of EFFECTS[type].params) out[p.name] = p.defaultValue;
+  for (const p of params) out[p.name] = p.defaultValue;
   return out;
 }
 
-/** Params in descriptor order, padded to the shader's fixed-size array. */
-export function packParams(type: EffectType, params: Record<string, number>): Float32Array {
-  const desc = EFFECTS[type];
-  const out = new Float32Array(MAX_EFFECT_PARAMS);
-  desc.params.forEach((p, i) => {
-    const v = params[p.name];
-    out[i] = Number.isFinite(v) ? v : p.defaultValue;
-  });
-  return out;
+/** The defaults for one instance — the custom-shader-aware counterpart of `defaultParams`. */
+export function defaultParamsFor(effect: EffectInstance): Record<string, number> {
+  const desc = descriptorFor(effect);
+  return desc ? paramDefaults(desc.params) : {};
 }
 
 /** Source-rectangle mirroring requested by geometric effects. */
@@ -506,7 +462,10 @@ export function flipFromEffects(effects: EffectInstance[]): { x: boolean; y: boo
 
 /** Effects that need a full-frame pass, in order. */
 export function shaderEffects(effects: EffectInstance[]): EffectInstance[] {
-  return effects.filter((e) => !EFFECTS[e.type]?.geometric);
+  return effects.filter((e) => {
+    const desc = descriptorFor(e);
+    return desc !== null && !desc.geometric;
+  });
 }
 
 /**
@@ -528,7 +487,7 @@ export function ffmpegChain(
   const unsupported: string[] = [];
 
   for (const effect of effects) {
-    const desc = EFFECTS[effect.type];
+    const desc = descriptorFor(effect);
     if (!desc) continue;
     if (!desc.ffmpeg) {
       unsupported.push(desc.label);

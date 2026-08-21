@@ -6,6 +6,7 @@ export const HISTORY_LIMIT = 100;
 export function docSnapshot(state: EditorState): EditorDoc {
   return {
     settings: state.settings,
+    exportSettings: state.exportSettings,
     tracks: state.tracks,
     clips: state.clips,
     libraryOrder: state.libraryOrder,
@@ -15,6 +16,7 @@ export function docSnapshot(state: EditorState): EditorDoc {
 export function docEquals(a: EditorDoc, b: EditorDoc): boolean {
   return (
     a.settings === b.settings &&
+    a.exportSettings === b.exportSettings &&
     a.tracks === b.tracks &&
     a.clips === b.clips &&
     a.libraryOrder === b.libraryOrder

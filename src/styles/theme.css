@@ -196,13 +196,11 @@ body.is-dragging * {
   opacity: 0.85;
 }
 
-.toolbar-resolution {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+.toolbar-settings {
   font-size: 12px;
   color: var(--text-muted);
   white-space: nowrap;
+  font-variant-numeric: tabular-nums;
 }
 
 .main-row {
@@ -295,6 +293,61 @@ body.is-dragging * {
   height: 100%;
   background: linear-gradient(90deg, #4caf50, #ffc107 70%, #ef5350);
   transition: width 80ms linear;
+}
+
+/* Camera: a preview before the take, because framing and lighting cannot be fixed after. */
+.record-camera {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.record-camera-pick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.record-camera-pick select {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+}
+
+/* Mirrored here and only here: the recorded file is never flipped. */
+.record-camera-preview {
+  width: 100%;
+  border-radius: 4px;
+  background: #000;
+  transform: scaleX(-1);
+  aspect-ratio: 16 / 9;
+  object-fit: cover;
+}
+
+.record-formats {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.record-formats li {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+/* The delivered rate falling well behind the negotiated one is worth looking at: a camera
+   starved of light halves its output without renegotiating the track. */
+.record-format.is-starved {
+  color: #ffd54f;
+}
+
+.record-ended {
+  color: #ffcdd2;
 }
 
 .record-controls {
@@ -727,6 +780,123 @@ body.is-dragging * {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
+}
+
+.modal-settings {
+  min-width: 380px;
+  max-width: 440px;
+}
+
+.modal-settings label {
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: -6px;
+}
+
+.settings-size {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.settings-size input[type='number'] {
+  width: 100%;
+  min-width: 0;
+}
+
+.settings-size select {
+  flex: 1;
+}
+
+.settings-times {
+  color: var(--text-muted);
+}
+
+.settings-note {
+  margin: -4px 0 0;
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.quality-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.quality-option {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 10px;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+}
+
+.quality-option.is-on {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, var(--surface2));
+}
+
+.quality-name {
+  font-weight: 600;
+}
+
+.quality-rate {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.quality-note {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.disclosure {
+  align-self: flex-start;
+  padding: 2px 6px;
+  font-size: 12px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+}
+
+.disclosure:hover {
+  color: var(--text);
+}
+
+.settings-advanced {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2);
+}
+
+.settings-advanced input[readonly] {
+  color: var(--text-muted);
+}
+
+/* Consequences of a setting, stated before the button that causes them. */
+.settings-warning {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text);
+  background: color-mix(in srgb, var(--accent) 14%, var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--accent) 32%, var(--border));
+}
+
+.settings-warning--hard {
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface2));
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
 }
 
 .hint {
@@ -1407,27 +1577,48 @@ body.is-resizing {
   z-index: 4;
 }
 
-.h-scrollbar {
+/*
+ * The minimap sits where the horizontal scrollbar used to, and does its job as well as its
+ * own: the window over the clips *is* the thumb, so there is one control here, not two.
+ */
+.minimap {
   grid-column: 2;
   grid-row: 3;
   position: relative;
-  height: 10px;
+  overflow: hidden;
   background: var(--surface2);
   border-top: 1px solid var(--border);
+  cursor: pointer;
+  touch-action: none;
 }
 
-.h-scrollbar-thumb {
+.minimap-canvas {
+  display: block;
+  width: 100%;
+}
+
+.minimap-window {
   position: absolute;
-  top: 2px;
-  height: 6px;
-  border-radius: 3px;
-  background: #4a4a58;
-  cursor: grab;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  /* Which gesture a press starts is decided from the geometry, not from the event target. */
+  pointer-events: none;
   will-change: transform;
 }
 
-.h-scrollbar-thumb:hover {
-  background: var(--accent);
+.minimap-playhead {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 1px;
+  background: #fff;
+  pointer-events: none;
+  will-change: transform;
 }
 
 /* --------------------------------------------------------------- inspector */
@@ -1609,7 +1800,165 @@ body.is-resizing {
   min-width: 64px;
 }
 
-.transport-scrub {
+.transport-spacer {
   flex: 1;
-  min-width: 60px;
+}
+
+/* ---------------------------------------------------------- custom shaders */
+
+.modal-shader {
+  min-width: min(760px, 92vw);
+  max-width: 92vw;
+  max-height: 88vh;
+  overflow-y: auto;
+}
+
+.shader-presets {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.shader-presets label {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.shader-presets .hint {
+  flex: 1;
+}
+
+/* Monospace and tall: this is where a 500-line raymarcher gets pasted. */
+.shader-source {
+  width: 100%;
+  min-height: 320px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  tab-size: 4;
+  white-space: pre;
+  overflow: auto;
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+}
+
+.shader-status {
+  margin: 0;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  background: color-mix(in srgb, var(--accent) 12%, var(--surface2));
+  border: 1px solid color-mix(in srgb, var(--accent) 30%, var(--border));
+}
+
+.shader-status--error {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: color-mix(in srgb, var(--danger) 14%, var(--surface2));
+  border-color: color-mix(in srgb, var(--danger) 38%, var(--border));
+}
+
+.shader-problems {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
+.shader-summary {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.shader-summary th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--text-muted);
+  padding: 3px 10px 3px 0;
+  vertical-align: top;
+  white-space: nowrap;
+}
+
+.shader-summary td {
+  padding: 3px 0;
+  color: var(--text);
+}
+
+/* ----------------------------------------------------------------- library presets */
+
+.modal-process {
+  min-width: 420px;
+  max-width: 480px;
+}
+
+.process-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.process-bar {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.process-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  /* Slow presets move this in single percent steps; easing the width keeps it from
+     looking stalled between them. */
+  transition: width 200ms linear;
+}
+
+/* The compact row in the library, shown while a job runs with the dialog closed. */
+.process-running {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 6px 8px;
+  margin: 8px 12px 0;
+  padding: 8px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.process-running .process-bar {
+  grid-column: 1 / -1;
+}
+
+.process-running .media-library-name {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.bake-list {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+/* The redirect notice carries a paragraph or two and an action, unlike the one-line warnings. */
+.settings-warning p {
+  margin: 0 0 6px;
+}
+
+.settings-warning p:last-child {
+  margin-bottom: 0;
+}
+
+.settings-warning button {
+  margin-top: 6px;
 }

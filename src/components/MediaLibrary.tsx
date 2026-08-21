@@ -6,6 +6,7 @@ import { isAssetInUse } from '../store/clipFactory';
 import type { AssetType } from '../types/editor';
 import { inferAssetKind } from '../utils/assetKind';
 import { VideoPoster } from './VideoPoster';
+import { ProcessDialog } from './ProcessDialog';
 import { formatDuration } from '../utils/time';
 
 const TYPE_LABEL: Record<AssetType, string> = {
@@ -23,6 +24,10 @@ export function MediaLibrary() {
   const addAssetToTimeline = useEditorStore((s) => s.addAssetToTimeline);
   const removeLibraryItem = useEditorStore((s) => s.removeLibraryItem);
   const libraryNotice = useEditorStore((s) => s.libraryNotice);
+  const processJob = useEditorStore((s) => s.processJob);
+  const cancelProcess = useEditorStore((s) => s.cancelProcess);
+  /** Which asset the preset dialog is open for. */
+  const [processTarget, setProcessTarget] = useState<string | null>(null);
   const capture = useCaptureSession();
   const recording = capture.phase === 'recording';
   const busy = capture.phase !== 'idle';
@@ -73,6 +78,24 @@ export function MediaLibrary() {
       {showPanel && <RecordPanel capture={capture} />}
       {libraryNotice && <p className="media-library-notice">{libraryNotice}</p>}
 
+      {processJob && (
+        <div className="process-running">
+          <div className="process-bar">
+            <div className="process-bar-fill" style={{ width: `${processJob.progress}%` }} />
+          </div>
+          <span className="media-library-name" title={processJob.label}>
+            {processJob.label}
+          </span>
+          <button type="button" title="Stop this preset" onClick={cancelProcess}>
+            Cancel
+          </button>
+        </div>
+      )}
+
+      {processTarget && (
+        <ProcessDialog assetId={processTarget} onClose={() => setProcessTarget(null)} />
+      )}
+
       <ul className="media-library-list">
         {libraryOrder.length === 0 && (
           <li className="media-library-empty">No media yet</li>
@@ -84,7 +107,15 @@ export function MediaLibrary() {
           const duration = asset.type === 'image' ? '5s' : formatDuration(asset.duration);
 
           return (
-            <li key={id} className={`media-library-item media-library-item--${asset.type}`}>
+            <li
+              key={id}
+              className={`media-library-item media-library-item--${asset.type}`}
+              onContextMenu={(e) => {
+                if (asset.type !== 'video') return;
+                e.preventDefault();
+                setProcessTarget(id);
+              }}
+            >
               {asset.type === 'video' && (
                 <VideoPoster assetId={id} blobUrl={asset.blobUrl} alt={asset.name} />
               )}
@@ -96,7 +127,10 @@ export function MediaLibrary() {
                 <span className="media-library-name" title={asset.name}>
                   {asset.name}
                 </span>
-                <span className="media-library-meta">{duration}</span>
+                <span className="media-library-meta">
+                  {duration}
+                  {asset.derivedFrom && ` · ${asset.derivedFrom.presetLabel}`}
+                </span>
               </div>
               <div className="media-library-actions">
                 <button
@@ -106,6 +140,16 @@ export function MediaLibrary() {
                 >
                   +
                 </button>
+                {asset.type === 'video' && (
+                  <button
+                    type="button"
+                    title="Process with a preset (right-click works too)"
+                    disabled={processJob !== null}
+                    onClick={() => setProcessTarget(id)}
+                  >
+                    ⚙
+                  </button>
+                )}
                 <button
                   type="button"
                   title={inUse ? 'In use on timeline' : 'Remove from library'}

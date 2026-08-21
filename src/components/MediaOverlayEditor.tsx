@@ -7,13 +7,13 @@ import {
   fromPct,
   getCropLayout,
   HANDLE_RADIUS_PX,
-  OVERLAY_PREVIEW_H,
-  OVERLAY_PREVIEW_W,
   pct,
+  stageSize,
   pointerCanvasNorm,
   pointerCanvasPx,
 } from '../utils/overlayEditorUtils';
 import { clampRect, drawOverlaySource, normalizeOverlayTransform } from '../utils/overlayTransform';
+import { useEditorStore } from '../store/editorStore';
 
 interface Props {
   mediaKind: 'video' | 'image';
@@ -34,6 +34,8 @@ export function MediaOverlayEditor({
   transform,
   onChange,
 }: Props) {
+  const settings = useEditorStore((s) => s.settings);
+  const stage = stageSize(settings.width, settings.height);
   const frameCanvasRef = useRef<HTMLCanvasElement>(null);
   const cropCanvasRef = useRef<HTMLCanvasElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -114,36 +116,36 @@ export function MediaOverlayEditor({
     if (!ctx) return;
 
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = OVERLAY_PREVIEW_W * dpr;
-    canvas.height = OVERLAY_PREVIEW_H * dpr;
-    canvas.style.width = `${OVERLAY_PREVIEW_W}px`;
-    canvas.style.height = `${OVERLAY_PREVIEW_H}px`;
+    canvas.width = stage.w * dpr;
+    canvas.height = stage.h * dpr;
+    canvas.style.width = `${stage.w}px`;
+    canvas.style.height = `${stage.h}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
     ctx.fillStyle = '#101820';
-    ctx.fillRect(0, 0, OVERLAY_PREVIEW_W, OVERLAY_PREVIEW_H);
-    drawOverlaySource(ctx, source, sw, sh, normalized, OVERLAY_PREVIEW_W, OVERLAY_PREVIEW_H);
+    ctx.fillRect(0, 0, stage.w, stage.h);
+    drawOverlaySource(ctx, source, sw, sh, normalized, stage.w, stage.h);
 
     const frame = clampRect(normalized.frame);
     ctx.strokeStyle = '#7ec8ff';
     ctx.lineWidth = 2;
     ctx.strokeRect(
-      frame.x * OVERLAY_PREVIEW_W,
-      frame.y * OVERLAY_PREVIEW_H,
-      frame.w * OVERLAY_PREVIEW_W,
-      frame.h * OVERLAY_PREVIEW_H,
+      frame.x * stage.w,
+      frame.y * stage.h,
+      frame.w * stage.w,
+      frame.h * stage.h,
     );
     ctx.fillStyle = 'rgba(126, 200, 255, 0.12)';
     ctx.fillRect(
-      frame.x * OVERLAY_PREVIEW_W,
-      frame.y * OVERLAY_PREVIEW_H,
-      frame.w * OVERLAY_PREVIEW_W,
-      frame.h * OVERLAY_PREVIEW_H,
+      frame.x * stage.w,
+      frame.y * stage.h,
+      frame.w * stage.w,
+      frame.h * stage.h,
     );
-    const handle = frameRectHandlePx(frame);
+    const handle = frameRectHandlePx(frame, stage);
     ctx.fillStyle = '#7ec8ff';
     ctx.fillRect(handle.x - 5, handle.y - 5, 10, 10);
-  }, [normalized, ready, mediaKind]);
+  }, [normalized, ready, mediaKind, stage.w, stage.h]);
 
   useEffect(() => {
     const canvas = cropCanvasRef.current;
@@ -156,15 +158,15 @@ export function MediaOverlayEditor({
     if (!ctx) return;
 
     const dpr = window.devicePixelRatio || 1;
-    canvas.width = OVERLAY_PREVIEW_W * dpr;
-    canvas.height = OVERLAY_PREVIEW_H * dpr;
-    canvas.style.width = `${OVERLAY_PREVIEW_W}px`;
-    canvas.style.height = `${OVERLAY_PREVIEW_H}px`;
+    canvas.width = stage.w * dpr;
+    canvas.height = stage.h * dpr;
+    canvas.style.width = `${stage.w}px`;
+    canvas.style.height = `${stage.h}px`;
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-    const layout = getCropLayout(sw, sh);
+    const layout = getCropLayout(sw, sh, stage);
     ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, OVERLAY_PREVIEW_W, OVERLAY_PREVIEW_H);
+    ctx.fillRect(0, 0, stage.w, stage.h);
     ctx.drawImage(source, layout.ox, layout.oy, layout.dw, layout.dh);
 
     const crop = clampRect(normalized.crop);
@@ -186,7 +188,7 @@ export function MediaOverlayEditor({
     const handle = cropRectHandlePx(crop, layout);
     ctx.fillStyle = '#ffb74d';
     ctx.fillRect(handle.x - 5, handle.y - 5, 10, 10);
-  }, [normalized, ready, mediaKind]);
+  }, [normalized, ready, mediaKind, stage.w, stage.h]);
 
   const beginDrag = (
     e: React.PointerEvent<HTMLCanvasElement>,
@@ -203,17 +205,17 @@ export function MediaOverlayEditor({
 
   const onFramePointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const box = e.currentTarget.getBoundingClientRect();
-    const px = pointerCanvasPx(e, box);
-    const handle = frameRectHandlePx(normalized.frame);
+    const px = pointerCanvasPx(e, box, stage);
+    const handle = frameRectHandlePx(normalized.frame, stage);
     const nearHandle = Math.hypot(px.x - handle.x, px.y - handle.y) < HANDLE_RADIUS_PX;
-    beginDrag(e, 'frame', nearHandle ? 'resize' : 'move', pointerCanvasNorm(e, box));
+    beginDrag(e, 'frame', nearHandle ? 'resize' : 'move', pointerCanvasNorm(e, box, stage));
   };
 
   const onCropPointerDown = (e: React.PointerEvent<HTMLCanvasElement>) => {
     const { sw, sh } = sourceSize();
-    const layout = getCropLayout(sw, sh);
+    const layout = getCropLayout(sw, sh, stage);
     const box = e.currentTarget.getBoundingClientRect();
-    const px = pointerCanvasPx(e, box);
+    const px = pointerCanvasPx(e, box, stage);
     const handle = cropRectHandlePx(normalized.crop, layout);
     const nearHandle = Math.hypot(px.x - handle.x, px.y - handle.y) < HANDLE_RADIUS_PX;
     beginDrag(e, 'crop', nearHandle ? 'resize' : 'move', canvasPxToCropNorm(px, layout), layout);
@@ -223,7 +225,7 @@ export function MediaOverlayEditor({
     const drag = dragRef.current;
     if (!drag || drag.target !== 'frame') return;
     const box = e.currentTarget.getBoundingClientRect();
-    const p = pointerCanvasNorm(e, box);
+    const p = pointerCanvasNorm(e, box, stage);
     const dx = p.x - drag.startPointer.x;
     const dy = p.y - drag.startPointer.y;
     const start = drag.startRect;
@@ -238,7 +240,7 @@ export function MediaOverlayEditor({
     const drag = dragRef.current;
     if (!drag || drag.target !== 'crop' || !drag.cropLayout) return;
     const box = e.currentTarget.getBoundingClientRect();
-    const p = canvasPxToCropNorm(pointerCanvasPx(e, box), drag.cropLayout);
+    const p = canvasPxToCropNorm(pointerCanvasPx(e, box, stage), drag.cropLayout);
     const dx = p.x - drag.startPointer.x;
     const dy = p.y - drag.startPointer.y;
     const start = drag.startRect;

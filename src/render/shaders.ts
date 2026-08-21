@@ -87,3 +87,46 @@ void main() {
   outColor = texture(uTex, vUv) * uAlpha;
 }
 `;
+
+/**
+ * Input pass for a custom shader chain.
+ *
+ * The compositor's layers are premultiplied; a Shadertoy shader expects straight colour
+ * and will happily sample `iChannel0` itself, so there is nowhere to intercept the read.
+ * The fix is to hand it a texture that is already straight — one extra blit, which also
+ * does the downsample when the effect runs at reduced render scale.
+ */
+export const CUSTOM_INPUT_FRAG = `#version 300 es
+precision highp float;
+
+in vec2 vUv;
+uniform sampler2D uTex;
+out vec4 outColor;
+
+void main() {
+  vec4 c = texture(uTex, vUv);
+  outColor = c.a > 0.0 ? vec4(c.rgb / c.a, c.a) : vec4(0.0);
+}
+`;
+
+/**
+ * Output pass for a custom shader chain: back to premultiplied, and back to full size.
+ *
+ * The layer's own alpha bounds the result. Most Shadertoy shaders end with
+ * `fragColor = vec4(rgb, 1.0)`, and taking that at face value would turn the transparent
+ * letterbox around a clip into an opaque black frame that hides every track below it.
+ */
+export const CUSTOM_RESOLVE_FRAG = `#version 300 es
+precision highp float;
+
+in vec2 vUv;
+uniform sampler2D uTex;      // the last stage's output, straight alpha
+uniform sampler2D uOriginal; // the layer as the chain received it
+out vec4 outColor;
+
+void main() {
+  vec4 c = texture(uTex, vUv);
+  float a = clamp(c.a, 0.0, 1.0) * texture(uOriginal, vUv).a;
+  outColor = vec4(clamp(c.rgb, 0.0, 1.0) * a, a);
+}
+`;

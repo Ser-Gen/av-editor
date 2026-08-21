@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { useEditorStore } from '../../store/editorStore';
 import { audioTracks, videoTracks } from '../../utils/compositeOrder';
+import { Minimap } from './Minimap';
 import { PlayheadLine } from './PlayheadLine';
 import { Ruler } from './Ruler';
 import { TimelineToolbar } from './TimelineToolbar';
@@ -176,58 +177,8 @@ export function Timeline() {
           <PlayheadLine variant="lanes" />
         </div>
 
-        <HorizontalScrollbar contentWidth={contentWidth} />
+        <Minimap />
       </div>
     </section>
-  );
-}
-
-/** Native scrollbars are gone with `overflow: hidden`, so the timeline draws its own. */
-function HorizontalScrollbar({ contentWidth }: { contentWidth: number }) {
-  const scrollX = useEditorStore((s) => s.scrollX);
-  const viewportWidth = useEditorStore((s) => s.viewportWidth);
-  const setScroll = useEditorStore((s) => s.setScroll);
-  const scrollY = useEditorStore((s) => s.scrollY);
-  const trackRef = useRef<HTMLDivElement>(null);
-  const dragRef = useRef<{ startClientX: number; startScrollX: number } | null>(null);
-
-  const ratio = contentWidth > 0 ? Math.min(1, viewportWidth / contentWidth) : 1;
-  const thumbWidth = Math.max(32, viewportWidth * ratio);
-  const maxScroll = Math.max(1, contentWidth - viewportWidth);
-  const thumbLeft = (scrollX / maxScroll) * (viewportWidth - thumbWidth);
-
-  useEffect(() => {
-    const onMove = (e: PointerEvent) => {
-      const drag = dragRef.current;
-      if (!drag) return;
-      const travel = Math.max(1, viewportWidth - thumbWidth);
-      const delta = ((e.clientX - drag.startClientX) / travel) * maxScroll;
-      setScroll(drag.startScrollX + delta, scrollY);
-    };
-    const onUp = () => {
-      dragRef.current = null;
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    return () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
-    };
-  }, [maxScroll, viewportWidth, thumbWidth, scrollY, setScroll]);
-
-  if (ratio >= 1) return <div className="h-scrollbar" ref={trackRef} />;
-
-  return (
-    <div className="h-scrollbar" ref={trackRef}>
-      <div
-        className="h-scrollbar-thumb"
-        style={{ width: thumbWidth, transform: `translate3d(${thumbLeft}px, 0, 0)` }}
-        onPointerDown={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          dragRef.current = { startClientX: e.clientX, startScrollX: scrollX };
-        }}
-      />
-    </div>
   );
 }

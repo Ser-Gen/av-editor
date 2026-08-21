@@ -1,5 +1,4 @@
 import type { Clip, EditorState, MediaAsset } from '../types/editor';
-import { resolutionToSize } from '../utils/resolution';
 import { overlayTransformToPixels } from '../utils/overlayTransform';
 import { audibleClips, compositeLayers } from '../utils/compositeOrder';
 import { activeEffects, enabledEffects, isAnimated, transformAt } from '../utils/clipRender';
@@ -133,7 +132,7 @@ function afadeFilters(clip: Clip): string[] {
 export function buildExportPlan(
   state: Pick<EditorState, 'clips' | 'mediaLibrary' | 'settings' | 'tracks'>,
 ): ExportPlan {
-  const { width, height } = resolutionToSize(state.settings.resolution);
+  const { width, height } = state.settings;
   const fps = state.settings.fps;
   const duration = Math.max(0.1, ...state.clips.map((c) => c.timelineStart + clipDuration(c)));
 

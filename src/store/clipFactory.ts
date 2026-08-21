@@ -1,4 +1,4 @@
-import type { Clip, MediaAsset, Track, TrackKind } from '../types/editor';
+import type { Clip, MediaAsset, OverlayTransform, Track, TrackKind } from '../types/editor';
 import { uid } from '../utils/id';
 import { audioTracks, videoTracks } from '../utils/compositeOrder';
 import { clipEnd, quantizeToFrame, rangesOverlap } from '../utils/time';
@@ -209,6 +209,11 @@ export interface RecordingPlacement {
   startOffset: number;
   /** Preferred lane within its own kind, counting from the base: 0 = V1/A1, 1 = A2. */
   lane: number;
+  /**
+   * Placement to arrive with — the camera's picture-in-picture frame. Ordinary clip data:
+   * editable, movable and removable afterwards like any transform dragged out by hand.
+   */
+  transform?: OverlayTransform;
 }
 
 /**
@@ -277,6 +282,7 @@ export function buildRecordingClips(
             audioEnabled: asset.hasAudio !== false,
             gain: 1,
             hideVideo: false,
+            ...(placement.transform ? { transform: placement.transform } : {}),
           },
     );
   }

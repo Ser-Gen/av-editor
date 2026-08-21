@@ -1,7 +1,7 @@
 import { useLayoutEffect, useState } from 'react';
 import type { EffectInstance, NormalizedRect } from '../types/editor';
 import { useEditorStore } from '../store/editorStore';
-import { EFFECTS, REGION_MODE, regionOf } from '../render/effects/registry';
+import { REGION_MODE, descriptorFor, regionOf } from '../render/effects/registry';
 import { clipDuration } from '../utils/time';
 import { evaluateChannel } from '../utils/keyframes';
 
@@ -129,7 +129,7 @@ export function MaskOverlay({ canvasRef }: { canvasRef: React.RefObject<HTMLCanv
               width: `${rect.w * 100}%`,
               height: `${rect.h * 100}%`,
             }}
-            title={`${EFFECTS[effect.type]?.label ?? effect.type} region — drag to move, corners to resize`}
+            title={`${descriptorFor(effect)?.label ?? effect.type} region — drag to move, corners to resize`}
             onPointerDown={(e) => startDrag(e, effect, 'move')}
           >
             {(['nw', 'ne', 'sw', 'se'] as const).map((handle) => (

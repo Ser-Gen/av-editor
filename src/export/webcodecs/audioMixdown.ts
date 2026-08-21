@@ -173,3 +173,24 @@ export async function* mixdownWindows(
     yield await ctx.startRendering();
   }
 }
+
+/**
+ * Folds a stereo window down to one channel.
+ *
+ * The mixdown always runs in stereo because that is what the timeline mixes into; mono is an
+ * output choice, applied at the last moment so nothing upstream has to know about it.
+ */
+export function downmixToMono(buffer: AudioBuffer): AudioBuffer {
+  if (buffer.numberOfChannels === 1) return buffer;
+  const out = new AudioBuffer({
+    length: buffer.length,
+    sampleRate: buffer.sampleRate,
+    numberOfChannels: 1,
+  });
+  const target = out.getChannelData(0);
+  for (let ch = 0; ch < buffer.numberOfChannels; ch++) {
+    const source = buffer.getChannelData(ch);
+    for (let i = 0; i < source.length; i++) target[i] += source[i] / buffer.numberOfChannels;
+  }
+  return out;
+}

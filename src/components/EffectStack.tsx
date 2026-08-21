@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import type { EffectInstance, EffectType } from '../types/editor';
+import { useEffect, useState } from 'react';
+import type { BuiltinEffectType, EffectInstance } from '../types/editor';
 import type { EffectTargetRef } from '../store/editorStore';
 import { useEditorStore } from '../store/editorStore';
 import {
@@ -9,15 +9,21 @@ import {
   REGION_FEATHER,
   REGION_INVERT,
   REGION_MODE,
+  descriptorFor,
   supportsRegion,
 } from '../render/effects/registry';
+import type { EffectParam } from '../render/effects/registry';
+import { shaderFailure, shaderTime } from '../render/effects/shaderStats';
 import { evaluateChannel } from '../utils/keyframes';
+import { ShaderDialog } from './ShaderDialog';
 
 /**
  * The effect chain editor.
  *
- * Entirely descriptor-driven: the controls come from the registry's param list, so a new
- * effect needs no code here. Order in the list is render order.
+ * Entirely descriptor-driven: the controls come from the descriptor's param list, so a new
+ * effect needs no code here — and a user's pasted shader, which produces a descriptor of
+ * exactly the same shape, gets its sliders from the same twenty lines. Order in the list is
+ * render order.
  */
 export function EffectStack({
   target,
@@ -32,15 +38,17 @@ export function EffectStack({
   label?: string;
 }) {
   const addEffect = useEditorStore((s) => s.addEffect);
+  const addCustomEffect = useEditorStore((s) => s.addCustomEffect);
   const addRegionEffect = useEditorStore((s) => s.addRegionEffect);
-  const [pending, setPending] = useState<EffectType>('eq');
+  const [pending, setPending] = useState<BuiltinEffectType>('eq');
+  const [adding, setAdding] = useState(false);
 
   return (
     <section className="inspector-section">
       <label>{label}</label>
 
       <div className="effect-add">
-        <select value={pending} onChange={(e) => setPending(e.target.value as EffectType)}>
+        <select value={pending} onChange={(e) => setPending(e.target.value as BuiltinEffectType)}>
           {EFFECT_ORDER.map((type) => (
             <option key={type} value={type}>
               {EFFECTS[type].label}
@@ -64,6 +72,23 @@ export function EffectStack({
           Black box
         </button>
       </div>
+
+      <div className="effect-presets">
+        <span className="hint">Or write one:</span>
+        <button type="button" onClick={() => setAdding(true)}>
+          Custom shader…
+        </button>
+      </div>
+
+      {adding && (
+        <ShaderDialog
+          onClose={() => setAdding(false)}
+          onSave={(source) => {
+            addCustomEffect(target, source);
+            setAdding(false);
+          }}
+        />
+      )}
 
       {effects.length === 0 ? (
         <p className="hint">No effects. They render bottom-of-list last.</p>
@@ -103,13 +128,17 @@ function EffectRow({
   const toggleEffect = useEditorStore((s) => s.toggleEffect);
   const setEffectParam = useEditorStore((s) => s.setEffectParam);
   const resetEffect = useEditorStore((s) => s.resetEffect);
+  const setEffectShader = useEditorStore((s) => s.setEffectShader);
   const toggleChannelArmed = useEditorStore((s) => s.toggleChannelArmed);
   const setRegionMode = useEditorStore((s) => s.setRegionMode);
   // An animated slider reads out the value at the playhead, so scrubbing the timeline
   // moves the control and dragging it writes a key where you are looking.
   const playhead = useEditorStore((s) => s.playhead);
+  const [editing, setEditing] = useState(false);
 
-  const desc = EFFECTS[effect.type];
+  const custom = effect.type === 'custom';
+  const cost = useShaderCost(custom && effect.enabled ? effect.id : null);
+  const desc = descriptorFor(effect);
   if (!desc) return null;
 
   // A track grade has no time base, so it cannot be keyframed.
@@ -131,6 +160,11 @@ function EffectRow({
           {desc.label}
         </label>
         <div className="effect-actions">
+          {custom && (
+            <button type="button" title="Edit the shader" onClick={() => setEditing(true)}>
+              ✎
+            </button>
+          )}
           <button type="button" title="Move up" disabled={first} onClick={() => moveEffect(target, effect.id, -1)}>
             ↑
           </button>
@@ -147,6 +181,30 @@ function EffectRow({
       </div>
 
       {desc.note && <p className="hint">{desc.note}</p>}
+
+      {editing && (
+        <ShaderDialog
+          initial={effect.shader}
+          onClose={() => setEditing(false)}
+          onSave={(source) => {
+            setEffectShader(target, effect.id, source);
+            setEditing(false);
+          }}
+        />
+      )}
+
+      {custom && cost.failure && (
+        <p className="shader-status shader-status--error">
+          {cost.failure} Switch it back on with the checkbox once you have.
+        </p>
+      )}
+
+      {custom && cost.ms !== null && (
+        <p className="hint">
+          {cost.ms.toFixed(1)} ms per frame on the GPU
+          {cost.ms > 16 && ' — over a frame at 60 fps; try a lower render scale'}
+        </p>
+      )}
 
       {supportsRegion(effect.type) && (
         <div className="effect-region">
@@ -211,25 +269,44 @@ function EffectRow({
       {desc.params.map((param) => {
         const stored = effect.params[param.name] ?? param.defaultValue;
         const keys = effect.keyframes?.[param.name];
-        const value = animatable ? evaluateChannel(keys, playhead - clipStart, stored) : stored;
+        // A fixed control changes the program between frames, so it has no value at a
+        // playhead position — it is whatever it is set to.
+        const value =
+          animatable && !param.fixed ? evaluateChannel(keys, playhead - clipStart, stored) : stored;
+        const set = (v: number) => setEffectParam(target, effect.id, param.name, v);
+
+        if (param.control === 'select') {
+          return (
+            <div className="slider-row effect-param" key={param.name}>
+              <span className="effect-param-label">{param.label}</span>
+              <select value={String(value)} onChange={(e) => set(Number(e.target.value))}>
+                {(param.options ?? []).map((option) => (
+                  <option key={option.value} value={String(option.value)}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+              {param.fixed && <span className="hint">recompiles</span>}
+            </div>
+          );
+        }
+
         if (param.control === 'toggle') {
           return (
             <label className="checkbox" key={param.name}>
-              <input
-                type="checkbox"
-                checked={value > 0.5}
-                onChange={(e) => setEffectParam(target, effect.id, param.name, e.target.checked ? 1 : 0)}
-              />
+              <input type="checkbox" checked={value > 0.5} onChange={(e) => set(e.target.checked ? 1 : 0)} />
               {param.label}
+              {param.fixed && <span className="hint"> recompiles</span>}
             </label>
           );
         }
+
         const armed = (keys?.length ?? 0) > 0;
         return (
           <div className="slider-row effect-param" key={param.name}>
             <button
               type="button"
-              hidden={!animatable}
+              hidden={!animatable || param.fixed}
               className={`stopwatch${armed ? ' is-armed' : ''}`}
               title={
                 armed
@@ -247,9 +324,9 @@ function EffectRow({
               max={param.max}
               step={param.step}
               value={value}
-              onChange={(e) => setEffectParam(target, effect.id, param.name, Number(e.target.value))}
+              onChange={(e) => set(Number(e.target.value))}
             />
-            <span>{param.format ? param.format(value) : round(value)}</span>
+            <span>{format(param, value)}</span>
           </div>
         );
       })}
@@ -257,6 +334,32 @@ function EffectRow({
   );
 }
 
-function round(v: number): string {
-  return Number(v.toFixed(2)).toString();
+/**
+ * What the renderer measured for this shader, and whether it survived.
+ *
+ * Polled rather than subscribed: both numbers come from the render loop, which must not
+ * be re-rendering React on every frame to report on itself.
+ */
+function useShaderCost(effectId: string | null): { ms: number | null; failure: string | null } {
+  const [cost, setCost] = useState<{ ms: number | null; failure: string | null }>({
+    ms: null,
+    failure: null,
+  });
+
+  useEffect(() => {
+    if (!effectId) {
+      setCost({ ms: null, failure: null });
+      return;
+    }
+    const read = () => setCost({ ms: shaderTime(effectId), failure: shaderFailure(effectId) });
+    read();
+    const timer = window.setInterval(read, 500);
+    return () => window.clearInterval(timer);
+  }, [effectId]);
+
+  return cost;
+}
+
+function format(param: EffectParam, value: number): string {
+  return param.format ? param.format(value) : Number(value.toFixed(2)).toString();
 }

@@ -3,21 +3,27 @@ import {
   CanvasSource,
   Mp4OutputFormat,
   Output,
-  QUALITY_HIGH,
   StreamTarget,
   canEncodeAudio,
 } from 'mediabunny';
 import type { Clip, EditorState, MediaAsset, VisualClip } from '../../types/editor';
 import { audibleClips, compositeLayers, compositeOrderedClips } from '../../utils/compositeOrder';
-import { activeEffects, enabledEffects, fadeGainAt, transformAt } from '../../utils/clipRender';
-import { resolutionToSize } from '../../utils/resolution';
+import {
+  activeEffects,
+  clipClock,
+  enabledEffects,
+  fadeGainAt,
+  timelineClock,
+  transformAt,
+} from '../../utils/clipRender';
 import { transitionStateAt } from '../../utils/transitions';
 import { clipDuration } from '../../utils/time';
 import { GLCompositor } from '../../render/GLCompositor';
-import { MIX_SAMPLE_RATE, MIX_WINDOW_SECONDS, mixdownWindows } from './audioMixdown';
+import { MIX_SAMPLE_RATE, MIX_WINDOW_SECONDS, downmixToMono, mixdownWindows } from './audioMixdown';
 import { ClipFrameReader } from './frameSource';
 import { MediaInputCache } from './mediaInputs';
 import { openScratchFile } from './opfs';
+import type { ResolvedExport } from '../../utils/exportSettings';
 import { WebCodecsUnsupportedError, webCodecsExportSupported } from './support';
 
 export type ExportSlice = Pick<EditorState, 'clips' | 'mediaLibrary' | 'settings' | 'tracks'>;
@@ -40,6 +46,7 @@ function sourceTimeFor(clip: Clip, t: number): number {
 
 export async function exportWithWebCodecs(
   state: ExportSlice,
+  spec: ResolvedExport,
   onProgress: (fraction: number) => void,
   signal: AbortSignal,
 ): Promise<WebCodecsExportResult> {
@@ -47,8 +54,9 @@ export async function exportWithWebCodecs(
     throw new WebCodecsUnsupportedError('This browser cannot encode H.264 through WebCodecs.');
   }
 
-  const { width, height } = resolutionToSize(state.settings.resolution);
-  const fps = state.settings.fps;
+  // The composition is defined in normalized space, so exporting at a different pixel size is
+  // a scale of the whole render, not a re-layout. Aspect is guarded before we get here.
+  const { width, height, fps } = spec;
   const duration = Math.max(
     0.1,
     ...state.clips.map((c) => c.timelineStart + clipDuration(c)),
@@ -109,17 +117,25 @@ export async function exportWithWebCodecs(
       target: new StreamTarget(scratch.writable, { chunked: true }),
     });
 
+    // Creation date is the one descriptive field the editor can honestly fill in: a project has
+    // no name to put in a title until projects can be saved. Without this an exported file has
+    // no date at all, and players fall back to whenever it was copied.
+    output.setMetadataTags({
+      date: new Date(),
+      comment: 'Encoded in the browser with WebCodecs.',
+    });
+
     const videoSource = new CanvasSource(compositor.canvas, {
       codec: 'avc',
-      bitrate: QUALITY_HIGH,
-      keyFrameInterval: 2,
+      bitrate: spec.videoBitrate,
+      keyFrameInterval: spec.keyframeInterval,
     });
     output.addVideoTrack(videoSource, { frameRate: fps, maximumPacketCount: totalFrames });
 
     let audioSource: AudioBufferSource | null = null;
     if (hasAudio) {
       // Channel count and sample rate come from the mixed AudioBuffer itself.
-      audioSource = new AudioBufferSource({ codec: 'aac', bitrate: 192_000 });
+      audioSource = new AudioBufferSource({ codec: 'aac', bitrate: spec.audioBitrate });
       // AAC packs 1024 samples per frame; the slack covers priming and the final partial.
       // One extra frame per window can appear at window boundaries, so budget for those.
       const windows = Math.ceil(duration / MIX_WINDOW_SECONDS);
@@ -144,7 +160,9 @@ export async function exportWithWebCodecs(
           audioDone = true;
           break;
         }
-        await audioSource.add(next.value);
+        await audioSource.add(
+          spec.audioChannels === 1 ? downmixToMono(next.value) : next.value,
+        );
         audioSeconds += next.value.duration;
       }
     };
@@ -165,6 +183,7 @@ export async function exportWithWebCodecs(
           const transition = transitionStateAt(clip, state.clips, t);
           const fade = fadeGainAt(clip, t) * transition.alpha;
           const effects = activeEffects(clip, t);
+          const clock = clipClock(clip, t, fps);
 
           if (clip.kind === 'text') {
             compositor.withEffects(
@@ -172,6 +191,7 @@ export async function exportWithWebCodecs(
               fade,
               (alpha, flip) => compositor.drawTextClip(clip, alpha, flip),
               transition.wipe,
+              clock,
             );
             continue;
           }
@@ -193,6 +213,7 @@ export async function exportWithWebCodecs(
                     flip,
                   ),
                 transition.wipe,
+                clock,
               );
             }
             continue;
@@ -220,17 +241,18 @@ export async function exportWithWebCodecs(
                 flip,
               ),
             transition.wipe,
+            clock,
           );
           if (drawable.source instanceof VideoFrame) drawable.source.close();
         }
 
         if (layer.track.effects?.length) {
-          compositor.applyToScene(enabledEffects(layer.track.effects));
+          compositor.applyToScene(enabledEffects(layer.track.effects), timelineClock(t, fps));
         }
         for (const adjustment of layer.adjustments) {
           const start = adjustment.timelineStart;
           if (t < start || t >= start + clipDuration(adjustment)) continue;
-          compositor.applyToScene(activeEffects(adjustment, t));
+          compositor.applyToScene(activeEffects(adjustment, t), clipClock(adjustment, t, fps));
         }
       }
       compositor.endFrame();

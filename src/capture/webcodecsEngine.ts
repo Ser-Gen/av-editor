@@ -84,6 +84,11 @@ export interface WebCodecsEngineOptions {
   /** Frame rate hint for the muxer; the real timing comes from the frames themselves. */
   frameRate?: number;
   /**
+   * H.264 bitrate. Omitted, it falls back to `QUALITY_HIGH`, which sizes from the pixel
+   * count alone and so short-changes a 60 fps capture — see `captureVideoBitrate`.
+   */
+  videoBitrate?: number;
+  /**
    * AAC bitrate. Speech survives 128k; a soundtrack captured from the system does not, and
    * a recording encoded below what the exporter uses would cap the quality of everything
    * made from it.
@@ -177,7 +182,7 @@ export class WebCodecsSourceEngine implements SourceEngine {
     if (videoTracks.length > 0) {
       engine.videoSource = new VideoSampleSource({
         codec: 'avc',
-        bitrate: QUALITY_HIGH,
+        bitrate: options.videoBitrate ?? QUALITY_HIGH,
         keyFrameInterval: FRAGMENT_SECONDS,
       });
       output.addVideoTrack(engine.videoSource, { frameRate: options.frameRate ?? 30 });

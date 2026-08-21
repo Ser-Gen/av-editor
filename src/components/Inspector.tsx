@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { clipDuration, formatTimecode } from '../utils/time';
 import type { OverlayTransform, TextTemplate, TransitionType } from '../types/editor';
@@ -9,6 +10,8 @@ import {
 import { TRANSFORM_CHANNELS, maxFade, transformAt } from '../utils/clipRender';
 import { TRANSITION_LABELS, incomingTransition } from '../utils/transitions';
 import { EffectStack } from './EffectStack';
+import { ProcessDialog } from './ProcessDialog';
+import { BakeDialog } from './BakeDialog';
 import { MediaOverlayEditor } from './MediaOverlayEditor';
 import { TextPlacementEditor } from './TextPlacementEditor';
 
@@ -27,6 +30,9 @@ export function Inspector() {
   const toggleChannelArmed = useEditorStore((s) => s.toggleChannelArmed);
   const playhead = useEditorStore((s) => s.playhead);
   const setTransitionType = useEditorStore((s) => s.setTransitionType);
+  const processJob = useEditorStore((s) => s.processJob);
+  const [processOpen, setProcessOpen] = useState(false);
+  const [bakeOpen, setBakeOpen] = useState(false);
 
   if (selectedClipIds.length > 1) {
     return (
@@ -271,6 +277,44 @@ export function Inspector() {
             />
             Hide video
           </label>
+        </section>
+      )}
+
+      {clip.kind === 'video' && asset && (
+        <section className="inspector-section">
+          <label>Process</label>
+          <button
+            type="button"
+            disabled={processJob !== null}
+            title="Run an FFmpeg preset over this clip's excerpt"
+            onClick={() => setProcessOpen(true)}
+          >
+            Run a preset…
+          </button>
+          <p className="hint">
+            Stabilize, deshake, interpolate, reverse — the things FFmpeg can do and the
+            renderer cannot — over just this clip's {duration.toFixed(1)}s, not the whole file.
+          </p>
+          <button
+            type="button"
+            disabled={processJob !== null}
+            title="Render this clip's effect chain into a new file on the GPU"
+            onClick={() => setBakeOpen(true)}
+          >
+            Bake effects…
+          </button>
+          <p className="hint">
+            Renders the effects above through the compositor and the hardware encoder — the fast
+            path, and the same picture the preview shows.
+          </p>
+          {processOpen && (
+            <ProcessDialog
+              assetId={clip.assetId}
+              clipId={clip.id}
+              onClose={() => setProcessOpen(false)}
+            />
+          )}
+          {bakeOpen && <BakeDialog clipId={clip.id} onClose={() => setBakeOpen(false)} />}
         </section>
       )}
 

@@ -43,6 +43,17 @@ The timeline owns its own scrolling — it never rides browser scroll.
 | **Drag on ruler** | Scrub the playhead |
 | **Drag on empty lane** | Marquee-select clips |
 
+Below the lanes is the **minimap**: the whole project drawn at a fixed size, with the lanes'
+viewport as a window over it. It navigates independently of the zoom — at frame-level zoom in a
+long take, one click on the far end goes there.
+
+| Input | Action |
+|-------|--------|
+| **Click / drag** | Seek there, bringing the lanes with it |
+| **Drag the window** | Pan the timeline |
+| **Wheel** | Zoom |
+| **Double-click** | Fit the project to the viewport |
+
 ### Keyboard shortcuts
 
 | Key | Action |

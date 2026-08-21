@@ -2,7 +2,7 @@ import { memo } from 'react';
 import type { Clip, Interp, Keyframe } from '../../types/editor';
 import type { ChannelRef } from '../../store/editorStore';
 import { useEditorStore } from '../../store/editorStore';
-import { EFFECTS } from '../../render/effects/registry';
+import { descriptorFor } from '../../render/effects/registry';
 import { clipDuration } from '../../utils/time';
 
 export const KEYFRAME_ROW_HEIGHT = 13;
@@ -20,7 +20,7 @@ export function keyframeRows(clip: Clip): Row[] {
     if (keys.length > 0) rows.push({ ref: { effectId: null, param: name }, label: name, keys });
   }
   for (const effect of clip.effects ?? []) {
-    const desc = EFFECTS[effect.type];
+    const desc = descriptorFor(effect);
     for (const [name, keys] of Object.entries(effect.keyframes ?? {})) {
       if (keys.length === 0) continue;
       const param = desc?.params.find((p) => p.name === name);

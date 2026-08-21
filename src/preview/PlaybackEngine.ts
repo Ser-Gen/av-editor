@@ -1,9 +1,15 @@
 import type { Clip, EditorState, MediaAsset, VisualClip } from '../types/editor';
-import { resolutionToSize } from '../utils/resolution';
 import { drawOverlaySource, normalizeOverlayTransform } from '../utils/overlayTransform';
 import { textFrameForClip } from '../utils/overlayTransform';
 import { audibleClips, compositeLayers, compositeOrderedClips } from '../utils/compositeOrder';
-import { activeEffects, enabledEffects, fadeGainAt, transformAt } from '../utils/clipRender';
+import {
+  activeEffects,
+  clipClock,
+  enabledEffects,
+  fadeGainAt,
+  timelineClock,
+  transformAt,
+} from '../utils/clipRender';
 import { transitionStateAt } from '../utils/transitions';
 import { clipDuration } from '../utils/time';
 import { GLCompositor } from '../render/GLCompositor';
@@ -146,7 +152,7 @@ export class PlaybackEngine {
   }
 
   private drawFrameContents(state: StoreSlice, t: number): void {
-    const { width, height } = resolutionToSize(state.settings.resolution);
+    const { width, height } = state.settings;
     if (this.canvas.width !== width) this.canvas.width = width;
     if (this.canvas.height !== height) this.canvas.height = height;
 
@@ -164,11 +170,11 @@ export class PlaybackEngine {
     for (const layer of compositeLayers(state.clips, state.tracks)) {
       this.drawTrackClipsGL(state, t, layer.clips);
       if (layer.track.effects?.length) {
-        gl.applyToScene(enabledEffects(layer.track.effects));
+        gl.applyToScene(enabledEffects(layer.track.effects), timelineClock(t, state.settings.fps));
       }
       for (const adjustment of layer.adjustments) {
         if (!this.isActive(adjustment, t, state)) continue;
-        gl.applyToScene(activeEffects(adjustment, t));
+        gl.applyToScene(activeEffects(adjustment, t), clipClock(adjustment, t, state.settings.fps));
       }
     }
 
@@ -190,6 +196,7 @@ export class PlaybackEngine {
         : transitionStateAt(clip, state.clips, t);
       const fade = (scrubbing ? 1 : fadeGainAt(clip, t)) * transition.alpha;
       const effects = activeEffects(clip, t);
+      const clock = clipClock(clip, t, state.settings.fps);
 
       if (clip.kind === 'text') {
         gl.withEffects(
@@ -197,6 +204,7 @@ export class PlaybackEngine {
           fade,
           (alpha, flip) => gl.drawTextClip(clip, alpha, flip),
           transition.wipe,
+          clock,
         );
         continue;
       }
@@ -223,6 +231,7 @@ export class PlaybackEngine {
               flip,
             ),
           transition.wipe,
+          clock,
         );
         continue;
       }
@@ -243,6 +252,7 @@ export class PlaybackEngine {
             flip,
           ),
         transition.wipe,
+        clock,
       );
     }
   }
