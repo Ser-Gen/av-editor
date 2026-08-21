@@ -557,6 +557,25 @@ export function outputDuration(preset: ToolPreset, sourceSeconds: number): numbe
  * error. A GIF is not: it enters the library as an image, and an image is a different kind
  * of clip from the video one it would be replacing.
  */
+/**
+ * Whether the result's sound stands in for the source's.
+ *
+ * Read off the verbatim args rather than carried as a flag, because the args are the source
+ * of truth here — `-af` filters the audio, `-an` drops it, and a `durationScale` moves it in
+ * time. A preset that grows an audio filter later is covered the day it is transcribed, with
+ * nothing to remember to set.
+ *
+ * It decides one thing: whether a clip's *detached* audio has to follow it onto the new file.
+ * For a picture-only preset the original file still carries the right sound, so it does not.
+ */
+export function presetChangesSound(preset: ToolPreset): boolean {
+  return (
+    preset.args.includes('-af') ||
+    preset.args.includes('-an') ||
+    (preset.durationScale ?? 1) !== 1
+  );
+}
+
 export function replaceRefusal(preset: ToolPreset): string | null {
   if (preset.ext !== 'mp4') {
     return `A ${preset.ext.toUpperCase()} joins the library as an image, so it cannot stand in for a video clip.`;

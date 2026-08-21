@@ -23,7 +23,14 @@ import type {
   ProcessRequest,
   DerivedFrom,
 } from '../types/editor';
-import { BAKE_ID, bakedName, derivedName, findPreset, replaceRefusal } from '../tools/presets';
+import {
+  BAKE_ID,
+  bakedName,
+  derivedName,
+  findPreset,
+  presetChangesSound,
+  replaceRefusal,
+} from '../tools/presets';
 import { bakeClip } from '../tools/bakeClip';
 import { runPreset } from '../tools/runPreset';
 import { formatExportError } from '../export/exportLog';
@@ -82,6 +89,7 @@ import { clearVideoThumbnailCache } from '../utils/videoThumbnailCache';
 import { clearWaveformCache } from '../utils/waveformCache';
 import { DEFAULT_FULL_FRAME } from '../utils/overlayTransform';
 import { clampTrackVolume } from '../utils/trackVolume';
+import { detachedAudio, detachedAudioOutcome } from '../utils/detachedAudio';
 import { overlapIsTransition } from '../utils/transitions';
 import {
   clipDuration,
@@ -353,7 +361,7 @@ interface EditorActions {
   replaceClipSource: (
     clipId: string,
     assetId: string,
-    options?: { clearEffects?: boolean },
+    options?: { clearEffects?: boolean; followDetachedAudio?: boolean },
   ) => string | null;
   /** Renders one clip's effect chain to a new file on the GPU, through the export path. */
   startBake: (clipId: string, replace: boolean) => Promise<void>;
@@ -504,7 +512,7 @@ export const useEditorStore = create<Store>((set, get) => {
     kind: AssetType,
     name: string,
     derivedFrom: DerivedFrom,
-    replace?: { clipId: string; clearEffects?: boolean },
+    replace?: { clipId: string; clearEffects?: boolean; followDetachedAudio?: boolean },
   ): Promise<{ asset: MediaAsset; swapped: string | null }> {
     const created = await createAssetFromFile(new File([produced], name, { type: produced.type }), kind);
     const asset: MediaAsset = { ...created, derivedFrom };
@@ -517,7 +525,10 @@ export const useEditorStore = create<Store>((set, get) => {
     });
 
     const swapped = replace
-      ? get().replaceClipSource(replace.clipId, asset.id, { clearEffects: replace.clearEffects })
+      ? get().replaceClipSource(replace.clipId, asset.id, {
+          clearEffects: replace.clearEffects,
+          followDetachedAudio: replace.followDetachedAudio,
+        })
       : null;
     return { asset, swapped };
   }
@@ -1048,7 +1059,9 @@ export const useEditorStore = create<Store>((set, get) => {
           kind,
           derivedName(asset.name, preset, range),
           { assetId, presetId, presetLabel: preset.label, range },
-          replaceClipId ? { clipId: replaceClipId } : undefined,
+          replaceClipId
+            ? { clipId: replaceClipId, followDetachedAudio: presetChangesSound(preset) }
+            : undefined,
         );
         set({
           libraryNotice: swapped
@@ -1116,6 +1129,9 @@ export const useEditorStore = create<Store>((set, get) => {
           'video',
           bakedName(asset.name, range),
           { assetId: asset.id, presetId: BAKE_ID, presetLabel: 'Baked effects', range },
+          // No `followDetachedAudio`: a bake renders the picture, and the clip whose audio
+          // was detached has `audioEnabled: false`, so the file it writes carries no sound to
+          // point that audio clip at.
           replace ? { clipId, clearEffects: true } : undefined,
         );
 
@@ -1151,13 +1167,30 @@ export const useEditorStore = create<Store>((set, get) => {
       const was = clipDuration(clip);
       const now = asset.duration;
       const baked = options?.clearEffects === true && (clip.effects?.length ?? 0) > 0;
+
+      // Detaching a clip's audio leaves a second clip playing the same file, and nothing
+      // recorded that the two belong together. Swapping only the video is how a project ends
+      // up with a processed picture over unprocessed sound — silently, because both halves
+      // are individually doing what they were told. Whether the new file's sound is meant to
+      // stand in is the producer's call, not this one's: a picture-only preset leaves the
+      // original audio correct, and a bake of a clip whose audio is off writes silence.
+      const partners = detachedAudio(clip, get().clips);
+      const follow =
+        options?.followDetachedAudio === true
+          ? new Set(partners.following.map((c) => c.id))
+          : new Set<string>();
+
       commit(baked ? 'Bake effects' : 'Replace clip source', (s) => ({
-        clips: s.clips.map((c) =>
-          c.id === clipId
-            ? { ...swapSource(clip, asset), ...(options?.clearEffects ? { effects: undefined } : {}) }
-            : c,
-        ),
+        clips: s.clips.map((c) => {
+          if (c.id === clipId) {
+            return { ...swapSource(clip, asset), ...(options?.clearEffects ? { effects: undefined } : {}) };
+          }
+          // One entry covers both, because one user action caused both.
+          return follow.has(c.id) && c.kind === 'audio' ? swapSource(c, asset) : c;
+        }),
       }));
+
+      const audio = detachedAudioOutcome(partners, follow.size > 0);
 
       // Said out loud because leaving the chain on the clip would apply every effect twice —
       // once from the file and once from the renderer — and the picture would only look
@@ -1166,7 +1199,7 @@ export const useEditorStore = create<Store>((set, get) => {
 
       // Under a frame is rounding, not a length change worth reporting.
       if (Math.abs(now - was) < 1 / get().settings.fps) {
-        return `the clip now plays the processed version.${chain}`;
+        return `the clip now plays the processed version.${chain}${audio}`;
       }
       const tail =
         now < was
@@ -1174,7 +1207,7 @@ export const useEditorStore = create<Store>((set, get) => {
           : `so it now reaches ${(now - was).toFixed(1)}s further right`;
       return (
         `the clip now plays the processed version and runs ${now.toFixed(1)}s instead of ` +
-        `${was.toFixed(1)}s, ${tail} — nothing later on the track moved.${chain}`
+        `${was.toFixed(1)}s, ${tail} — nothing later on the track moved.${chain}${audio}`
       );
     },
 

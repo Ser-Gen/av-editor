@@ -8,11 +8,13 @@ import {
   findPreset,
   formatEstimate,
   outputDuration,
+  presetChangesSound,
   replaceRefusal,
 } from '../tools/presets';
 import type { SourceRange } from '../tools/presets';
 import type { ProcessJob } from '../types/editor';
 import { clipDuration } from '../utils/time';
+import { detachedAudio, detachedAudioAdvice } from '../utils/detachedAudio';
 import { EFFECTS } from '../render/effects/registry';
 
 const PHASE_LABEL: Record<ProcessJob['phase'], string> = {
@@ -42,7 +44,8 @@ export function ProcessDialog({
   onClose: () => void;
 }) {
   const asset = useEditorStore((s) => s.mediaLibrary[assetId]);
-  const clip = useEditorStore((s) => (clipId ? s.clips.find((c) => c.id === clipId) : undefined));
+  const clips = useEditorStore((s) => s.clips);
+  const clip = clipId ? clips.find((c) => c.id === clipId) : undefined;
   const job = useEditorStore((s) => s.processJob);
   const notice = useEditorStore((s) => s.libraryNotice);
   const startProcess = useEditorStore((s) => s.startProcess);
@@ -78,6 +81,9 @@ export function ProcessDialog({
   const resultSeconds = outputDuration(preset, sourceSeconds);
   const lengthChanges = Math.abs(resultSeconds - sourceSeconds) > 0.05;
   const framed = clip && 'transform' in clip && clip.transform !== undefined;
+  const audioAdvice = clip
+    ? detachedAudioAdvice(detachedAudio(clip, clips), presetChangesSound(preset))
+    : null;
   const busyElsewhere = job !== null && !ours.current;
 
   return (
@@ -164,6 +170,8 @@ export function ProcessDialog({
             moves.
           </p>
         )}
+
+        {willReplace && audioAdvice && <p className="settings-warning">{audioAdvice}</p>}
 
         {willReplace && framed && preset.reshapes && (
           <p className="settings-warning">
