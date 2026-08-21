@@ -538,7 +538,34 @@ export class PlaybackEngine {
 
   seek(state: StoreSlice, t: number): Promise<void> {
     this.pause();
+    this.retire(state, t);
     return this.renderFrameAsync(state, t);
+  }
+
+  /**
+   * Let go of what the project no longer contains.
+   *
+   * `syncAudio` does this while playing, but it is the *play* path only — the stopped path
+   * draws and returns. So deleting a clip with playback stopped left its gain node connected
+   * to the destination and its element at full volume, paused. Nothing in the app could sound
+   * it, which is why it went unnoticed; anything outside the app that resumed that element
+   * could, and did.
+   *
+   * Nothing is audible while stopped, so the listening set is empty by definition and the
+   * volumes go to zero. `play()` opens up what it needs on its way in.
+   */
+  private retire(state: StoreSlice, t: number): void {
+    const existing = new Set(state.clips.map((c) => c.id));
+    for (const [clipId, route] of this.clipRoutes) {
+      if (existing.has(clipId)) continue;
+      if (route.connectedToDest) {
+        route.gain.disconnect();
+        route.connectedToDest = false;
+      }
+      this.clipRoutes.delete(clipId);
+    }
+    const drawing = new Set<HTMLMediaElement>(this.activeVideos(state, t).map((v) => v.video));
+    this.pool.settle(new Set(), drawing);
   }
 
   destroy(): void {

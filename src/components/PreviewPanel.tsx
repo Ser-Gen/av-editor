@@ -3,6 +3,7 @@ import { useEditorStore } from '../store/editorStore';
 import { PlaybackEngine } from '../preview/PlaybackEngine';
 import { captureCanvasAsPngFile, frameFileNameFromTime } from '../utils/captureFrame';
 import { formatTimecode, parseTimecode } from '../utils/time';
+import { bindMediaKeys, setMediaPlaybackState } from '../preview/mediaSession';
 import { MaskOverlay } from './MaskOverlay';
 
 /** Editable MM:SS:FF — type a timecode and the playhead jumps there. */
@@ -77,6 +78,13 @@ export function PreviewPanel() {
     );
     return () => engine.destroy();
   }, [setPlayhead, setPlaying]);
+
+  // The media keys drive the transport, not whichever decoder the engine last touched.
+  useEffect(
+    () => bindMediaKeys({ play: () => setPlaying(true), pause: () => setPlaying(false) }),
+    [setPlaying],
+  );
+  useEffect(() => setMediaPlaybackState(isPlaying), [isPlaying]);
 
   const stateSlice = { clips, mediaLibrary, settings, tracks, trimPreview };
 

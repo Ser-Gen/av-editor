@@ -59,6 +59,7 @@ long take, one click on the far end goes there.
 | Key | Action |
 |-----|--------|
 | **Space** | Play / pause |
+| **Media keys** | Play / pause the project (not whichever file the preview last decoded) |
 | **⌘Z** / **Ctrl+Z** | Undo (⇧⌘Z or Ctrl+Y to redo) |
 | **S** | Split selected clips at playhead |
 | **⌘D** / **Ctrl+D** | Duplicate selection |
