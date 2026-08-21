@@ -3,6 +3,14 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#0d0d0f" />
+    <!--
+      favicon.png is the same artwork rasterized at 32px, for browsers that do not take an
+      SVG icon (Safari before 16.4). Redraw the SVG and it needs redrawing too. Declaring
+      either one also stops the browser asking for /favicon.ico.
+    -->
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="alternate icon" type="image/png" sizes="32x32" href="/favicon.png" />
     <title>AV Editor</title>
   </head>
   <body>
