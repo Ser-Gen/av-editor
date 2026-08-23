@@ -887,6 +887,66 @@ body.is-dragging * {
 }
 
 
+/* ------------------------------------------------------------- clip context menu */
+
+.clip-menu {
+  position: fixed;
+  z-index: 120;
+  min-width: 232px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.55);
+}
+
+.clip-menu-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 5px 8px;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.clip-menu-item:hover:not(:disabled) {
+  background: var(--accent);
+  color: #fff;
+}
+
+.clip-menu-item:disabled {
+  color: var(--text-muted);
+  cursor: default;
+  opacity: 0.6;
+}
+
+.clip-menu-item.is-danger:hover:not(:disabled) {
+  background: #c62828;
+}
+
+.clip-menu-item kbd {
+  font-family: var(--font);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.clip-menu-item:hover:not(:disabled) kbd {
+  color: rgba(255, 255, 255, 0.75);
+}
+
+.clip-menu-rule {
+  height: 1px;
+  margin: 4px 6px;
+  background: var(--border);
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;

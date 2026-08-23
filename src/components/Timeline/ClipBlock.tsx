@@ -18,6 +18,7 @@ interface Props {
     clip: Clip,
     mode: 'move' | 'left' | 'right' | 'fadeIn' | 'fadeOut',
   ) => void;
+  onContextMenu: (e: React.MouseEvent, clip: Clip) => void;
 }
 
 function clipLabel(clip: Clip, asset: MediaAsset | undefined): string {
@@ -36,6 +37,7 @@ export const ClipBlock = memo(function ClipBlock({
   locked,
   asset,
   onPointerDown,
+  onContextMenu,
 }: Props) {
   const duration = clipDuration(clip);
   const left = clip.timelineStart * pxPerSec;
@@ -69,6 +71,7 @@ export const ClipBlock = memo(function ClipBlock({
       className={classes}
       style={{ left, width, height, top: 4 }}
       onPointerDown={(e) => onPointerDown(e, clip, 'move')}
+      onContextMenu={(e) => onContextMenu(e, clip)}
       title={label}
     >
       {/*

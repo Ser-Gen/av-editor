@@ -54,6 +54,24 @@ long take, one click on the far end goes there.
 | **Wheel** | Zoom |
 | **Double-click** | Fit the project to the viewport |
 
+### Right-click a clip
+
+| Item | Notes |
+|------|-------|
+| Split at playhead | `S`. Needs the playhead inside the clip |
+| Trim start / end to playhead | Cut here and discard that side, without the leftover clip to select and delete |
+| Duplicate | `⌘D` |
+| Bake this range to the library… | Renders the clip's effect chain through the compositor into a new file — this clip's range, not the whole source |
+| Run a preset on this range… | The FFmpeg presets, over the same range |
+| Detach audio · Mute this clip · Hide video | The inspector's video toggles, one click away |
+| Zoom to clip | `Z` |
+| Delete · Ripple delete | `⌫` and `⇧⌫` |
+
+Right-clicking a clip that is not selected selects it first, so a menu offering to delete
+three clips can never mean three you were not pointing at. Anything that cannot apply is
+listed but disabled, with the reason as its tooltip — offline media cannot be baked, a locked
+track refuses every edit, and only one preset or bake may run at a time.
+
 ### Keyboard shortcuts
 
 | Key | Action |

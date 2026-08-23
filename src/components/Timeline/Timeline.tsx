@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useEditorStore } from '../../store/editorStore';
 import { audioTracks, videoTracks } from '../../utils/compositeOrder';
 import { formatTimecode } from '../../utils/time';
@@ -9,6 +9,10 @@ import { TimelineToolbar } from './TimelineToolbar';
 import { TrackHeader } from './TrackHeader';
 import { TrackLane } from './TrackLane';
 import { RULER_HEIGHT, TRACK_HEADER_WIDTH } from './constants';
+import { ClipContextMenu } from './ClipContextMenu';
+import type { ClipMenuRequest } from './ClipContextMenu';
+import { BakeDialog } from '../BakeDialog';
+import { ProcessDialog } from '../ProcessDialog';
 import { useTimelineDrop } from './useTimelineDrop';
 import { useTimelineInteractions } from './useTimelineInteractions';
 import { useTimelineViewport } from './useTimelineViewport';
@@ -31,6 +35,20 @@ export function Timeline() {
   const { marquee, dragInvalid, onClipPointerDown, onLanePointerDown, onRulerPointerDown } =
     useTimelineInteractions(viewportRef, altHeldRef);
   const { dropTarget, onDragEnter, onDragOver, onDragLeave, onDrop } = useTimelineDrop(viewportRef);
+
+  const [menu, setMenu] = useState<ClipMenuRequest | null>(null);
+  const [bakeClipId, setBakeClipId] = useState<string | null>(null);
+  const [presetClipId, setPresetClipId] = useState<string | null>(null);
+
+  const onClipContextMenu = useCallback((e: React.MouseEvent, clip: { id: string }) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const store = useEditorStore.getState();
+    // Right-clicking a clip that is not in the selection selects it first, so the menu's
+    // "Delete 3 clips" can never mean three clips you were not pointing at.
+    if (!store.selectedClipIds.includes(clip.id)) store.selectClip(clip.id);
+    setMenu({ clipId: clip.id, x: e.clientX, y: e.clientY });
+  }, []);
 
   const duration = getProjectDuration();
   const span = getTimelineSpan();
@@ -152,6 +170,7 @@ export function Timeline() {
                 dragInvalid={dragInvalid}
                 mediaLibrary={mediaLibrary}
                 onClipPointerDown={onClipPointerDown}
+                onClipContextMenu={onClipContextMenu}
               />
             ))}
 
@@ -208,6 +227,24 @@ export function Timeline() {
 
         <Minimap />
       </div>
+
+      {menu && (
+        <ClipContextMenu
+          request={menu}
+          onClose={() => setMenu(null)}
+          onBake={setBakeClipId}
+          onPreset={setPresetClipId}
+        />
+      )}
+      {bakeClipId && <BakeDialog clipId={bakeClipId} onClose={() => setBakeClipId(null)} />}
+      {presetClipId && <PresetForClip clipId={presetClipId} onClose={() => setPresetClipId(null)} />}
     </section>
   );
+}
+
+/** The preset dialog wants the asset as well as the clip; the menu only carries the clip. */
+function PresetForClip({ clipId, onClose }: { clipId: string; onClose: () => void }) {
+  const clip = useEditorStore((s) => s.clips.find((c) => c.id === clipId));
+  if (!clip || !('assetId' in clip)) return null;
+  return <ProcessDialog assetId={clip.assetId} clipId={clip.id} onClose={onClose} />;
 }

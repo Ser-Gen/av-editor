@@ -21,6 +21,7 @@ interface Props {
     clip: Clip,
     mode: 'move' | 'left' | 'right' | 'fadeIn' | 'fadeOut',
   ) => void;
+  onClipContextMenu: (e: React.MouseEvent, clip: Clip) => void;
 }
 
 export const TrackLane = memo(function TrackLane({
@@ -34,6 +35,7 @@ export const TrackLane = memo(function TrackLane({
   dragInvalid,
   mediaLibrary,
   onClipPointerDown,
+  onClipContextMenu,
 }: Props) {
   const from = scrollX - CULL_MARGIN_PX;
   const to = scrollX + viewportWidth + CULL_MARGIN_PX;
@@ -61,6 +63,7 @@ export const TrackLane = memo(function TrackLane({
             locked={track.locked}
             asset={'assetId' in clip ? mediaLibrary[clip.assetId] : undefined}
             onPointerDown={onClipPointerDown}
+            onContextMenu={onClipContextMenu}
           />
         );
       })}

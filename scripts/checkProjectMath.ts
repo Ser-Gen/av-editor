@@ -34,6 +34,8 @@ import {
   seekTimeAt,
 } from '../src/utils/transport';
 import { formatClock } from '../src/utils/time';
+import { clampMenuPosition, clipMenuItems } from '../src/utils/clipMenu';
+import type { ClipMenuContext } from '../src/utils/clipMenu';
 import {
   PANEL_MAX_FRACTION,
   PANEL_MIN_WIDTH,
@@ -1304,6 +1306,81 @@ check('minutes and seconds', formatClock(75), '1:15');
 check('an hour brings the hours out', formatClock(3661), '1:01:01');
 check('and it never shows a negative', formatClock(-5), '0:00');
 check('a frame short of a second has not got there yet', formatClock(0.98), '0:00');
+
+
+// --- 32. the clip context menu -------------------------------------------------
+//
+// A menu is mostly a list of things that must not be offered. An action shown on a clip it
+// cannot work on is worse than one that is missing — you click it and nothing happens, or
+// worse, something does. Every entry below is either absent or disabled *with a reason*.
+
+const menuBase: ClipMenuContext = {
+  kind: 'video', playheadInside: true, hasAsset: true, offline: false,
+  hasAudio: true, audioEnabled: true, hideVideo: false,
+  trackLocked: false, producerBusy: false, selectionCount: 1,
+};
+const ids = (ctx: ClipMenuContext) => clipMenuItems(ctx).map((i) => i.id);
+const item = (ctx: ClipMenuContext, id: string) => clipMenuItems(ctx).find((i) => i.id === id);
+const enabled = (ctx: ClipMenuContext, id: string) => item(ctx, id)?.disabled !== true;
+
+check('a video clip offers the lot',
+  ids(menuBase),
+  ['split', 'trimStart', 'trimEnd', 'duplicate', 'bake', 'preset', 'detach', 'toggleAudio',
+   'toggleVideo', 'zoom', 'delete', 'rippleDelete']);
+
+// An audio clip has no picture to bake, no preset to run over it and no audio to detach from
+// itself — and no mute, because a gain of zero cannot say what it used to be.
+check('an audio clip offers only what an audio clip has',
+  ids({ ...menuBase, kind: 'audio', hideVideo: false }),
+  ['split', 'trimStart', 'trimEnd', 'duplicate', 'zoom', 'delete', 'rippleDelete']);
+check('a text clip has no source to render from',
+  ids({ ...menuBase, kind: 'text' }).includes('bake'), false);
+check('an image can be baked but has no preset',
+  [ids({ ...menuBase, kind: 'image' }).includes('bake'),
+   ids({ ...menuBase, kind: 'image' }).includes('preset')], [true, false]);
+
+check('splitting needs the playhead inside the clip',
+  enabled({ ...menuBase, playheadInside: false }, 'split'), false);
+check('and says so rather than greying out silently',
+  !!item({ ...menuBase, playheadInside: false }, 'split')?.reason, true);
+check('trimming to the playhead needs it too',
+  enabled({ ...menuBase, playheadInside: false }, 'trimEnd'), false);
+
+check('a locked track disables every edit',
+  ['split', 'trimStart', 'trimEnd', 'duplicate', 'delete', 'rippleDelete']
+    .every((id) => !enabled({ ...menuBase, trackLocked: true }, id)), true);
+check('but zooming to it is still allowed — looking is not editing',
+  enabled({ ...menuBase, trackLocked: true }, 'zoom'), true);
+
+check('offline media cannot be baked', enabled({ ...menuBase, offline: true }, 'bake'), false);
+check('and the reason names relinking',
+  item({ ...menuBase, offline: true }, 'bake')?.reason?.includes('relink'), true);
+check('one producer at a time', enabled({ ...menuBase, producerBusy: true }, 'preset'), false);
+check('a file with no audio track cannot have it detached',
+  enabled({ ...menuBase, hasAudio: false }, 'detach'), false);
+
+check('the labels count what is actually selected',
+  item({ ...menuBase, selectionCount: 3 }, 'delete')?.label, 'Delete 3 clips');
+check('and stay singular for one', item(menuBase, 'delete')?.label, 'Delete');
+check('the toggles say what the click will do',
+  [item(menuBase, 'toggleVideo')?.label,
+   item({ ...menuBase, hideVideo: true }, 'toggleVideo')?.label],
+  ['Hide video', 'Show video']);
+
+// The timeline sits at the bottom of the window, so a menu opening downwards off the screen
+// is not an edge case here — it is every right-click.
+const view = { width: 1200, height: 800 };
+const menuBox = { width: 240, height: 300 };
+check('a menu with room opens where you clicked',
+  clampMenuPosition(100, 100, menuBox, view), { x: 100, y: 100 });
+check('one near the bottom flips up over the pointer',
+  clampMenuPosition(100, 700, menuBox, view).y, 400);
+check('one near the right edge flips left',
+  clampMenuPosition(1100, 100, menuBox, view).x, 860);
+check('and a corner does both',
+  clampMenuPosition(1100, 700, menuBox, view), { x: 860, y: 400 });
+check('a menu taller than the window still starts on screen',
+  clampMenuPosition(100, 700, { width: 240, height: 900 }, view).y >= 0, true);
 
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
