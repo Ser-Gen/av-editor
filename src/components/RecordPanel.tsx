@@ -1,10 +1,25 @@
 import { useEffect, useRef } from 'react';
 import { SOURCE_LABELS } from '../capture/recordingStore';
 import type { CaptureSourceKind } from '../capture/recordingStore';
-import { CAPTURE_STEP_LABELS, formatLabel } from '../capture/sources';
+import {
+  CAMERA_HEIGHT,
+  CAMERA_WIDTH,
+  CAPTURE_FPS_CHOICES,
+  CAPTURE_SCALE_CHOICES,
+  CAPTURE_STEP_LABELS,
+  formatLabel,
+  scaledSize,
+} from '../capture/sources';
 import type { CaptureController } from '../capture/useCaptureSession';
 import type { SourceStatus } from '../capture/CaptureSession';
-import { estimatedBytesPerSecond } from '../capture/bitrate';
+import {
+  AUDIO_BITRATE_DEFAULT,
+  AUDIO_BITRATE_SYSTEM,
+  CAPTURE_QUALITIES,
+  QUALITY_LABEL,
+  estimatedBytesPerSecond,
+  qualityLabel,
+} from '../capture/bitrate';
 import { formatDuration } from '../utils/time';
 import { useEditorStore } from '../store/editorStore';
 import { useStorageBudget } from '../hooks/useStorageBudget';
@@ -15,6 +30,7 @@ import {
   headroomSeconds,
 } from '../utils/storageBudget';
 import type { SourceRequest } from '../capture/sources';
+import type { CaptureQuality } from '../capture/bitrate';
 
 /**
  * What a video source is doing, in the two numbers that disagree.
@@ -59,24 +75,56 @@ function CameraPreview({ stream }: { stream: MediaStream }) {
  * screen. It is an estimate of an estimate and is worded as one — but it is the only number
  * available at the moment it can still change someone's mind.
  */
+function plannedSources(
+  request: SourceRequest,
+  settings: { width: number; height: number },
+): { width: number; height: number; fps: number }[] {
+  const video: { width: number; height: number; fps: number }[] = [];
+  // The *requested* rate, not the project's. Reading the project's meant a 30 fps project
+  // priced a 60 fps screen capture at half its real cost, and the estimate only corrected
+  // itself once the take was already running — after the moment it could have changed a mind.
+  if (request.screen) {
+    video.push({ ...scaledSize(settings.width, settings.height, request.scale), fps: request.fps });
+  }
+  if (request.camera) {
+    video.push({ ...scaledSize(CAMERA_WIDTH, CAMERA_HEIGHT, request.scale), fps: request.fps });
+  }
+  return video;
+}
+
+function plannedAudio(request: SourceRequest): number[] {
+  const rates: number[] = [];
+  if (request.mic) rates.push(AUDIO_BITRATE_DEFAULT);
+  if (request.systemAudio) rates.push(AUDIO_BITRATE_SYSTEM);
+  return rates;
+}
+
 function plannedBytesPerSecond(
   request: SourceRequest,
   settings: { width: number; height: number; fps: number },
 ): number {
-  const video: { width: number; height: number; fps: number }[] = [];
-  if (request.screen) video.push(settings);
-  if (request.camera) video.push(settings);
-  const audio = (request.mic ? 1 : 0) + (request.systemAudio ? 1 : 0);
-  return estimatedBytesPerSecond(video, audio);
+  return estimatedBytesPerSecond(plannedSources(request, settings), plannedAudio(request), request.quality);
+}
+
+/** `1080p60 · Normal` — what the estimate below it is an estimate *of*. */
+function plannedFormatLabel(
+  request: SourceRequest,
+  settings: { width: number; height: number },
+): string {
+  const sources = plannedSources(request, settings);
+  const shape = sources[0] ? qualityLabel(sources[0].height, sources[0].fps) : 'audio only';
+  return `${shape} · ${QUALITY_LABEL[request.quality]}`;
 }
 
 /** What this take is on course to write in an hour, from the formats in use right now. */
-function hourlyBytes(sources: SourceStatus[]): number {
+function hourlyBytes(sources: SourceStatus[], quality: CaptureQuality): number {
   const video = sources
     .filter((s) => s.format)
     .map((s) => ({ width: s.format!.width, height: s.format!.height, fps: s.format!.frameRate }));
-  const audio = sources.filter((s) => !s.format).length;
-  return estimatedBytesPerSecond(video, audio) * 3600;
+  const audio = sources
+    .filter((s) => !s.format)
+    .map((s) => (s.kind === 'system' ? AUDIO_BITRATE_SYSTEM : AUDIO_BITRATE_DEFAULT));
+  return estimatedBytesPerSecond(video, audio, quality) * 3600;
 }
 
 interface Props {
@@ -112,7 +160,7 @@ export function RecordPanel({ capture }: Props) {
   const { budget } = useStorageBudget();
   const measured = status?.sources.some((s) => s.format) ?? false;
   const bytesPerSecond = measured
-    ? hourlyBytes(status?.sources ?? []) / 3600
+    ? hourlyBytes(status?.sources ?? [], request.quality) / 3600
     : plannedBytesPerSecond(request, settings);
   // The estimate is not refreshed during a take — the library does not change — so the bytes
   // this take has already written are subtracted to keep the figure honest as it counts down.
@@ -166,6 +214,68 @@ export function RecordPanel({ capture }: Props) {
           );
         })}
       </div>
+
+      {/*
+        Both settings are requests, and both are locked once a take is running: the encoder
+        was configured from them at `start`, and a control that silently applied to the
+        *next* recording would be worse than one that is greyed out.
+      */}
+      <div className="record-format">
+        <label className="record-format-field">
+          <span>Frame rate</span>
+          <select
+            value={request.fps}
+            disabled={recording || busy}
+            onChange={(e) => setRequest({ ...request, fps: Number(e.target.value) })}
+          >
+            {CAPTURE_FPS_CHOICES.map((rate) => (
+              <option key={rate} value={rate}>
+                {rate} fps
+              </option>
+            ))}
+          </select>
+        </label>
+        <label
+          className="record-format-field"
+          title="A fraction of whatever the source turns out to be — a screen picker decides the resolution, not this app."
+        >
+          <span>Scale</span>
+          <select
+            value={request.scale}
+            disabled={recording || busy}
+            onChange={(e) => setRequest({ ...request, scale: Number(e.target.value) })}
+          >
+            {CAPTURE_SCALE_CHOICES.map((s) => (
+              <option key={s} value={s}>
+                {Math.round(s * 100)}%
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="record-format-field">
+          <span>Quality</span>
+          <select
+            value={request.quality}
+            disabled={recording || busy}
+            onChange={(e) => setRequest({ ...request, quality: e.target.value as CaptureQuality })}
+          >
+            {CAPTURE_QUALITIES.map((q) => (
+              <option key={q} value={q}>
+                {QUALITY_LABEL[q]}
+              </option>
+            ))}
+          </select>
+        </label>
+      </div>
+      {phase === 'idle' && (
+        <p className="record-option-note record-option-note--block">
+          Rate and scale are what the display or camera are asked for, not what they must
+          give — the panel reports what each track actually negotiated once recording starts.
+          Scale is a fraction of the source, because a share picker decides the resolution and
+          a window is whatever size you left it. Anything that would come out under
+          128&nbsp;px on an edge is left unscaled.
+        </p>
+      )}
 
       {request.mic && (
         <label className="record-option" title="Chrome's voice processing: right for a voice in a room, wrong for anything recorded as music or as a performance.">
@@ -234,7 +344,8 @@ export function RecordPanel({ capture }: Props) {
 
       {budget && !recording && (
         <p className={`record-headroom${noRoom ? ' is-blocked' : headroom <= 15 * 60 ? ' is-low' : ''}`}>
-          ≈ {formatBytes(bytesPerSecond * 3600)} per hour at this quality ·{' '}
+          ≈ {formatBytes(bytesPerSecond * 3600)} per hour at{' '}
+          {measured ? formatLabel(status?.sources.find((s) => s.format)?.format ?? null) : plannedFormatLabel(request, settings)} ·{' '}
           {noRoom
             ? `only ${formatHeadroom(headroom)} of space left — free some up before recording.`
             : `room for ${formatHeadroom(headroom)}.`}
@@ -303,7 +414,7 @@ export function RecordPanel({ capture }: Props) {
               rather than as the fixed number a 30 fps assumption would print. */}
           {status.sources.some((s) => s.format) && (
             <>
-              {' '}≈ {formatBytes(hourlyBytes(status.sources))} per hour at this rate
+              {' '}≈ {formatBytes(hourlyBytes(status.sources, request.quality))} per hour at this rate
               {budget && <>, room for {formatHeadroom(headroom)}</>}.
             </>
           )}

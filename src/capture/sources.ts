@@ -10,6 +10,8 @@
  * stream itself after the picker returns, never assumed from the request.
  */
 
+import type { CaptureQuality } from './bitrate';
+
 export type MimeChoice = { mimeType: string; container: 'webm' | 'mp4' };
 
 export interface SystemAudioSupport {
@@ -103,6 +105,15 @@ export interface SourceRequest {
    * recorded as music or as a performance, where the same three processors are damage.
    */
   processMic: boolean;
+  /**
+   * Frame rate to ask each video source for, and the rate the size estimate is priced at.
+   * A request, not a promise: a display that cannot do 60 hands back 30.
+   */
+  fps: number;
+  /** How generous to be with bits. See `QUALITY_SCALE`. */
+  quality: CaptureQuality;
+  /** Fraction of the source's own size to encode at. 1 leaves every source alone. */
+  scale: number;
 }
 
 /**
@@ -167,14 +178,85 @@ export const TARGET_FPS = 60;
 export const CAMERA_WIDTH = 1280;
 export const CAMERA_HEIGHT = 720;
 
-export function cameraConstraints(deviceId?: string): MediaTrackConstraints {
+/**
+ * Rates worth offering. 60 for anything with motion in it, 30 for a talking head or a slide
+ * deck at half the size, 24 for matching footage that was shot at 24.
+ *
+ * Every one is a request, never a guarantee — see the `ideal` note below. What the panel
+ * reports once a take is running is always what the track negotiated.
+ */
+export const CAPTURE_FPS_CHOICES = [24, 30, 60] as const;
+
+/**
+ * Scale, not resolution, because for a screen capture the resolution is not the app's to
+ * choose: whatever you pick in the browser's share picker is what arrives, and a window is
+ * whatever size you left it. A fraction is the only setting that means the same thing for a
+ * 4K display, a 1440p monitor and a 1000-pixel-wide program window.
+ */
+export const CAPTURE_SCALE_CHOICES = [1, 0.75, 0.5, 0.25] as const;
+
+/** Below this on either edge, scaling is refused outright rather than done badly. */
+export const MIN_CAPTURE_EDGE = 128;
+
+/**
+ * The size a source should be encoded at, or the size it already is.
+ *
+ * Even on both axes, because H.264 refuses an odd dimension. Returns the original untouched
+ * whenever the request cannot be honoured sensibly — a scale of 1, a nonsense number, or a
+ * result so small the encoder would be the least of the problems. Scaling one axis and
+ * clamping the other would keep the pixel count and lose the shape, which is worse than not
+ * scaling at all.
+ */
+export function scaledSize(
+  width: number,
+  height: number,
+  scale: number,
+): { width: number; height: number } {
+  const original = { width, height };
+  if (!Number.isFinite(scale) || scale >= 1 || scale <= 0) return original;
+  if (!(width > 0) || !(height > 0)) return original;
+  const w = Math.round((width * scale) / 2) * 2;
+  const h = Math.round((height * scale) / 2) * 2;
+  if (w < MIN_CAPTURE_EDGE || h < MIN_CAPTURE_EDGE) return original;
+  return { width: w, height: h };
+}
+
+/**
+ * Ask a live video track to hand over smaller frames.
+ *
+ * Done to the track rather than to the frames because everything downstream then follows for
+ * free: `trackFormat` reports the smaller size, the bitrate is derived from it, the sidecar
+ * records it, and the MediaRecorder fallback gets the same treatment as the WebCodecs path
+ * without either of them knowing this happened.
+ *
+ * `ideal`, and failure is swallowed: a browser that will not resize a display track leaves it
+ * at its native size, and the panel goes on reporting what the track actually negotiated. A
+ * capture that ran bigger than asked is a far better outcome than one that refused to start.
+ */
+export async function applyCaptureScale(stream: MediaStream | null, scale: number): Promise<void> {
+  const track = stream?.getVideoTracks()[0];
+  if (!track) return;
+  const settings = track.getSettings();
+  const target = scaledSize(settings.width ?? 0, settings.height ?? 0, scale);
+  if (target.width === (settings.width ?? 0) && target.height === (settings.height ?? 0)) return;
+  try {
+    await track.applyConstraints({
+      width: { ideal: target.width },
+      height: { ideal: target.height },
+    });
+  } catch {
+    // Left at its native size, which `trackFormat` will report truthfully.
+  }
+}
+
+export function cameraConstraints(deviceId?: string, fps: number = TARGET_FPS): MediaTrackConstraints {
   return {
     // `ideal`, so a remembered camera that has since been unplugged opens the default one
     // instead of throwing. `resolveCameraChoice` already drops ids that are not present.
     ...(deviceId ? { deviceId: { ideal: deviceId } } : {}),
     width: { ideal: CAMERA_WIDTH },
     height: { ideal: CAMERA_HEIGHT },
-    frameRate: { ideal: TARGET_FPS },
+    frameRate: { ideal: fps },
   };
 }
 
@@ -294,7 +376,7 @@ export async function acquireSources(
     const display = await provider.getDisplayMedia({
       // `ideal`, never `exact`: a display that cannot deliver 60 should hand back 30, not
       // throw `OverconstrainedError` and record nothing at all.
-      video: request.screen ? { frameRate: { ideal: TARGET_FPS } } : true,
+      video: request.screen ? { frameRate: { ideal: request.fps } } : true,
       // Not a bare `true`: that hands the browser its own defaults, which on Chrome means a
       // soundtrack captured through echo cancellation and automatic gain.
       audio: request.systemAudio ? UNPROCESSED_AUDIO : false,
@@ -315,6 +397,7 @@ export async function acquireSources(
 
     if (request.screen) {
       result.screen = new MediaStream(display.getVideoTracks());
+      await applyCaptureScale(result.screen, request.scale);
     } else {
       for (const track of display.getVideoTracks()) track.stop();
     }
@@ -326,7 +409,12 @@ export async function acquireSources(
     // ticked that would capture the same voice twice and put a duplicate on the timeline.
     try {
       onStep('camera');
-      result.camera = await provider.getUserMedia({ video: cameraConstraints(request.cameraDeviceId) });
+      result.camera = await provider.getUserMedia({
+        video: cameraConstraints(request.cameraDeviceId, request.fps),
+      });
+      // After acquisition, like the screen: the camera negotiates the best format it has and
+      // is then asked down from it, so one rule covers both sources.
+      await applyCaptureScale(result.camera, request.scale);
     } catch (e) {
       if (!result.screen && !result.systemAudio && !request.mic) throw e;
       result.cameraMissing = cameraFailure(e);

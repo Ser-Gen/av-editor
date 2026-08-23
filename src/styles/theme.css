@@ -413,6 +413,27 @@ body.is-dragging * {
   opacity: 0.55;
 }
 
+.record-format {
+  display: flex;
+  gap: 8px;
+  padding: 0 12px 4px;
+}
+
+.record-format-field {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: var(--text-muted);
+  min-width: 0;
+}
+
+.record-format-field select {
+  width: 100%;
+  font-size: 12px;
+}
+
 .record-option-note {
   display: block;
   font-size: 10px;

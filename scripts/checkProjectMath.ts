@@ -78,7 +78,14 @@ import { bakeClipOf, bakeSize, bakeSpec } from '../src/tools/bakeClip';
 import { EFFECTS } from '../src/render/effects/registry';
 import { DEFAULT_EXPORT_SETTINGS as BAKE_EXPORT_DEFAULTS } from '../src/utils/exportSettings';
 import { pictureInPictureTransform, PIP_MARGIN_PX, PIP_WIDTH_FRACTION } from '../src/capture/pip';
-import { captureVideoBitrate, estimatedBytesPerSecond } from '../src/capture/bitrate';
+import {
+  AUDIO_BITRATE_DEFAULT,
+  AUDIO_BITRATE_SYSTEM,
+  QUALITY_SCALE,
+  captureVideoBitrate,
+  estimatedBytesPerSecond,
+  qualityLabel,
+} from '../src/capture/bitrate';
 import {
   REFUSE_HEADROOM_SECONDS,
   WARN_HEADROOM_SECONDS,
@@ -101,7 +108,7 @@ import { isCollectable } from '../src/project/mediaStore';
 import { fastestRate, frameRateDecision } from '../src/capture/frameRate';
 import { describeCameras, resolveCameraChoice } from '../src/capture/cameraDevices';
 import { SOURCE_LANE, SOURCE_LABELS } from '../src/capture/recordingStore';
-import { cameraFailure, formatLabel } from '../src/capture/sources';
+import { MIN_CAPTURE_EDGE, cameraFailure, formatLabel, scaledSize } from '../src/capture/sources';
 import {
   detachedAudio,
   detachedAudioAdvice,
@@ -572,7 +579,8 @@ check('a nonsense frame rate does not produce a nonsense bitrate',
 
 // Half an hour of screen + camera is the number the panel's estimate is made of.
 const perSecond = estimatedBytesPerSecond(
-  [{ width: 1920, height: 1080, fps: 60 }, { width: 1280, height: 720, fps: 60 }], 2);
+  [{ width: 1920, height: 1080, fps: 60 }, { width: 1280, height: 720, fps: 60 }],
+  [AUDIO_BITRATE_DEFAULT, AUDIO_BITRATE_SYSTEM]);
 check('1080p60 screen plus 720p60 camera for 30 minutes is under 3 GB',
   (perSecond * 1800) / 1e9 < 3, true);
 check('and over 2 GB — worth saying out loud before someone starts a long take',
@@ -815,7 +823,7 @@ check('a picture-only preset explains why nothing needs to happen',
 
 const GB = 1024 * 1024 * 1024;
 // A 1080p30 screen capture plus one AAC stream, from the project's own bitrate curve.
-const RATE = estimatedBytesPerSecond([{ width: 1920, height: 1080, fps: 30 }], 1);
+const RATE = estimatedBytesPerSecond([{ width: 1920, height: 1080, fps: 30 }], [AUDIO_BITRATE_DEFAULT]);
 
 check('an hour of 1080p30 capture is a few gigabytes',
   Math.round((RATE * 3600) / GB * 10) / 10, 2.7, 0.15);
@@ -1381,6 +1389,98 @@ check('and a corner does both',
   clampMenuPosition(1100, 700, menuBox, view), { x: 860, y: 400 });
 check('a menu taller than the window still starts on screen',
   clampMenuPosition(100, 700, { width: 240, height: 900 }, view).y >= 0, true);
+
+
+// --- 33. what a recording costs, and what the panel says it costs ---------------
+//
+// The estimate is the number someone decides on before there is any file to measure, so it
+// has to be priced at what the encoder will actually be told — the rate the capture will
+// *request*, and the bitrate each audio stream will really use. Reading the project's frame
+// rate instead priced a 60 fps screen capture at half its cost, and the figure only corrected
+// itself once the take was running, which is after it could change anyone's mind.
+
+check('Normal is exactly what every recording used before the setting existed',
+  QUALITY_SCALE.normal, 1);
+check('so Normal at 1080p30 is still 6 Mbps',
+  captureVideoBitrate(1920, 1080, 30, 'normal'), 6_000_000);
+check('Draft is meaningfully smaller', captureVideoBitrate(1920, 1080, 30, 'draft'), 3_600_000);
+check('High is meaningfully bigger', captureVideoBitrate(1920, 1080, 30, 'high'), 9_600_000);
+check('and an unspecified quality is Normal',
+  captureVideoBitrate(1920, 1080, 30), captureVideoBitrate(1920, 1080, 30, 'normal'));
+
+// The frame rate still enters as a square root, quality on top of it rather than instead.
+check('60 fps costs about 40% more, not 100%',
+  captureVideoBitrate(1920, 1080, 60, 'normal') / 6_000_000, Math.SQRT2, 0.01);
+check('and quality scales that too',
+  captureVideoBitrate(1920, 1080, 60, 'draft'),
+  Math.round((captureVideoBitrate(1920, 1080, 60, 'normal') * 0.6) / 1000) * 1000);
+
+// The reported bug: screen + mic + system audio on a 1080p project.
+const hd = [{ width: 1920, height: 1080, fps: 30 }];
+const bothAudio = [AUDIO_BITRATE_DEFAULT, AUDIO_BITRATE_SYSTEM];
+check('system audio is charged at what system audio costs',
+  estimatedBytesPerSecond(hd, bothAudio) * 8, 6_000_000 + 192_000 + 256_000);
+check('a count-and-a-default was 64 kbps light on exactly this setup',
+  estimatedBytesPerSecond(hd, bothAudio) - estimatedBytesPerSecond(hd, [192_000, 192_000]),
+  64_000 / 8);
+
+// The one that was actually wrong by 41%.
+const priced30 = estimatedBytesPerSecond([{ width: 1920, height: 1080, fps: 30 }], bothAudio);
+const priced60 = estimatedBytesPerSecond([{ width: 1920, height: 1080, fps: 60 }], bothAudio);
+check('pricing a 60 fps capture at 30 understated it by more than a third',
+  priced60 / priced30 > 1.35, true);
+check('draft at 60 fits in less than normal at 60',
+  estimatedBytesPerSecond([{ width: 1920, height: 1080, fps: 60 }], bothAudio, 'draft') < priced60, true);
+check('an audio-only take costs only its audio',
+  estimatedBytesPerSecond([], [AUDIO_BITRATE_DEFAULT]) * 8, 192_000);
+
+check('the format label is the shape people recognise', qualityLabel(1080, 60), '1080p60');
+check('and reads the same for a camera', qualityLabel(720, 30), '720p30');
+check('a rate that never arrived is left off', qualityLabel(1080, 0), '1080p');
+check('and nothing at all says so', qualityLabel(0, 60), 'unknown format');
+
+
+// --- 34. recording scale --------------------------------------------------------
+//
+// Scale rather than resolution, because for a screen capture the resolution is not ours to
+// pick: the share picker decides, and a program window is whatever size it was left. The
+// rules that matter are the ones that fire on the sizes nobody plans for — an odd-numbered
+// window, and a small one asked to halve twice.
+
+check('full scale leaves a source exactly alone', scaledSize(1920, 1080, 1), { width: 1920, height: 1080 });
+check('half of 1080p is 540p', scaledSize(1920, 1080, 0.5), { width: 960, height: 540 });
+check('a quarter of 4K is still a full HD frame',
+  scaledSize(3840, 2160, 0.25), { width: 960, height: 540 });
+check('three quarters of 1080p', scaledSize(1920, 1080, 0.75), { width: 1440, height: 810 });
+
+// An application window is the case this setting exists for, and it is never a round number.
+check('an odd-sized window comes out even on both axes',
+  scaledSize(1001, 701, 0.5), { width: 500, height: 350 });
+check('and keeps its shape while doing it',
+  Math.abs(500 / 350 - 1001 / 701) < 0.01, true);
+check('an odd scale of an odd window is still even',
+  [scaledSize(1063, 745, 0.75).width % 2, scaledSize(1063, 745, 0.75).height % 2], [0, 0]);
+
+// Refusals. Every one of these returns the source untouched rather than a broken frame size.
+check('a scale that would go under the floor is refused outright',
+  scaledSize(400, 300, 0.25), { width: 400, height: 300 });
+check('and it is the *shorter* edge that decides',
+  scaledSize(1920, 200, 0.5), { width: 1920, height: 200 });
+check('the floor is where it says it is',
+  scaledSize(MIN_CAPTURE_EDGE * 2, MIN_CAPTURE_EDGE * 2, 0.5),
+  { width: MIN_CAPTURE_EDGE, height: MIN_CAPTURE_EDGE });
+check('scaling up is not this control’s job', scaledSize(640, 480, 2), { width: 640, height: 480 });
+check('nor is scaling to nothing', scaledSize(640, 480, 0), { width: 640, height: 480 });
+check('a nonsense scale changes nothing', scaledSize(640, 480, Number.NaN), { width: 640, height: 480 });
+check('and neither does an unmeasured track', scaledSize(0, 0, 0.5), { width: 0, height: 0 });
+
+// The point of the setting: half the edges is a quarter of the pixels, and the bitrate
+// curve follows the pixel count — so half scale is roughly a quarter of the bytes.
+const fullScale = captureVideoBitrate(1920, 1080, 60, 'normal');
+const halfScale = captureVideoBitrate(960, 540, 60, 'normal');
+check('half scale costs about a quarter as much', fullScale / halfScale, 4, 0.3);
+check('and half scale on Draft is cheaper still',
+  captureVideoBitrate(960, 540, 60, 'draft') < halfScale, true);
 
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);

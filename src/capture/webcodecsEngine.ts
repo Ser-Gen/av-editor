@@ -96,10 +96,13 @@ export interface WebCodecsEngineOptions {
   audioBitrate?: number;
 }
 
-/** What the exporter encodes at. A capture has no business being worse than its own export. */
-export const AUDIO_BITRATE_DEFAULT = 192_000;
-/** System audio carries music and effects, not speech, and is worth the extra headroom. */
-export const AUDIO_BITRATE_SYSTEM = 256_000;
+/*
+ * Defined with the rest of the bitrate policy, not here: the record panel has to price a
+ * take before any encoder exists, and it must price it at the numbers the encoder will
+ * actually use. Re-exported so the engine's own importers do not have to care.
+ */
+import { AUDIO_BITRATE_DEFAULT, AUDIO_BITRATE_SYSTEM } from './bitrate';
+export { AUDIO_BITRATE_DEFAULT, AUDIO_BITRATE_SYSTEM };
 
 export class WebCodecsSourceEngine implements SourceEngine {
   readonly engine = 'webcodecs' as const;

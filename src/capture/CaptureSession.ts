@@ -28,6 +28,7 @@ import { OUT_OF_SPACE } from './quota';
 import { acquireSources, browserSources, stopStream, trackFormat } from './sources';
 import type { CaptureStepReporter, SourceProvider, SourceRequest, VideoFormat } from './sources';
 import { captureVideoBitrate } from './bitrate';
+import type { CaptureQuality } from './bitrate';
 import {
   AUDIO_BITRATE_DEFAULT,
   AUDIO_BITRATE_SYSTEM,
@@ -179,6 +180,8 @@ export class CaptureSession {
   private dropWatch: { atMs: number; dropped: number }[] = [];
   /** Set once the camera has been reduced, so it only ever happens once. */
   private degraded: string | null = null;
+  /** The quality this take was started at; the encoder is the only thing that reads it. */
+  private quality: CaptureQuality = 'normal';
 
   readonly sessionId = uid('session');
   /** Non-null when system audio was requested and the platform did not provide it. */
@@ -207,6 +210,7 @@ export class CaptureSession {
   ): Promise<CaptureSession> {
     const session = new CaptureSession();
     onStep('choosing-engine');
+    session.quality = request.quality;
     session.engineChoice = await chooseEngine(enginePreference);
     const sources = await acquireSources(request, provider, onStep);
     session.systemAudioMissing = sources.systemAudioMissing;
@@ -293,7 +297,7 @@ export class CaptureSession {
         // Sized from what the track actually negotiated, so a 60 fps capture is not encoded
         // at a 30 fps budget. `QUALITY_HIGH` does not know the frame rate exists.
         videoBitrate: format
-          ? captureVideoBitrate(format.width, format.height, format.frameRate)
+          ? captureVideoBitrate(format.width, format.height, format.frameRate, this.quality)
           : undefined,
         // System audio is whatever the machine is playing — music, a game, a call — and is
         // the one source where the encoder, not the microphone, is the weak link.

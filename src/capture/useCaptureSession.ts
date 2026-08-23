@@ -9,6 +9,7 @@ import type { RecordedSource } from './recordingStore';
 import { discardRecording, findOrphans, finalizeRecording, recoverRecording } from './recovery';
 import type { OrphanRecording } from './recovery';
 import { cameraConstraints, systemAudioSupport } from './sources';
+import { TARGET_FPS } from './sources';
 import type { CaptureStep, SourceProvider, SourceRequest } from './sources';
 import { listCameras, onDeviceChange, resolveCameraChoice } from './cameraDevices';
 import type { CameraDevice } from './cameraDevices';
@@ -71,6 +72,9 @@ export function useCaptureSession(
     mic: true,
     systemAudio: true,
     processMic: true,
+    fps: TARGET_FPS,
+    quality: 'normal',
+    scale: 1,
   });
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
   const [cameraPreview, setCameraPreview] = useState<MediaStream | null>(null);
@@ -155,7 +159,7 @@ export function useCaptureSession(
     let live = true;
     let opened: MediaStream | null = null;
     navigator.mediaDevices
-      ?.getUserMedia({ video: cameraConstraints(request.cameraDeviceId) })
+      ?.getUserMedia({ video: cameraConstraints(request.cameraDeviceId, request.fps) })
       .then((stream) => {
         opened = stream;
         if (!live) {
@@ -172,7 +176,7 @@ export function useCaptureSession(
       for (const track of opened?.getTracks() ?? []) track.stop();
       setCameraPreview(null);
     };
-  }, [previewWanted, request.camera, request.cameraDeviceId, phase, refreshCameras]);
+  }, [previewWanted, request.camera, request.cameraDeviceId, request.fps, phase, refreshCameras]);
 
   // Decided up front so the panel can say how it will record before anyone presses Record.
   useEffect(() => {

@@ -22,25 +22,82 @@ const REFERENCE_FPS = 30;
 /** mediabunny's exponent, kept so that nothing changes at 30 fps. */
 const SPATIAL_EXPONENT = 0.95;
 
-export function captureVideoBitrate(width: number, height: number, fps: number): number {
+/**
+ * Audio is not derived from anything — a voice costs what a voice costs, whatever the
+ * picture is doing. System audio gets more because it is usually music rather than speech,
+ * and because it is the one stream nobody can re-record.
+ *
+ * They live here rather than with the encoder that consumes them: the panel has to price a
+ * take before any encoder exists, and two copies of these numbers is how an estimate starts
+ * quietly disagreeing with the file it is estimating.
+ */
+export const AUDIO_BITRATE_DEFAULT = 192_000;
+export const AUDIO_BITRATE_SYSTEM = 256_000;
+
+export type CaptureQuality = 'draft' | 'normal' | 'high';
+
+export const CAPTURE_QUALITIES: CaptureQuality[] = ['draft', 'normal', 'high'];
+
+/**
+ * What each setting multiplies the derived bitrate by.
+ *
+ * `normal` is exactly 1 on purpose: it is the bitrate every recording made before this
+ * setting existed used, so adding the control changes nothing for anyone who ignores it.
+ * Draft is for long screen captures, where roughly two-thirds the size is worth more than
+ * the detail nobody will look at; high is for anything that will be graded or scaled.
+ */
+export const QUALITY_SCALE: Record<CaptureQuality, number> = {
+  draft: 0.6,
+  normal: 1,
+  high: 1.6,
+};
+
+export const QUALITY_LABEL: Record<CaptureQuality, string> = {
+  draft: 'Draft',
+  normal: 'Normal',
+  high: 'High',
+};
+
+export function captureVideoBitrate(
+  width: number,
+  height: number,
+  fps: number,
+  quality: CaptureQuality = 'normal',
+): number {
   const pixels = Math.max(1, width * height);
   const rate = Math.min(240, Math.max(1, Number.isFinite(fps) ? fps : REFERENCE_FPS));
   const spatial = Math.pow(pixels / REFERENCE_PIXELS, SPATIAL_EXPONENT);
   const temporal = Math.sqrt(rate / REFERENCE_FPS);
-  return Math.round((REFERENCE_BITRATE * spatial * temporal) / 1000) * 1000;
+  const scale = QUALITY_SCALE[quality] ?? 1;
+  return Math.round((REFERENCE_BITRATE * spatial * temporal * scale) / 1000) * 1000;
+}
+
+/** `1080p60` — the shape of a capture in the four characters people actually recognise. */
+export function qualityLabel(height: number, fps: number): string {
+  if (!(height > 0)) return 'unknown format';
+  const rate = fps > 0 ? Math.round(fps) : 0;
+  return rate > 0 ? `${Math.round(height)}p${rate}` : `${Math.round(height)}p`;
 }
 
 /**
  * Bytes a capture of this shape is likely to write per second — for the panel's estimate.
  *
- * Video plus one AAC stream, which is what almost every session records. It is an estimate
- * of a variable-bitrate encode and is presented as one.
+ * It is an estimate of a variable-bitrate encode and is presented as one.
  */
 export function estimatedBytesPerSecond(
   sources: { width: number; height: number; fps: number }[],
-  audioStreams: number,
-  audioBitrate = 192_000,
+  /**
+   * One entry per audio stream, at what that stream will actually encode at. A count and a
+   * single default was close enough until system audio started costing 256k — at which point
+   * every estimate for the commonest setup of all was quietly 64 kbps light.
+   */
+  audioBitrates: number[],
+  quality: CaptureQuality = 'normal',
 ): number {
-  const video = sources.reduce((sum, s) => sum + captureVideoBitrate(s.width, s.height, s.fps), 0);
-  return (video + audioStreams * audioBitrate) / 8;
+  const video = sources.reduce(
+    (sum, s) => sum + captureVideoBitrate(s.width, s.height, s.fps, quality),
+    0,
+  );
+  const audio = audioBitrates.reduce((sum, b) => sum + b, 0);
+  return (video + audio) / 8;
 }

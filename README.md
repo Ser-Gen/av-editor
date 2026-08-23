@@ -370,6 +370,39 @@ source becomes its own file, its own library asset and its own timeline track.
 | Format | H.264/AAC in a fragmented MP4 (`.m4a` for audio-only sources), named `<source>-recording_<timestamp>_<length>.mp4`. Browsers without the WebCodecs pipeline fall back to WebM — see below |
 | Processing | Echo cancellation and noise suppression enabled on the microphone |
 
+### Frame rate and quality
+
+| Setting | Choices | Effect |
+|---------|---------|--------|
+| Frame rate | 24 / 30 / 60 fps | Asked of the display and the camera. A request, not a promise — a display that cannot do 60 hands back 30, and the panel reports what each track actually negotiated |
+| Scale | 100 / 75 / 50 / 25 % | A fraction of whatever the source turns out to be, applied to the screen and the camera alike |
+| Quality | Draft / Normal / High | Multiplies the derived video bitrate by 0.6 / 1 / 1.6. Audio is unaffected |
+
+**Scale, not resolution**, because for a screen capture the resolution is not the app's to
+choose: the browser's share picker decides it, and a program window is whatever size you
+left it. A fraction means the same thing for a 4K display, a 1440p monitor and a
+1000-pixel-wide window. Halving the edges quarters the pixels, and the bitrate curve
+follows the pixel count — so 50% is roughly a quarter of the bytes.
+
+It is asked of the live track, so everything downstream follows on its own: the reported
+format, the bitrate, the sidecar, and the `MediaRecorder` fallback as much as the WebCodecs
+path. Both axes come out even (H.264 refuses an odd dimension), and anything that would
+land under 128 px on an edge is left unscaled rather than scaled badly.
+
+Bitrate is otherwise derived from resolution and frame rate: 6 Mbps at 1080p30, scaled by
+`pixels^0.95 × √(fps/30)`. **Normal is exactly 1×**, so it is the bitrate every recording
+made before this setting existed used. Draft is for long screen captures, where two-thirds
+the size is worth more than detail nobody will look at; High is for anything that will be
+graded or scaled afterwards.
+
+All three are locked once a take is running — the encoder was configured from them at the start,
+and a control that silently applied to the *next* recording would be worse than one that is
+greyed out.
+
+The size line under the controls is priced at the rate the capture will **request** and at
+what each audio stream will really encode at (192 kbps for a microphone, 256 for system
+audio), and it names the format it is estimating: `≈ 3.62 GB per hour at 1080p60 · Normal`.
+
 ### How recordings are written
 
 Frames are read off the stream, encoded with WebCodecs and muxed to disk as the recording
