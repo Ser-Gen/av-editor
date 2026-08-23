@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef } from 'react';
 import { useEditorStore } from '../../store/editorStore';
 import { audioTracks, videoTracks } from '../../utils/compositeOrder';
+import { formatTimecode } from '../../utils/time';
 import { Minimap } from './Minimap';
 import { PlayheadLine } from './PlayheadLine';
 import { Ruler } from './Ruler';
@@ -8,6 +9,7 @@ import { TimelineToolbar } from './TimelineToolbar';
 import { TrackHeader } from './TrackHeader';
 import { TrackLane } from './TrackLane';
 import { RULER_HEIGHT, TRACK_HEADER_WIDTH } from './constants';
+import { useTimelineDrop } from './useTimelineDrop';
 import { useTimelineInteractions } from './useTimelineInteractions';
 import { useTimelineViewport } from './useTimelineViewport';
 
@@ -28,6 +30,7 @@ export function Timeline() {
   const { pxPerSec, scrollX, scrollY, xToTime } = useTimelineViewport(viewportRef);
   const { marquee, dragInvalid, onClipPointerDown, onLanePointerDown, onRulerPointerDown } =
     useTimelineInteractions(viewportRef, altHeldRef);
+  const { dropTarget, onDragEnter, onDragOver, onDragLeave, onDrop } = useTimelineDrop(viewportRef);
 
   const duration = getProjectDuration();
   const span = getTimelineSpan();
@@ -124,6 +127,10 @@ export function Timeline() {
           className="lanes-viewport"
           onPointerDown={onLanePointerDown}
           onContextMenu={(e) => e.preventDefault()}
+          onDragEnter={onDragEnter}
+          onDragOver={onDragOver}
+          onDragLeave={onDragLeave}
+          onDrop={onDrop}
         >
           <div
             className="lanes-content"
@@ -168,6 +175,28 @@ export function Timeline() {
                 className="marquee"
                 style={{ left: marquee.x, top: marquee.y, width: marquee.w, height: marquee.h }}
               />
+            )}
+
+            {/*
+              Where a dropped file would land. The lane and the time are known; the length is
+              not — the browser will not name a dragged file until it is let go — so this is a
+              line and a lane, not a clip-shaped ghost that would have to guess.
+            */}
+            {dropTarget && (
+              <div
+                className={`drop-target${dropTarget.locked ? ' is-locked' : ''}`}
+                style={{ top: dropTarget.top, height: dropTarget.height }}
+                aria-hidden
+              >
+                <div className="drop-line" style={{ left: dropTarget.time * pxPerSec }} />
+                <div className="drop-chip" style={{ left: dropTarget.time * pxPerSec }}>
+                  {dropTarget.count > 0 && (
+                    <strong>{dropTarget.count} file{dropTarget.count === 1 ? '' : 's'}</strong>
+                  )}
+                  <span>{formatTimecode(dropTarget.time, fps)}</span>
+                  {dropTarget.locked && <em>lane locked</em>}
+                </div>
+              </div>
             )}
           </div>
 

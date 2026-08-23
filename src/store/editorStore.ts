@@ -37,6 +37,7 @@ import { runPreset } from '../tools/runPreset';
 import { formatExportError } from '../export/exportLog';
 import {
   buildClipsForAsset,
+  buildDropClips,
   buildRecordingClips,
   createTrack,
   findLaneForPlacement,
@@ -50,7 +51,7 @@ import {
   nextTrackLabel,
   trackHasOverlap,
 } from './clipFactory';
-import type { RecordingPlacement } from './clipFactory';
+import type { DropItem, RecordingPlacement } from './clipFactory';
 import { docEquals, docSnapshot, pruneSelection, pushEntry } from './history';
 import { SOURCE_LANE } from '../capture/recordingStore';
 import type { RecordedSource } from '../capture/recordingStore';
@@ -349,6 +350,7 @@ interface EditorActions {
   importFiles: (files: FileList | File[], kind: AssetType) => Promise<void>;
   importUrlsToLibrary: (urls: string[]) => Promise<void>;
   addAssetToTimeline: (assetId: string) => void;
+  dropFilesAt: (dropped: DroppedFile[], trackId: string, time: number) => Promise<void>;
   removeLibraryItem: (assetId: string) => void;
   /**
    * Replaces the whole document with a saved one. Not a `commit`: reopening a project is not
@@ -447,6 +449,15 @@ interface EditorActions {
  * so a future open may need no click at all.
  */
 export interface RelinkInput {
+  file: File;
+  handle?: FileSystemFileHandle;
+}
+
+/**
+ * A file dragged in from the desktop. Structurally a `RelinkInput` on purpose — a dropped
+ * file and a picked one are the same thing to everything downstream, handle included.
+ */
+export interface DroppedFile {
   file: File;
   handle?: FileSystemFileHandle;
 }
@@ -1011,6 +1022,64 @@ export const useEditorStore = create<Store>((set, get) => {
           clips: [...s.clips, ...placed.clips],
           selectedClipIds: [placed.selectedClipId],
         } as Partial<EditorState>;
+      });
+    },
+
+    /**
+     * Files dragged in from the desktop, onto the lane and the time the pointer named.
+     *
+     * They enter the library like any other import — referenced, never copied, so they come
+     * back offline after a reload like everything else the user brought — but they reach the
+     * timeline through `buildDropClips` rather than the import placement, because the drop
+     * already said where. The handle is kept where the browser offers one; it is the same
+     * bonus relinking gets, and the same thing nothing depends on.
+     *
+     * One history entry for the whole drop, however many files it carried.
+     */
+    dropFilesAt: async (dropped, trackId, time) => {
+      if (dropped.length === 0) return;
+      set({ libraryNotice: `Adding ${dropped.length} file(s)\u2026` });
+
+      const items: DropItem[] = [];
+      const failed: string[] = [];
+      for (const { file, handle } of dropped) {
+        try {
+          const asset = await createAssetFromFile(file, inferAssetKind(file.name, file.type));
+          set((state) => ({
+            mediaLibrary: { ...state.mediaLibrary, [asset.id]: asset },
+            libraryOrder: state.libraryOrder.includes(asset.id)
+              ? state.libraryOrder
+              : [...state.libraryOrder, asset.id],
+          }));
+          if (handle) void putHandle(asset.id, handle);
+          items.push({ assetId: asset.id, asset });
+        } catch (e) {
+          failed.push(file.name);
+          console.warn('[Timeline] dropped file could not be read:', file.name, e);
+        }
+      }
+
+      if (items.length > 0) {
+        const label = items.length === 1 ? `Add ${items[0].asset.name}` : `Add ${items.length} files`;
+        commit(label, (s) => {
+          const placed = buildDropClips(items, s.tracks, s.clips, trackId, time, s.settings.fps);
+          return {
+            tracks: placed.tracks,
+            clips: [...s.clips, ...placed.clips],
+            selectedClipIds: placed.clips.map((c) => c.id),
+          } as Partial<EditorState>;
+        });
+      }
+
+      const added =
+        items.length === 1 ? `Added ${items[0].asset.name}.` : `Added ${items.length} files.`;
+      set({
+        libraryNotice:
+          failed.length === 0
+            ? added
+            : items.length === 0
+              ? `Could not read ${failed.join(', ')}.`
+              : `${added} Could not read ${failed.join(', ')}.`,
       });
     },
 

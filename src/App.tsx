@@ -29,6 +29,34 @@ export default function App() {
     localStorage.setItem(TIMELINE_HEIGHT_KEY, String(Math.round(timelineHeight)));
   }, [timelineHeight]);
 
+  /*
+   * A file dropped anywhere the app does not handle would otherwise make the browser leave
+   * the page and open it. The timeline's handlers sit closer to the target and run first,
+   * so `defaultPrevented` is how this tells "already placed" from "landed nowhere" — and
+   * landing nowhere is worth a word, since the alternative is a drag that silently does
+   * nothing at all.
+   */
+  useEffect(() => {
+    // Required on dragover or the drop event never fires, here or on the timeline.
+    const allow = (e: DragEvent) => {
+      if (Array.from(e.dataTransfer?.types ?? []).includes('Files')) e.preventDefault();
+    };
+    const stray = (e: DragEvent) => {
+      if (e.defaultPrevented) return;
+      if (!Array.from(e.dataTransfer?.types ?? []).includes('Files')) return;
+      e.preventDefault();
+      useEditorStore
+        .getState()
+        .setLibraryNotice('Drop media onto a timeline track to place it there.');
+    };
+    window.addEventListener('dragover', allow);
+    window.addEventListener('drop', stray);
+    return () => {
+      window.removeEventListener('dragover', allow);
+      window.removeEventListener('drop', stray);
+    };
+  }, []);
+
   useEffect(() => {
     const onMove = (e: PointerEvent) => {
       const drag = resizeRef.current;

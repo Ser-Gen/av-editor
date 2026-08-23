@@ -80,8 +80,8 @@ import {
   timeAtMinimapX,
   viewportWindow,
 } from '../src/utils/minimap';
-import { buildRecordingClips } from '../src/store/clipFactory';
-import { defaultTracks } from '../src/store/clipFactory';
+import { buildDropClips, buildRecordingClips } from '../src/store/clipFactory';
+import { createTrack, defaultTracks } from '../src/store/clipFactory';
 import { readFileSync } from 'node:fs';
 import type { Clip, MediaAsset } from '../src/types/editor';
 
@@ -964,6 +964,103 @@ check('one written after the save is unsaved work, not garbage',
   isCollectable('fresh.mp4', SAVED_AT + 1, kept, SAVED_AT), false);
 check('one written in the same millisecond gets the benefit of the doubt',
   isCollectable('fresh.mp4', SAVED_AT, kept, SAVED_AT), false);
+
+
+// --- 27. a drop lands where the pointer said ------------------------------------
+//
+// The whole difference between a drop and an import is that the position was chosen. An
+// import may look for room and append; a drop may not, because the user was specific about
+// the time and about nothing else. So every one of these asserts the same thing from a
+// different angle: the lane may change, the time may not.
+
+const dropTracks = [
+  { ...createTrack('video', 'V2'), id: 'v2' },
+  { ...createTrack('video', 'V1'), id: 'v1' },
+  { ...createTrack('audio', 'A1'), id: 'a1' },
+];
+const videoAsset = (duration: number) =>
+  ({ id: 'x', type: 'video', name: 'v.mp4', duration, hasAudio: true, origin: 'imported' }) as MediaAsset;
+const audioAsset = (duration: number) =>
+  ({ id: 'y', type: 'audio', name: 'a.mp3', duration, origin: 'imported' }) as MediaAsset;
+const imageAsset = () =>
+  ({ id: 'z', type: 'image', name: 'i.png', duration: 5, origin: 'imported' }) as MediaAsset;
+
+const one = buildDropClips(
+  [{ assetId: 'a', asset: videoAsset(4) }], dropTracks, [], 'v1', 7.5, 30);
+check('a dropped clip starts where it was dropped', one.clips[0].timelineStart, 7.5);
+check('on the lane it was dropped on', one.clips[0].trackId, 'v1');
+check('and creates no track to do it', one.tracks.length, 3);
+
+// Several at once: a sequence from the drop point, not a stack at it.
+const three = buildDropClips(
+  [
+    { assetId: 'a', asset: videoAsset(4) },
+    { assetId: 'b', asset: videoAsset(2) },
+    { assetId: 'c', asset: imageAsset() },
+  ],
+  dropTracks, [], 'v1', 1, 30);
+check('files dropped together queue up from the drop point',
+  three.clips.map((c) => c.timelineStart), [1, 5, 7]);
+check('all on the same lane', new Set(three.clips.map((c) => c.trackId)).size, 1);
+check('a still gets the standard image length', three.clips[2].sourceTrimOut, 5);
+
+// Mixed kinds do not queue behind each other — a music bed dropped with a video is meant
+// to start with it, not after it.
+const mixed = buildDropClips(
+  [
+    { assetId: 'a', asset: videoAsset(4) },
+    { assetId: 'b', asset: audioAsset(30) },
+  ],
+  dropTracks, [], 'v1', 2, 30);
+check('a video and a song dropped together both start at the pointer',
+  mixed.clips.map((c) => c.timelineStart), [2, 2]);
+check('the song goes to an audio lane, not the video lane it was dropped on',
+  mixed.clips[1].trackId, 'a1');
+
+// Dropped onto an occupied spot: the lane gives way, the time does not.
+const occupied = [
+  { id: 'c1', trackId: 'v1', timelineStart: 3, sourceTrimIn: 0, sourceTrimOut: 5,
+    kind: 'video', assetId: 'old', hasAudio: false, audioEnabled: false, gain: 1, hideVideo: false },
+] as Clip[];
+const collided = buildDropClips(
+  [{ assetId: 'a', asset: videoAsset(4) }], dropTracks, occupied, 'v1', 4, 30);
+check('a drop onto an occupied spot keeps its time', collided.clips[0].timelineStart, 4);
+check('and moves to the next free lane instead', collided.clips[0].trackId, 'v2');
+
+const noRoom = buildDropClips(
+  [{ assetId: 'a', asset: videoAsset(4) }],
+  [{ ...createTrack('video', 'V1'), id: 'v1' }], occupied, 'v1', 4, 30);
+check('with no free lane at that time, one is made', noRoom.tracks.length, 2);
+check('and the time is still the time', noRoom.clips[0].timelineStart, 4);
+
+const lockedTracks = [
+  { ...createTrack('video', 'V2'), id: 'v2' },
+  { ...createTrack('video', 'V1'), id: 'v1', locked: true },
+];
+const overLocked = buildDropClips(
+  [{ assetId: 'a', asset: videoAsset(4) }], lockedTracks, [], 'v1', 6, 30);
+// A sequence that had to give way stays given-way: scattering back onto the original lane
+// the moment it happens to be free again is worse than one lane's worth of consistency.
+const sticky = buildDropClips(
+  [
+    { assetId: 'a', asset: videoAsset(4) },
+    { assetId: 'b', asset: videoAsset(4) },
+  ],
+  dropTracks, occupied, 'v1', 4, 30);
+check('a bumped sequence keeps its whole length on one lane',
+  [...new Set(sticky.clips.map((c) => c.trackId))], ['v2']);
+check('and stays end to end', sticky.clips.map((c) => c.timelineStart), [4, 8]);
+
+check('a locked lane is not written to', overLocked.clips[0].trackId, 'v2');
+check('though the drop still happens where it was aimed',
+  overLocked.clips[0].timelineStart, 6);
+
+check('a drop before zero is clamped, not negative',
+  buildDropClips([{ assetId: 'a', asset: videoAsset(4) }], dropTracks, [], 'v1', -3, 30)
+    .clips[0].timelineStart, 0);
+check('and lands on the frame grid like every other edit',
+  buildDropClips([{ assetId: 'a', asset: videoAsset(4) }], dropTracks, [], 'v1', 1.017, 30)
+    .clips[0].timelineStart, 31 / 30);
 
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);

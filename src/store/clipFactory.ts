@@ -293,3 +293,112 @@ export function buildRecordingClips(
     selectedClipId: created[0]?.id ?? '',
   };
 }
+
+export interface DropItem {
+  assetId: string;
+  asset: MediaAsset;
+}
+
+/** Lanes of one kind, base lane first — the order every placement here searches in. */
+function lanesFromBase(tracks: Track[], kind: TrackKind): Track[] {
+  return kind === 'video' ? [...videoTracks(tracks)].reverse() : audioTracks(tracks);
+}
+
+/**
+ * Lays files dropped from the desktop onto the lane and the time they were dropped on.
+ *
+ * What separates this from an import is that the position is not the app's to choose. An
+ * import may look for room, and `placeOnBaseVideoLane` will happily append after the last
+ * clip — reasonable when nobody said where. Here somebody did, with a pointer, so the time
+ * is not negotiable: a clip that quietly slid down its track would be wrong in the one
+ * dimension the user was specific about.
+ *
+ * The lane is negotiable, and for exactly two reasons — it holds the other kind of media,
+ * or something is already sitting there. Both are answered the way `buildRecordingClips`
+ * answers them: keep the time, take the next lane, make one if there is no free lane.
+ *
+ * Several files at once lay out as a sequence from the drop point, but one sequence *per
+ * kind*: dropping a video and a music bed together starts both at the pointer, rather than
+ * queueing the music behind the picture.
+ */
+export function buildDropClips(
+  items: DropItem[],
+  tracks: Track[],
+  existingClips: Clip[],
+  trackId: string,
+  start: number,
+  fps: number,
+): ClipPlacementResult {
+  let nextTracks = tracks;
+  const created: Clip[] = [];
+  const at = quantizeToFrame(Math.max(0, start), fps);
+  const cursor: Record<TrackKind, number> = { video: at, audio: at };
+  // A sequence stays on one lane. If the first file had to give way to something already on
+  // the pointer's lane, the rest follow it rather than scattering back the moment the
+  // original lane happens to be free again.
+  const lane: Record<TrackKind, string> = { video: trackId, audio: trackId };
+
+  for (const item of items) {
+    const { asset, assetId } = item;
+    const kind: TrackKind = asset.type === 'audio' ? 'audio' : 'video';
+    const duration = quantizeToFrame(
+      asset.type === 'image' ? IMAGE_CLIP_DURATION : asset.duration,
+      fps,
+    );
+    const begin = cursor[kind];
+
+    const lanes = lanesFromBase(nextTracks, kind);
+    // The lane under the pointer leads the search, but only when it can hold this kind of
+    // clip at all — an audio file dropped on a video track is a mis-aim, not a request to
+    // put sound on a video lane.
+    const preferred = lanes.findIndex((t) => t.id === lane[kind]);
+    const candidates =
+      preferred >= 0 ? [...lanes.slice(preferred), ...lanes.slice(0, preferred)] : lanes;
+
+    let laneId: string | null = null;
+    for (const lane of candidates) {
+      if (lane.locked) continue;
+      const busy = [...existingClips, ...created].some(
+        (c) =>
+          c.trackId === lane.id &&
+          rangesOverlap(c.timelineStart, clipEnd(c), begin, begin + duration),
+      );
+      if (!busy) {
+        laneId = lane.id;
+        break;
+      }
+    }
+    if (!laneId) {
+      const addition = addTrack(nextTracks, kind);
+      nextTracks = addition.tracks;
+      laneId = addition.trackId;
+    }
+
+    const base = {
+      id: uid('clip'),
+      trackId: laneId,
+      timelineStart: begin,
+      sourceTrimIn: 0,
+      sourceTrimOut: duration,
+    };
+    created.push(
+      asset.type === 'audio'
+        ? { ...base, kind: 'audio', assetId, gain: 1 }
+        : asset.type === 'image'
+          ? { ...base, kind: 'image', assetId }
+          : {
+              ...base,
+              kind: 'video',
+              assetId,
+              hasAudio: asset.hasAudio !== false,
+              audioEnabled: asset.hasAudio !== false,
+              gain: 1,
+              hideVideo: false,
+            },
+    );
+    cursor[kind] = begin + duration;
+    lane[kind] = laneId;
+  }
+
+  return { tracks: nextTracks, clips: created, selectedClipId: created[0]?.id ?? '' };
+}

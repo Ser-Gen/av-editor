@@ -24,7 +24,7 @@ Open the dev server URL. COOP/COEP headers are required for FFmpeg WASM (configu
 
 ## Quick start
 
-1. Import media from the toolbar or **Media Library** (left panel).
+1. Import media from the toolbar or **Media Library** (left panel), or drag files straight from Finder onto a track.
 2. Drag clips along the timeline or between tracks; trim with edge handles.
 3. Add text with templates (lower third, center title, subtitle).
 4. Preview with transport controls; adjust clip and track volume as needed.
@@ -99,6 +99,7 @@ The **Media Library** panel stores all imported media for reuse. Files are refer
 | **+** on a library item | Media Library | Same asset added to timeline at playhead |
 | **×** on a library item | Media Library | Remove from library (disabled while used on timeline) |
 | **Record** | Media Library | Opens the capture panel: screen, microphone, system audio (see below) |
+| Drag files from Finder | Onto the timeline | File → library **and** a clip at the track and time you dropped on |
 
 A video file imports as **one clip** that carries its own audio — it moves, trims, splits and deletes as a single object. Use **Detach audio** in the Inspector to move that audio onto its own audio track when you need to slide it against the picture.
 
@@ -232,6 +233,30 @@ Two stages, multiplied together:
 
 Both affect preview (Web Audio `GainNode`) and export (FFmpeg `volume` filter).
 Preview and export mix all audible clips (`amix` in FFmpeg).
+
+### Dropping files onto the timeline
+
+Files dragged in from Finder land on the track and at the time you drop them, rather than
+at the playhead. While you drag, a line shows the exact frame it will land on and the lane
+it will land in; it snaps like a clip drag does, and ⌥ suspends snapping the same way.
+
+What the pointer chooses is the **time**, and that is not negotiated — a clip that quietly
+slid down its track would be wrong in the one dimension you were specific about. The lane
+is negotiated, for the two reasons a lane can be wrong: it is locked or holds the other
+kind of media, or something is already sitting at that time. In both cases the file keeps
+its time and takes the next lane, and a new track is made if no lane is free.
+
+Dropping several files at once lays them end to end from the drop point — but one sequence
+per kind, so a video and a music bed dropped together both start at the pointer instead of
+the music queueing behind the picture. The whole drop is one undo step.
+
+The length of what you are dragging cannot be shown: no browser will name a dragged file
+before you let go of it, so there is no duration to draw a ghost clip from. Folders are
+skipped with a message rather than imported as an unreadable file.
+
+Dropped files are imported like any other — **referenced, not copied**, so they come back
+offline after a reload exactly like files chosen through the picker. See
+[Saving, and what survives a refresh](#saving-and-what-survives-a-refresh).
 
 ### Placement (video, image, text)
 
