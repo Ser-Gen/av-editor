@@ -24,6 +24,7 @@ import type {
 import { MediaRecorderSourceEngine, mediaRecorderExtension, mediaRecorderMime } from './mediaRecorderEngine';
 import type { CaptureSourceKind, RecordingMeta } from './recordingStore';
 import { deleteRecording, writeMeta } from './recordingStore';
+import { OUT_OF_SPACE } from './quota';
 import { acquireSources, browserSources, stopStream, trackFormat } from './sources';
 import type { CaptureStepReporter, SourceProvider, SourceRequest, VideoFormat } from './sources';
 import { captureVideoBitrate } from './bitrate';
@@ -393,6 +394,7 @@ export class CaptureSession {
       };
     });
     this.considerDegrading(sources);
+    this.considerOutOfSpace(sources);
     return {
       elapsed: this.elapsed,
       sources,
@@ -412,6 +414,23 @@ export class CaptureSession {
    * frames has a problem this cannot fix, and halving it again would only make the face
    * stutter for nothing.
    */
+  /**
+   * Running out of disk mid-take.
+   *
+   * The bytes already written are a valid file — that is the whole design of the recording
+   * path — so the right response is to close this source cleanly and keep them, not to throw
+   * the take away. It ends for the same kind of reason an unplugged camera does, and says so
+   * in the same place.
+   */
+  private considerOutOfSpace(sources: SourceStatus[]): void {
+    if (this.stopped) return;
+    for (const status of sources) {
+      if (!status.error?.includes(OUT_OF_SPACE) || status.endedReason) continue;
+      const source = this.sources.find((s) => s.kind === status.kind);
+      if (source) void this.endSource(source, 'ran out of storage space');
+    }
+  }
+
   private considerDegrading(sources: SourceStatus[]): void {
     if (this.degraded || this.stopped) return;
     const camera = this.sources.find((s) => s.kind === 'camera');

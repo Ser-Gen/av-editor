@@ -367,10 +367,12 @@ export function getAssetFilesFromPlan(
   plan: ExportPlan,
   mediaLibrary: Record<string, MediaAsset>,
 ): { path: string; file: File }[] {
-  return plan.inputSpecs.map((spec) => ({
-    path: spec.path,
-    file: mediaLibrary[spec.assetId].file,
-  }));
+  return plan.inputSpecs.flatMap((spec) => {
+    const file = mediaLibrary[spec.assetId]?.file;
+    // See `collectAssetMemPaths`: offline media cannot reach here, because export refuses
+    // to start with any offline clip in the project.
+    return file ? [{ path: spec.path, file }] : [];
+  });
 }
 
 export function buildFfmpegInputArgs(plan: ExportPlan): string[] {

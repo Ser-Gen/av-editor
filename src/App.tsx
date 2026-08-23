@@ -7,8 +7,10 @@ import { Timeline } from './components/Timeline/Timeline';
 import { TextAddModal } from './components/TextAddModal';
 import { useUrlMediaImport } from './hooks/useUrlMediaImport';
 import { useEditorStore } from './store/editorStore';
+// Defined beside the eraser, so "Clear everything" cannot drift out of date with what is
+// actually written.
+import { TIMELINE_HEIGHT_KEY } from './project/projectStore';
 
-const TIMELINE_HEIGHT_KEY = 'editor.timelineHeight';
 const MIN_TIMELINE_HEIGHT = 140;
 
 function initialTimelineHeight(): number {

@@ -7,6 +7,7 @@ import { fetchFile, loadFfmpeg } from './ffmpegLoader';
 import { fileHasAudioStream } from './probeStreams';
 import { WebCodecsUnsupportedError, webCodecsExportSupported } from './webcodecs/support';
 import { clearExportScratch } from './webcodecs/opfs';
+import { exportBlockedBy } from '../utils/offlineMedia';
 import { formatBitrate, resolveExport } from '../utils/exportSettings';
 import type { ResolvedExport } from '../utils/exportSettings';
 import { sameAspect } from '../utils/resolution';
@@ -43,6 +44,10 @@ export async function runExport(options: { forceFfmpeg?: boolean } = {}): Promis
   if (store.clips.length === 0) {
     throw new Error('Add at least one clip before exporting.');
   }
+  // Offline media would encode as a silent black rectangle, and the place that gets
+  // discovered is after the upload. Refusing here is the entire point of tracking it.
+  const offline = exportBlockedBy(store.clips, store.mediaLibrary);
+  if (offline) throw new Error(offline);
 
   const controller = new AbortController();
   activeExport = controller;

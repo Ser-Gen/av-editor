@@ -71,7 +71,19 @@ export const ClipBlock = memo(function ClipBlock({
       onPointerDown={(e) => onPointerDown(e, clip, 'move')}
       title={label}
     >
-      {clip.kind === 'video' && !clip.hideVideo && asset && (
+      {/*
+        Offline: the block keeps its length, label, fades and effect badges — everything the
+        edit consists of — and says what it is waiting for. A filmstrip cannot be derived
+        without the file, and an empty strip would read as a black clip rather than a missing
+        one.
+      */}
+      {asset && !asset.file && (
+        <div className="clip-offline" style={{ height }}>
+          <span className="clip-offline-label">Offline</span>
+        </div>
+      )}
+
+      {clip.kind === 'video' && !clip.hideVideo && asset?.blobUrl && (
         <div className="clip-visual" style={{ height: videoStripHeight }}>
           <ClipFilmstrip
             assetId={asset.id}
@@ -85,14 +97,14 @@ export const ClipBlock = memo(function ClipBlock({
         </div>
       )}
 
-      {clip.kind === 'image' && asset && (
+      {clip.kind === 'image' && asset?.blobUrl && (
         <div
           className="clip-image-fill"
           style={{ height, backgroundImage: `url(${asset.blobUrl})` }}
         />
       )}
 
-      {showsAudioStrip && asset && (
+      {showsAudioStrip && asset?.file && (
         <div
           className="clip-audio"
           style={{ height: audioStripHeight, top: clip.kind === 'video' ? videoStripHeight : 0 }}

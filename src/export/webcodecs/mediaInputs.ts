@@ -12,6 +12,9 @@ export class MediaInputCache {
   private input(asset: MediaAsset): Input {
     let input = this.inputs.get(asset.id);
     if (!input) {
+      // Guarded by `exportBlockedBy` long before this. Failing loudly rather than encoding
+      // a silent black rectangle is the whole reason that guard exists.
+      if (!asset.file) throw new Error(`"${asset.name}" is offline — relink it before exporting.`);
       input = new Input({ formats: ALL_FORMATS, source: new BlobSource(asset.file) });
       this.inputs.set(asset.id, input);
     }

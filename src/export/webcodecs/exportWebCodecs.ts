@@ -100,6 +100,7 @@ export async function exportWithWebCodecs(
       } else if (clip.kind === 'image') {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset || images.has(asset.id)) continue;
+        if (!asset.file) throw new Error(`"${asset.name}" is offline — relink it before exporting.`);
         images.set(asset.id, await createImageBitmap(asset.file));
       }
     }

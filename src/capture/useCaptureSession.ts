@@ -94,7 +94,15 @@ export function useCaptureSession(
 
   const refreshOrphans = useCallback(async () => {
     const found = await findOrphans().catch(() => [] as OrphanRecording[]);
-    setOrphans(found.filter((o) => !consumed.current.has(o.meta.id)));
+    // A restored project owns its own recordings. Without this a reload would offer every
+    // recording in the open project back as a crash leftover — `consumed` only remembers
+    // what *this* page load imported, and a reload starts it empty.
+    const owned = new Set(
+      Object.values(useEditorStore.getState().mediaLibrary)
+        .map((a) => a.recordingId)
+        .filter((id): id is string => !!id),
+    );
+    setOrphans(found.filter((o) => !consumed.current.has(o.meta.id) && !owned.has(o.meta.id)));
   }, []);
 
   // Anything left on disk from a previous session — including a tab that was killed.
@@ -264,6 +272,8 @@ export function useCaptureSession(
           sources.push({
             kind: entry.meta.kind,
             file: finished.file,
+            recordingId: finished.meta.id,
+            storedName: finished.meta.readyFile ?? finished.meta.rawFile,
             startOffset: entry.meta.startOffset,
             duration: finished.duration || entry.measuredDuration,
             format: entry.meta.format,
@@ -319,6 +329,8 @@ export function useCaptureSession(
           {
             kind: orphan.meta.kind,
             file: finished.file,
+            recordingId: finished.meta.id,
+            storedName: finished.meta.readyFile ?? finished.meta.rawFile,
             // A recovered file stands alone; there is no session left to align it against.
             startOffset: 0,
             duration: finished.duration,

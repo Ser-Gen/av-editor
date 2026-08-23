@@ -8,6 +8,10 @@ import { inferAssetKind } from '../utils/assetKind';
 import { VideoPoster } from './VideoPoster';
 import { ProcessDialog } from './ProcessDialog';
 import { formatDuration } from '../utils/time';
+import { StorageBar } from './StorageBar';
+import { ProjectFolderButtons } from './ProjectFolderButtons';
+import { pickMediaFiles } from '../project/pickFiles';
+import { formatBytes } from '../utils/storageBudget';
 
 const TYPE_LABEL: Record<AssetType, string> = {
   video: 'Video',
@@ -28,6 +32,10 @@ export function MediaLibrary() {
   const cancelProcess = useEditorStore((s) => s.cancelProcess);
   /** Which asset the preset dialog is open for. */
   const [processTarget, setProcessTarget] = useState<string | null>(null);
+  const relinkFiles = useEditorStore((s) => s.relinkFiles);
+  const relinkAsset = useEditorStore((s) => s.relinkAsset);
+  const readOnly = useEditorStore((s) => s.readOnly);
+  const offlineCount = libraryOrder.filter((id) => mediaLibrary[id] && !mediaLibrary[id].file).length;
   const capture = useCaptureSession();
   const recording = capture.phase === 'recording';
   const busy = capture.phase !== 'idle';
@@ -74,6 +82,36 @@ export function MediaLibrary() {
         />
       </div>
 
+      {/*
+        Relinking is one picker for the whole project rather than one per file: imported
+        media is never copied, so this is the path every reopened project takes, and doing it
+        file by file would make reopening a chore rather than a click.
+      */}
+      {offlineCount > 0 && (
+        <div className="media-library-offline">
+          <span>
+            {offlineCount} file(s) offline — imported media lives on your disk, not in the
+            browser.
+          </span>
+          <button type="button" onClick={() =>
+              void pickMediaFiles(true).then((files) => {
+                if (files.length > 0) void relinkFiles(files);
+              })
+            }>
+            Relink…
+          </button>
+        </div>
+      )}
+
+      {readOnly && (
+        <p className="media-library-notice is-warning">
+          Open in another tab — nothing here is being saved.
+        </p>
+      )}
+
+      <StorageBar />
+      <ProjectFolderButtons />
+
       <p className="hint">Import once, add to timeline many times.</p>
       {showPanel && <RecordPanel capture={capture} />}
       {libraryNotice && <p className="media-library-notice">{libraryNotice}</p>}
@@ -116,10 +154,11 @@ export function MediaLibrary() {
                 setProcessTarget(id);
               }}
             >
-              {asset.type === 'video' && (
+              {!asset.file && <span className="media-library-thumb is-offline" title="Offline" />}
+              {asset.type === 'video' && asset.blobUrl && (
                 <VideoPoster assetId={id} blobUrl={asset.blobUrl} alt={asset.name} />
               )}
-              {asset.type === 'image' && (
+              {asset.type === 'image' && asset.blobUrl && (
                 <img className="media-library-thumb" src={asset.blobUrl} alt={asset.name} />
               )}
               <div className="media-library-item-main">
@@ -130,12 +169,33 @@ export function MediaLibrary() {
                 <span className="media-library-meta">
                   {duration}
                   {asset.derivedFrom && ` · ${asset.derivedFrom.presetLabel}`}
+                  {/*
+                    Only files this app produced are sized here. They are the ones taking up
+                    the quota — imported media is never copied — and deletion never cascades
+                    to them, so without a size the largest reclaimable files are unfindable.
+                  */}
+                  {asset.origin !== 'imported' && asset.file && ` · ${formatBytes(asset.file.size)}`}
+                  {!asset.file && ' · offline'}
                 </span>
               </div>
               <div className="media-library-actions">
+                {!asset.file && (
+                  <button
+                    type="button"
+                    title={`Find ${asset.name} on disk`}
+                    onClick={() =>
+                      void pickMediaFiles(false).then((picked) => {
+                        if (picked[0]) void relinkAsset(id, picked[0].file);
+                      })
+                    }
+                  >
+                    Relink
+                  </button>
+                )}
                 <button
                   type="button"
                   title="Add to timeline at playhead"
+                  disabled={!asset.file}
                   onClick={() => addAssetToTimeline(id)}
                 >
                   +

@@ -15,6 +15,7 @@ import { clipDuration } from '../utils/time';
 import { GLCompositor } from '../render/GLCompositor';
 import { MediaElementPool } from './mediaElements';
 import { drawTextClip } from './textRenderer';
+import { offlineCard } from '../utils/offlineCard';
 
 type StoreSlice = Pick<EditorState, 'clips' | 'mediaLibrary' | 'settings' | 'tracks' | 'trimPreview'>;
 
@@ -76,16 +77,46 @@ export class PlaybackEngine {
     return this.pool.keyFor(clip, state.clips);
   }
 
-  private getVideo(asset: MediaAsset, key: string = asset.id): HTMLVideoElement {
+  private getVideo(asset: MediaAsset, key: string = asset.id): HTMLVideoElement | null {
     return this.pool.video(asset, key);
   }
 
-  private getAudio(asset: MediaAsset, key: string = asset.id): HTMLAudioElement {
+  private getAudio(asset: MediaAsset, key: string = asset.id): HTMLAudioElement | null {
     return this.pool.audio(asset, key);
   }
 
-  private getImage(asset: MediaAsset): HTMLImageElement {
+  private getImage(asset: MediaAsset): HTMLImageElement | null {
     return this.pool.image(asset);
+  }
+
+  /**
+   * A clip whose file is missing, drawn where the file would have been.
+   *
+   * It goes through `withEffects` and `drawSource` like any other visual, so it inherits the
+   * clip's transform, crop, fade and transition untouched. The effect chain still runs over
+   * it, which looks odd for about a second and is correct: what is missing is the media, not
+   * the edit, and pretending otherwise would hide that a graded PiP is still a graded PiP.
+   */
+  private drawOfflineGL(
+    gl: GLCompositor,
+    clip: VisualClip,
+    asset: MediaAsset,
+    t: number,
+    effects: ReturnType<typeof activeEffects>,
+    fade: number,
+    transition: ReturnType<typeof transitionStateAt>,
+    clock: ReturnType<typeof clipClock>,
+    key: string,
+  ): void {
+    const card = offlineCard(asset.name, asset.width ?? 1280, asset.height ?? 720);
+    gl.withEffects(
+      effects,
+      fade,
+      (alpha, flip) =>
+        gl.drawSource(`${key}:offline`, card, card.width, card.height, transformAt(clip, t), alpha, flip),
+      transition.wipe,
+      clock,
+    );
   }
 
   private isActive(clip: Clip, t: number, state: StoreSlice): boolean {
@@ -216,6 +247,10 @@ export class PlaybackEngine {
         if (clip.hideVideo) continue;
         const key = this.elementKey(clip, state);
         const video = this.getVideo(asset, key);
+        if (!video) {
+          this.drawOfflineGL(gl, clip, asset, t, effects, fade, transition, clock, key);
+          continue;
+        }
         if (video.readyState < 2 || video.videoWidth === 0) continue;
         gl.withEffects(
           effects,
@@ -237,6 +272,10 @@ export class PlaybackEngine {
       }
 
       const img = this.getImage(asset);
+      if (!img) {
+        this.drawOfflineGL(gl, clip, asset, t, effects, fade, transition, clock, asset.id);
+        continue;
+      }
       if (!img.complete || img.naturalWidth === 0) continue;
       gl.withEffects(
         effects,
@@ -281,6 +320,11 @@ export class PlaybackEngine {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
         const video = this.getVideo(asset, this.elementKey(clip, state));
+        if (!video) {
+          const card = offlineCard(asset.name, asset.width ?? width, asset.height ?? height);
+          this.drawVisual(ctx, card, card.width, card.height, clip, t, width, height);
+          continue;
+        }
         if (video.readyState < 2 || video.videoWidth === 0) continue;
         this.drawVisual(ctx, video, video.videoWidth, video.videoHeight, clip, t, width, height);
         continue;
@@ -290,6 +334,11 @@ export class PlaybackEngine {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
         const img = this.getImage(asset);
+        if (!img) {
+          const card = offlineCard(asset.name, asset.width ?? width, asset.height ?? height);
+          this.drawVisual(ctx, card, card.width, card.height, clip, t, width, height);
+          continue;
+        }
         if (!img.complete || img.naturalWidth === 0) continue;
         this.drawVisual(ctx, img, img.naturalWidth, img.naturalHeight, clip, t, width, height);
         continue;
@@ -328,6 +377,7 @@ export class PlaybackEngine {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
         const video = this.getVideo(asset, this.elementKey(clip, state));
+        if (!video) continue;
         out.push({ video, at: this.sourceTime(clip, t, state) });
       }
     }
@@ -376,6 +426,7 @@ export class PlaybackEngine {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
         const video = this.getVideo(asset, this.elementKey(clip, state));
+        if (!video) continue;
         const st = this.sourceTime(clip, t, state);
         this.nudgeElement(video, st);
         if (video.paused) void video.play().catch(() => undefined);
@@ -390,10 +441,10 @@ export class PlaybackEngine {
       const asset = state.mediaLibrary[clip.assetId];
       if (!asset) return null;
       const key = this.elementKey(clip, state);
-      return {
-        el: clip.kind === 'video' ? this.getVideo(asset, key) : this.getAudio(asset, key),
-        key,
-      };
+      const el = clip.kind === 'video' ? this.getVideo(asset, key) : this.getAudio(asset, key);
+      // Offline: there is no element, so there is no route and nothing to hear. The picture
+      // still draws its placeholder; silence is the honest counterpart of that.
+      return el ? { el, key } : null;
     }
     return null;
   }
@@ -522,7 +573,7 @@ export class PlaybackEngine {
           const asset = state.mediaLibrary[clip.assetId];
           if (!asset) continue;
           const video = this.getVideo(asset, this.elementKey(clip, state));
-          void video.play().catch(() => undefined);
+          void video?.play().catch(() => undefined);
         }
       }
       this.renderPlayFrame(state, startTime);

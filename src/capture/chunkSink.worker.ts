@@ -6,6 +6,7 @@
  * mid-recording leaves a file containing every byte acknowledged so far. The main thread
  * hands over ArrayBuffers and forgets them, which is what keeps the heap flat.
  */
+import { OUT_OF_SPACE } from './quota';
 
 interface OpenMsg {
   type: 'open';
@@ -91,6 +92,14 @@ self.onmessage = async (event: MessageEvent<Msg>) => {
       self.postMessage({ type: 'closed', bytes: size });
     }
   } catch (e) {
-    self.postMessage({ type: 'error', message: e instanceof Error ? e.message : String(e) });
+    // A quota failure is not like other write failures: the file on disk is intact and
+    // valid, and the only thing to do is stop cleanly and say so. It is named here so the
+    // session can tell the two apart.
+    const quota = e instanceof DOMException && e.name === 'QuotaExceededError';
+    self.postMessage({
+      type: 'error',
+      message: quota ? OUT_OF_SPACE : e instanceof Error ? e.message : String(e),
+      quota,
+    });
   }
 };

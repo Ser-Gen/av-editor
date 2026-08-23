@@ -106,6 +106,55 @@ Status messages (import, URL load, recording, frame capture) appear briefly in t
 
 ---
 
+## Saving, and what survives a refresh
+
+The project saves itself. There is no Save button and no project list — whatever you are
+working on is written to browser storage as you edit, and reopens when you come back.
+
+**What comes back on its own:** the whole timeline — cuts, tracks, effects, keyframes, fades,
+masks, custom shaders, project and export settings — together with every file the app *made*:
+recordings, preset outputs, baked clips, captured frames, and anything fetched from a URL.
+
+**What does not:** the files you imported from your own disk. They are never copied into the
+browser, so a 4 GB import costs nothing and takes no time — but the browser cannot reopen a
+file on its own. Those clips come back **offline**: full length, all their edits intact,
+drawn as a striped placeholder that says what is missing.
+
+| Action | Where | Result |
+|--------|-------|--------|
+| **Relink…** | Media Library, when anything is offline | One picker for the whole project — hand back the files and each finds its own clip |
+| **Relink** | On an offline library item | Find that one file |
+| **Save a copy…** | Media Library | Writes the project *and every file it uses* into a folder you choose |
+| **Open a copy…** | Media Library | Opens a project back out of such a folder, media and all |
+| **Clear everything** | Media Library, beside the storage bar | Deletes the project, all recordings and all produced files. Your own imported files are untouched |
+
+Relinking matches on name, size and modification date, so a whole project usually relinks in
+one interaction. A file matched on name alone is accepted and flagged — it may be a different
+cut of the same thing. **Export refuses to start while any clip is offline**, and names the
+files, because the alternative is discovering a black rectangle after the upload.
+
+Saving a copy to a folder is worth doing on anything you care about. It is a real backup
+outside the browser, it survives *Clear everything*, and it is the answer to eviction —
+browsers may reclaim storage on their own, and Safari does so after seven days without a
+visit. It also makes reopening free: one folder permission covers every file inside it, so a
+project saved to a folder tends to reopen with no relinking at all.
+
+Two tabs cannot edit one project. The second one opens read-only and says so, rather than
+silently overwriting the first.
+
+### Storage
+
+The library shows how much of the browser's storage is used, whether it can be evicted, and
+the size of every file the app produced — those are the ones taking up room, and deleting an
+original never deletes what was made from it.
+
+Before a recording, the Record panel converts the space left into the number that matters:
+`≈ 4.1 GB per hour at this quality · room for about 6 h 40 m`. Under 15 minutes of headroom
+it warns; under 5 it will not start a take. If storage does run out mid-recording, that
+source stops cleanly and says why — the file already on disk stays playable.
+
+---
+
 ## URL import
 
 On page load, media URLs from the query string are fetched into the **Media Library only** (not the timeline). Useful for opening the editor with assets pre-loaded from another app or a bookmark.

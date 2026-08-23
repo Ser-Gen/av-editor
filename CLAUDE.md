@@ -35,6 +35,7 @@ the console.
 
 ```
 src/store/      editorStore.ts (one zustand store, all actions), history.ts, clipFactory.ts
+src/project/    persistence: project file, OPFS stores, autosave, relink, folder bundle
 src/render/     GLCompositor.ts + effects/ (registry, custom shader compiler, presets)
 src/preview/    PlaybackEngine.ts — drives <video>/<audio> elements against the compositor
 src/export/     runExport.ts, webcodecs/ (fast path), buildFilterGraph.ts (FFmpeg fallback)
@@ -82,4 +83,14 @@ sub-frame alignment is why recordings are *placed* rather than imported.
 `check:math` re-parses that file and diffs all of them element-by-element. A "tidied" filter chain
 fails the check run. That is the point.
 
-**Nothing is persisted.** A refresh clears the project.
+**The project persists; imported media does not.** `project.json` in OPFS is `docSnapshot()`
+plus a serializable asset table, autosaved debounced and flushed on `visibilitychange`
+(`beforeunload` cannot await an async write). Files the app *made* — recordings, preset
+outputs, bakes, captured frames — are kept in OPFS, because nobody can be asked for them
+again; recordings are bound to their existing sidecar rather than copied. Files the user
+*imported* are never copied, so every reopened project starts with them **offline**:
+`MediaAsset.file` and `.blobUrl` are optional on purpose, which is what forces each consumer
+to answer for the missing case instead of assuming. Offline is a display state, not an error
+— the timeline lays out from the stored table, the preview draws a placeholder card through
+the ordinary `drawSource` path, and export refuses to start. See
+`docs/persistence-plan.md`.

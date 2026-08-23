@@ -218,10 +218,41 @@ export interface AdjustmentClip extends BaseClip {
 export type Clip = VideoClip | AudioClip | ImageClip | TextClip | AdjustmentClip;
 export type VisualClip = VideoClip | ImageClip | TextClip;
 
+/**
+ * Where an asset's bytes come from, which decides whether they survive a reload.
+ *
+ * `imported` files are the user's own and are never copied — only recognised again.
+ * `derived` and `recorded` files were made by this app and have nowhere else to live, so
+ * they are kept in OPFS. See `docs/persistence-plan.md`.
+ */
+export type AssetOrigin = 'imported' | 'derived' | 'recorded';
+
+/**
+ * Enough of a file to recognise it when the user offers it back.
+ *
+ * Not a path: the File System Access API never gives one, and a `File` from an `<input>`
+ * has no durable identity at all. These three fields are what both APIs do provide.
+ */
+export interface AssetFingerprint {
+  name: string;
+  size: number;
+  lastModified: number;
+}
+
+/**
+ * A file in the library.
+ *
+ * `file` and `blobUrl` are **optional on purpose**: an asset restored from disk has
+ * everything needed to lay the timeline out — duration, dimensions, whether it has sound —
+ * and no bytes at all until it is relinked or read back out of OPFS. That state is called
+ * *offline*, and every consumer has to answer for it rather than assume media is there.
+ */
 export interface MediaAsset {
   id: string;
-  file: File;
-  blobUrl: string;
+  /** Absent while offline. */
+  file?: File;
+  /** Absent while offline. Revoked when the asset leaves the library. */
+  blobUrl?: string;
   type: AssetType;
   name: string;
   duration: number;
@@ -231,7 +262,33 @@ export interface MediaAsset {
   hasAudio?: boolean;
   /** Present when a library preset made this asset out of another one. */
   derivedFrom?: DerivedFrom;
+  origin: AssetOrigin;
+  /** `imported` only: how to match a file the user re-picks back to this asset. */
+  fingerprint?: AssetFingerprint;
+  /** `derived` and `recorded`: the bytes in OPFS. */
+  opfsName?: string;
+  /** `recorded` only: the sidecar in `recordings/` that describes the capture. */
+  recordingId?: string;
 }
+
+/** A `MediaAsset` with the live handles stripped — what actually goes in `project.json`. */
+export type StoredAsset = Omit<MediaAsset, 'file' | 'blobUrl'>;
+
+/**
+ * The saved project.
+ *
+ * `doc` is exactly `docSnapshot()`, so what is undoable and what is saved cannot drift.
+ * The library rides alongside it rather than inside it, mirroring the fact that
+ * `mediaLibrary` is deliberately outside the undo document.
+ */
+export interface ProjectFile {
+  version: 1;
+  savedAt: number;
+  doc: EditorDoc;
+  assets: StoredAsset[];
+}
+
+export const PROJECT_FILE_VERSION = 1;
 
 /**
  * The recipe that produced a processed asset.
@@ -326,4 +383,9 @@ export interface EditorState extends EditorDoc {
   libraryNotice: string | null;
   /** The library preset currently running, if any. */
   processJob: ProcessJob | null;
+  /**
+   * Another tab holds the project. Autosave is off and edits are the user's own risk — the
+   * alternative, two tabs writing one file, loses work silently.
+   */
+  readOnly: boolean;
 }

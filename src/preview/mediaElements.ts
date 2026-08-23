@@ -53,7 +53,12 @@ export class MediaElementPool {
     return this.keys.byClip.get(clip.id) ?? clip.assetId;
   }
 
-  video(asset: MediaAsset, key: string = asset.id): HTMLVideoElement {
+  /**
+   * `null` for an offline asset. There is nothing to decode and nothing to hold an element
+   * open for; the frame draws a placeholder in its place instead.
+   */
+  video(asset: MediaAsset, key: string = asset.id): HTMLVideoElement | null {
+    if (!asset.blobUrl) return null;
     let v = this.videos.get(key);
     if (!v) {
       v = document.createElement('video');
@@ -72,7 +77,8 @@ export class MediaElementPool {
     return v;
   }
 
-  audio(asset: MediaAsset, key: string = asset.id): HTMLAudioElement {
+  audio(asset: MediaAsset, key: string = asset.id): HTMLAudioElement | null {
+    if (!asset.blobUrl) return null;
     let a = this.audios.get(key);
     if (!a) {
       a = document.createElement('audio');
@@ -85,7 +91,8 @@ export class MediaElementPool {
     return a;
   }
 
-  image(asset: MediaAsset): HTMLImageElement {
+  image(asset: MediaAsset): HTMLImageElement | null {
+    if (!asset.blobUrl) return null;
     let img = this.images.get(asset.id);
     if (!img) {
       img = new Image();

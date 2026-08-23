@@ -8,6 +8,8 @@
  * file rather than an anonymous one.
  */
 
+import { dirKeys as opfsDirKeys, opfsAvailable as opfsIsAvailable } from '../project/opfs';
+
 export type CaptureSourceKind = 'screen' | 'camera' | 'mic' | 'system';
 
 export const SOURCE_LABELS: Record<CaptureSourceKind, string> = {
@@ -63,6 +65,16 @@ export interface RecordingMeta {
 export interface RecordedSource {
   kind: CaptureSourceKind;
   file: File;
+  /**
+   * The sidecar this came from, and the name of the file it left in `recordings/`.
+   *
+   * Recordings are the one kind of media the app both makes and keeps: they are already on
+   * disk, so a restored project binds to them rather than copying them. These two fields are
+   * that binding — without them a reloaded project cannot tell its own recordings from
+   * crash leftovers, and would offer them back as orphans.
+   */
+  recordingId: string;
+  storedName: string;
   /** Seconds after the session anchor — preserved on the timeline so sources stay aligned. */
   startOffset: number;
   duration: number;
@@ -83,9 +95,7 @@ export const SOURCE_LANE: Record<CaptureSourceKind, number> = {
 
 const DIR = 'recordings';
 
-export function opfsAvailable(): boolean {
-  return typeof navigator !== 'undefined' && !!navigator.storage?.getDirectory;
-}
+export { dirKeys, opfsAvailable } from '../project/opfs';
 
 export async function recordingsDir(): Promise<FileSystemDirectoryHandle> {
   const root = await navigator.storage.getDirectory();
@@ -103,7 +113,7 @@ export async function writeMeta(meta: RecordingMeta): Promise<void> {
 }
 
 export async function readAllMeta(): Promise<RecordingMeta[]> {
-  if (!opfsAvailable()) return [];
+  if (!opfsIsAvailable()) return [];
   let dir: FileSystemDirectoryHandle;
   try {
     dir = await recordingsDir();
@@ -111,7 +121,7 @@ export async function readAllMeta(): Promise<RecordingMeta[]> {
     return [];
   }
   const out: RecordingMeta[] = [];
-  for await (const name of dirKeys(dir)) {
+  for await (const name of opfsDirKeys(dir)) {
     if (!name.endsWith('.json')) continue;
     try {
       const file = await (await dir.getFileHandle(name)).getFile();
@@ -149,7 +159,3 @@ export async function deleteRecording(meta: RecordingMeta): Promise<void> {
   await removeEntry(metaName(meta.id));
 }
 
-/** `keys()` is present on the handle at runtime but missing from the DOM lib types. */
-export function dirKeys(dir: FileSystemDirectoryHandle): AsyncIterable<string> {
-  return (dir as unknown as { keys(): AsyncIterable<string> }).keys();
-}

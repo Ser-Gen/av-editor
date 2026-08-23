@@ -139,7 +139,7 @@ export function Inspector() {
               Animate placement
             </label>
           )}
-          {hasTransform && clip.transform && asset && (
+          {hasTransform && clip.transform && asset?.blobUrl && (
             <MediaOverlayEditor
               mediaKind={clip.kind === 'video' ? 'video' : 'image'}
               blobUrl={asset.blobUrl}

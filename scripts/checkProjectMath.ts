@@ -43,6 +43,25 @@ import { EFFECTS } from '../src/render/effects/registry';
 import { DEFAULT_EXPORT_SETTINGS as BAKE_EXPORT_DEFAULTS } from '../src/utils/exportSettings';
 import { pictureInPictureTransform, PIP_MARGIN_PX, PIP_WIDTH_FRACTION } from '../src/capture/pip';
 import { captureVideoBitrate, estimatedBytesPerSecond } from '../src/capture/bitrate';
+import {
+  REFUSE_HEADROOM_SECONDS,
+  WARN_HEADROOM_SECONDS,
+  budgetLevel,
+  budgetOf,
+  canStartRecording,
+  formatBytes,
+  formatHeadroom,
+  headroomSeconds,
+} from '../src/utils/storageBudget';
+import {
+  exportBlockedBy,
+  offlineClipIds,
+  planRelink,
+  relinkSummary,
+} from '../src/utils/offlineMedia';
+import { fromProjectFile, toProjectFile } from '../src/project/projectFile';
+import { reachableMedia } from '../src/project/rehydrate';
+import { isCollectable } from '../src/project/mediaStore';
 import { fastestRate, frameRateDecision } from '../src/capture/frameRate';
 import { describeCameras, resolveCameraChoice } from '../src/capture/cameraDevices';
 import { SOURCE_LANE, SOURCE_LABELS } from '../src/capture/recordingStore';
@@ -752,6 +771,200 @@ check('a sound-changing preset warns that the trimmed clip will be left behind',
   /processed picture over unprocessed sound/.test(detachedAudioAdvice(strayPair, true)!), true);
 check('a picture-only preset explains why nothing needs to happen',
   /same audio either way/.test(detachedAudioAdvice(pair, false)!), true);
+
+// --- 22. storage headroom: the number a person can act on ----------------------
+//
+// Bytes free is not the question anyone asks. These assert the conversion into recording
+// time, and both sides of every threshold that conversion feeds.
+
+const GB = 1024 * 1024 * 1024;
+// A 1080p30 screen capture plus one AAC stream, from the project's own bitrate curve.
+const RATE = estimatedBytesPerSecond([{ width: 1920, height: 1080, fps: 30 }], 1);
+
+check('an hour of 1080p30 capture is a few gigabytes',
+  Math.round((RATE * 3600) / GB * 10) / 10, 2.7, 0.15);
+check('free space becomes seconds of recording',
+  headroomSeconds(RATE * 600, RATE), 600);
+// Asserted as a predicate: `check` compares numbers by difference, and Infinity - Infinity
+// is NaN, so the arithmetic path cannot express "unbounded".
+check('nothing being written means the space cannot run out',
+  headroomSeconds(GB, 0) === Infinity, true);
+check('negative free space is clamped, not negative time',
+  headroomSeconds(-GB, RATE), 0);
+
+// The thresholds, from both sides. A minute either way of the boundary must land where the
+// UI says it does, because one of them disables the Record button.
+check('just above the refusal line, recording may start',
+  canStartRecording(RATE * (REFUSE_HEADROOM_SECONDS + 60), RATE), true);
+check('just below it, it may not',
+  canStartRecording(RATE * (REFUSE_HEADROOM_SECONDS - 60), RATE), false);
+check('exactly at the line counts as too little',
+  canStartRecording(RATE * REFUSE_HEADROOM_SECONDS, RATE), false);
+
+const roomy = budgetOf(10 * GB, 100 * GB);
+check('a mostly empty store with no capture planned is fine',
+  budgetLevel(roomy), 'ok');
+check('...and is still fine with twenty minutes of headroom',
+  budgetLevel(roomy, WARN_HEADROOM_SECONDS + 300), 'ok');
+check('fourteen minutes of headroom is a warning',
+  budgetLevel(roomy, WARN_HEADROOM_SECONDS - 60), 'low');
+check('four minutes is critical however much of the quota is free',
+  budgetLevel(roomy, REFUSE_HEADROOM_SECONDS - 60), 'critical');
+check('a nearly full store is low even with nothing being written',
+  budgetLevel(budgetOf(93 * GB, 100 * GB)), 'low');
+check('a 99%-full store is critical on the fraction alone',
+  budgetLevel(budgetOf(99 * GB, 100 * GB)), 'critical');
+check('usage cannot exceed the quota it is measured against',
+  budgetOf(120 * GB, 100 * GB).free, 0);
+
+// Rounded down and hedged: `quota` is a padded estimate and the bitrate is variable, so
+// claiming a precise figure would be a precision neither input has.
+check('hours and minutes', formatHeadroom(6 * 3600 + 40 * 60), 'about 6 h 40 m');
+check('a whole number of hours drops the minutes', formatHeadroom(2 * 3600), 'about 2 h');
+check('under an hour reads in minutes', formatHeadroom(12 * 60 + 59), 'about 12 min');
+check('under a minute is not rounded to zero', formatHeadroom(41), 'under a minute');
+check('no capture planned reads as no limit', formatHeadroom(Infinity), 'plenty of room');
+check('bytes round the way the panel showed them', formatBytes(2.5 * GB), '2.50 GB');
+
+// --- 23. relinking: one picker, many files ------------------------------------
+//
+// Imported media is never copied, so this is the path every reopened project takes. The
+// matching has to be strongest-first: a folder holding two versions of the same name must
+// not have them swapped by iteration order.
+
+const offlineAssets = [
+  { id: 'a1', name: 'holiday.mp4', fingerprint: { name: 'holiday.mp4', size: 1000, lastModified: 10 } },
+  { id: 'a2', name: 'holiday.mp4', fingerprint: { name: 'holiday.mp4', size: 2000, lastModified: 20 } },
+  { id: 'a3', name: 'music.wav', fingerprint: { name: 'music.wav', size: 300, lastModified: 30 } },
+];
+const offered = [
+  { name: 'holiday.mp4', size: 2000, lastModified: 20 },
+  { name: 'holiday.mp4', size: 1000, lastModified: 10 },
+  { name: 'unrelated.mov', size: 77, lastModified: 5 },
+];
+const plan = planRelink(offered, offlineAssets);
+check('two files of the same name find their own assets, not each other',
+  plan.pairs.filter((p) => p.quality === 'exact').map((p) => [p.assetId, p.file.size]),
+  [['a1', 1000], ['a2', 2000]]);
+check('a file nothing wanted is reported rather than forced somewhere',
+  plan.unmatched.map((f) => f.name), ['unrelated.mov']);
+check('and the asset with no file offered is still offline',
+  plan.stillOffline, ['a3']);
+
+// A copy across filesystems loses `lastModified`. Same name, same size is still the file.
+const copied = planRelink([{ name: 'music.wav', size: 300, lastModified: 999 }], [offlineAssets[2]]);
+check('a copied file matches on name and size', copied.pairs[0].quality, 'resized');
+
+// Name alone is accepted, because refusing would strand the user — but it is the only tier
+// that can bind the wrong file, so it is reported as a guess.
+const guessed = planRelink([{ name: 'music.wav', size: 999, lastModified: 1 }], [offlineAssets[2]]);
+check('a differing file of the right name is a guess, not a match',
+  guessed.pairs[0].quality, 'renamed');
+check('and the summary says so in the words the user needs',
+  /may be a different cut/.test(relinkSummary(guessed)), true);
+check('a clean relink does not hedge',
+  /may be a different cut/.test(relinkSummary(plan)), false);
+
+// --- 24. offline media never reaches an encoder -------------------------------
+
+const libOffline = {
+  on: { id: 'on', name: 'here.mp4', type: 'video', duration: 5, origin: 'imported', file: {} },
+  off: { id: 'off', name: 'gone.mp4', type: 'video', duration: 5, origin: 'imported' },
+} as never;
+const clipsFor = (assetId: string) =>
+  [{ id: `c-${assetId}`, kind: 'video', assetId, trackId: 't', timelineStart: 0,
+     sourceTrimIn: 0, sourceTrimOut: 5 }] as never;
+
+check('a project whose media is all present exports',
+  exportBlockedBy(clipsFor('on'), libOffline), null);
+check('one offline clip stops the export and names the file',
+  /gone\.mp4/.test(exportBlockedBy(clipsFor('off'), libOffline) ?? ''), true);
+check('the offline clip is the one identified, not the whole timeline',
+  offlineClipIds(clipsFor('off'), libOffline), ['c-off']);
+
+// --- 25. the project file round-trips ------------------------------------------
+
+const fixtureState = {
+  settings: { width: 1920, height: 1080, fps: 30 },
+  exportSettings: DEFAULT_EXPORT_SETTINGS,
+  tracks: [{ id: 't1', kind: 'video', label: 'V1', height: 64, muted: false, hidden: false, locked: false }],
+  clips: [
+    { id: 'c1', kind: 'video', assetId: 'a1', trackId: 't1', timelineStart: 0,
+      sourceTrimIn: 0, sourceTrimOut: 4, hasAudio: true, audioEnabled: true },
+  ],
+  libraryOrder: ['a1', 'a2'],
+  mediaLibrary: {
+    a1: { id: 'a1', name: 'holiday.mp4', type: 'video', duration: 12, origin: 'imported',
+          fingerprint: { name: 'holiday.mp4', size: 1000, lastModified: 10 },
+          file: {}, blobUrl: 'blob:x' },
+    a2: { id: 'a2', name: 'holiday — Stabilized.mp4', type: 'video', duration: 12,
+          origin: 'derived', opfsName: 'a2.mp4',
+          derivedFrom: { assetId: 'a1', presetId: 'deshake', presetLabel: 'Stabilize' },
+          file: {}, blobUrl: 'blob:y' },
+  },
+} as never;
+
+const written = toProjectFile(fixtureState);
+check('the live handles are not written to disk',
+  JSON.stringify(written).includes('blob:'), false);
+check('the saved document is exactly the undoable one',
+  Object.keys(written.doc).sort(),
+  ['clips', 'exportSettings', 'libraryOrder', 'settings', 'tracks']);
+
+const readBack = fromProjectFile(JSON.parse(JSON.stringify(written)))!;
+check('the document survives the round trip', readBack.doc, written.doc);
+// Key *order* is not part of the format — the reader builds its own canonical order — so
+// the comparison is by content. Anything that changed a value would still fail.
+const sortKeys = (v: unknown): unknown =>
+  Array.isArray(v)
+    ? v.map(sortKeys)
+    : v && typeof v === 'object'
+      ? Object.fromEntries(Object.entries(v as object).sort(([a], [b]) => a.localeCompare(b)).map(([k, x]) => [k, sortKeys(x)]))
+      : v;
+check('so does the asset table', sortKeys(readBack.assets), sortKeys(written.assets));
+check('a clean file needs no repairs', readBack.repairs, []);
+
+// A version this build does not understand is not guessed at — the caller falls back to the
+// rotated copy, which is the whole reason rotation exists.
+check('a future version is refused rather than misread',
+  fromProjectFile({ ...written, version: 99 }), null);
+check('so is a file with no document at all',
+  fromProjectFile({ version: 1, savedAt: 0, assets: [] }), null);
+
+// A clip pointing at an asset the file does not describe would be invisible *and*
+// unrelinkable — it could never be told what it was waiting for.
+const orphaned = fromProjectFile({ ...written, assets: [written.assets[1]] })!;
+check('a clip with no asset entry gets a placeholder rather than vanishing',
+  orphaned.assets.some((a) => a.id === 'a1' && a.name === 'Missing file'), true);
+check('and the repair is reported, not silent', orphaned.repairs.length, 1);
+check('an asset missing from libraryOrder is still shown',
+  fromProjectFile({ ...written, doc: { ...written.doc, libraryOrder: [] } })!.doc.libraryOrder,
+  ['a1', 'a2']);
+
+// Reachability is computed from the asset table alone and never from `derivedFrom`: a bake
+// outlives the original it was made from, so deleting a source must not sweep its bytes.
+check('only produced files are reachable in media/',
+  [...reachableMedia(written.assets)], ['a2.mp4']);
+
+// --- 26. the sweep cannot delete work that is merely unsaved -------------------
+//
+// This one is a regression test, not a precaution. "Not in the project" and "garbage" are
+// only the same thing when the project on disk is current — and it is not current for a bake
+// made seconds ago, or made at all in a tab that could not autosave. Sweeping on
+// reachability alone deleted a bake the user had just made.
+
+const SAVED_AT = 1_000_000;
+const kept = new Set(['a2.mp4']);
+
+check('a referenced file is never collected, however old',
+  isCollectable('a2.mp4', SAVED_AT - 99_999, kept, SAVED_AT), false);
+check('an unreferenced file older than the save is genuinely orphaned',
+  isCollectable('gone.mp4', SAVED_AT - 1, kept, SAVED_AT), true);
+check('one written after the save is unsaved work, not garbage',
+  isCollectable('fresh.mp4', SAVED_AT + 1, kept, SAVED_AT), false);
+check('one written in the same millisecond gets the benefit of the doubt',
+  isCollectable('fresh.mp4', SAVED_AT, kept, SAVED_AT), false);
+
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

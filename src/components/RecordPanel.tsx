@@ -6,13 +6,15 @@ import type { CaptureController } from '../capture/useCaptureSession';
 import type { SourceStatus } from '../capture/CaptureSession';
 import { estimatedBytesPerSecond } from '../capture/bitrate';
 import { formatDuration } from '../utils/time';
-
-function formatBytes(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
-}
+import { useEditorStore } from '../store/editorStore';
+import { useStorageBudget } from '../hooks/useStorageBudget';
+import {
+  canStartRecording,
+  formatBytes,
+  formatHeadroom,
+  headroomSeconds,
+} from '../utils/storageBudget';
+import type { SourceRequest } from '../capture/sources';
 
 /**
  * What a video source is doing, in the two numbers that disagree.
@@ -50,6 +52,24 @@ function CameraPreview({ stream }: { stream: MediaStream }) {
   return <video ref={ref} className="record-camera-preview" muted playsInline />;
 }
 
+/**
+ * What a take *would* write per second, before it starts.
+ *
+ * Nothing has been negotiated yet, so the project's own frame size and rate stand in for the
+ * screen. It is an estimate of an estimate and is worded as one — but it is the only number
+ * available at the moment it can still change someone's mind.
+ */
+function plannedBytesPerSecond(
+  request: SourceRequest,
+  settings: { width: number; height: number; fps: number },
+): number {
+  const video: { width: number; height: number; fps: number }[] = [];
+  if (request.screen) video.push(settings);
+  if (request.camera) video.push(settings);
+  const audio = (request.mic ? 1 : 0) + (request.systemAudio ? 1 : 0);
+  return estimatedBytesPerSecond(video, audio);
+}
+
 /** What this take is on course to write in an hour, from the formats in use right now. */
 function hourlyBytes(sources: SourceStatus[]): number {
   const video = sources
@@ -85,6 +105,22 @@ export function RecordPanel({ capture }: Props) {
   const busy = phase === 'starting' || phase === 'finishing';
   const recording = phase === 'recording';
   const levels = new Map(status?.sources.map((s) => [s.kind, s]) ?? []);
+
+  // Storage, in the unit the question is actually asked in. During a take the rate comes
+  // from the formats really negotiated; before one, from the project's own shape.
+  const settings = useEditorStore((s) => s.settings);
+  const { budget } = useStorageBudget();
+  const measured = status?.sources.some((s) => s.format) ?? false;
+  const bytesPerSecond = measured
+    ? hourlyBytes(status?.sources ?? []) / 3600
+    : plannedBytesPerSecond(request, settings);
+  // The estimate is not refreshed during a take — the library does not change — so the bytes
+  // this take has already written are subtracted to keep the figure honest as it counts down.
+  const freeNow = budget ? Math.max(0, budget.free - (recording ? (status?.bytesTotal ?? 0) : 0)) : 0;
+  const headroom = budget ? headroomSeconds(freeNow, bytesPerSecond) : Infinity;
+  // Refusing is the kinder failure: a take that dies at minute 38 has already cost the
+  // thing it was recording.
+  const noRoom = !!budget && !recording && !canStartRecording(freeNow, bytesPerSecond);
 
   // The camera is held open only while this panel is on screen: elsewhere it would light
   // the indicator and lock the device against other applications for nothing.
@@ -196,11 +232,20 @@ export function RecordPanel({ capture }: Props) {
         <p className="record-warning">{capture.systemAudioNote}</p>
       )}
 
+      {budget && !recording && (
+        <p className={`record-headroom${noRoom ? ' is-blocked' : headroom <= 15 * 60 ? ' is-low' : ''}`}>
+          ≈ {formatBytes(bytesPerSecond * 3600)} per hour at this quality ·{' '}
+          {noRoom
+            ? `only ${formatHeadroom(headroom)} of space left — free some up before recording.`
+            : `room for ${formatHeadroom(headroom)}.`}
+        </p>
+      )}
+
       <div className="record-controls">
         <button
           type="button"
           className={recording ? 'btn-record-active' : 'btn-record'}
-          disabled={busy}
+          disabled={busy || noRoom}
           onClick={() => void (recording ? capture.stop() : capture.start())}
         >
           {recording
@@ -257,7 +302,10 @@ export function RecordPanel({ capture }: Props) {
           {/* From the formats actually negotiated, so 60 fps reads as the extra bytes it is
               rather than as the fixed number a 30 fps assumption would print. */}
           {status.sources.some((s) => s.format) && (
-            <> ≈ {formatBytes(hourlyBytes(status.sources))} per hour at this rate.</>
+            <>
+              {' '}≈ {formatBytes(hourlyBytes(status.sources))} per hour at this rate
+              {budget && <>, room for {formatHeadroom(headroom)}</>}.
+            </>
           )}
         </p>
       )}

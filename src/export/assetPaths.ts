@@ -16,12 +16,18 @@ export function collectAssetMemPaths(
   }
   return [...ids]
     .sort()
-    .map((assetId) => {
+    .flatMap((assetId) => {
       const asset = mediaLibrary[assetId];
-      return {
-        assetId,
-        path: `input_${assetId}.${extFromName(asset.name)}`,
-        file: asset.file,
-      };
+      // An offline asset has no bytes to write into MEMFS. Export refuses to start when any
+      // clip is offline (`exportBlockedBy`), so this is unreachable in practice — and
+      // silently skipping is the only sane thing to do if it ever is reached.
+      if (!asset?.file) return [];
+      return [
+        {
+          assetId,
+          path: `input_${assetId}.${extFromName(asset.name)}`,
+          file: asset.file,
+        },
+      ];
     });
 }

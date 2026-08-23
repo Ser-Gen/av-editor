@@ -22,6 +22,7 @@ import type {
   TransitionType,
   ProcessRequest,
   DerivedFrom,
+  AssetOrigin,
 } from '../types/editor';
 import {
   BAKE_ID,
@@ -78,6 +79,12 @@ import {
 } from '../utils/keyframes';
 import { audioTracks, videoTracks } from '../utils/compositeOrder';
 import { inferAssetKind } from '../utils/assetKind';
+import { fingerprintOf, planRelink, relinkSummary } from '../utils/offlineMedia';
+import { putMedia, dropMedia, collectGarbage } from '../project/mediaStore';
+import { attachFile, reachableMedia, rehydrate } from '../project/rehydrate';
+import { putHandle } from '../project/handleStore';
+import { notifyProducedFile } from '../project/saveSignal';
+import type { LoadedProject } from '../project/projectFile';
 import { uid } from '../utils/id';
 import { probeMediaFile } from '../utils/probeMedia';
 import { clampDimension, clampFps, DEFAULT_SETTINGS, sameAspect } from '../utils/resolution';
@@ -278,6 +285,7 @@ const initialState: EditorState = {
   exportNotice: null,
   libraryNotice: null,
   processJob: null,
+  readOnly: false,
 };
 
 interface EditorActions {
@@ -342,6 +350,16 @@ interface EditorActions {
   importUrlsToLibrary: (urls: string[]) => Promise<void>;
   addAssetToTimeline: (assetId: string) => void;
   removeLibraryItem: (assetId: string) => void;
+  /**
+   * Replaces the whole document with a saved one. Not a `commit`: reopening a project is not
+   * an edit, so it starts a fresh history rather than becoming an entry in the old one.
+   */
+  restoreProject: (loaded: LoadedProject, files?: ReadonlyMap<string, File>) => Promise<void>;
+  /** Hands offline assets their bytes back. Returns what to tell the user. */
+  relinkFiles: (inputs: RelinkInput[]) => Promise<string>;
+  /** Attaches one specific file to one specific asset, for a per-item relink. */
+  relinkAsset: (assetId: string, file: File) => Promise<void>;
+  setReadOnly: (readOnly: boolean) => void;
   /** Imports one capture session and lays its sources out keeping their measured offsets. */
   /**
    * Adds a finished capture session. The notice is anything the user has to be told about
@@ -424,15 +442,55 @@ interface EditorActions {
   clearTrimPreview: () => void;
 }
 
+/**
+ * A file offered back for an offline asset. The handle, where the picker gave one, is kept
+ * so a future open may need no click at all.
+ */
+export interface RelinkInput {
+  file: File;
+  handle?: FileSystemFileHandle;
+}
+
 type Store = EditorState & EditorActions;
+
+/**
+ * What to say after a project comes back. Offline is the ordinary case here, not a failure,
+ * so it is reported as a next step rather than an error.
+ */
+function restoreNotice(loaded: LoadedProject, assets: MediaAsset[]): string {
+  const offline = assets.filter((a) => !a.file).length;
+  const parts: string[] = [];
+  if (loaded.recovered) parts.push('Recovered the previous save.');
+  else parts.push('Project restored.');
+  if (loaded.repairs.length > 0) parts.push(`Repaired on load: ${loaded.repairs.join('; ')}.`);
+  if (offline > 0) {
+    parts.push(
+      `${offline} file(s) are offline — imported media is not copied, so pick them again with Relink.`,
+    );
+  }
+  return parts.join(' ');
+}
+
 
 /** The running preset job, so `cancelProcess` has something to abort. One at a time. */
 let activeProcess: AbortController | null = null;
 
-async function createAssetFromFile(file: File, kind: AssetType): Promise<MediaAsset> {
+/**
+ * A library entry for a file, plus whatever will let it be found again after a reload.
+ *
+ * An imported file records a fingerprint and nothing else — it is the user's own and is
+ * never copied. Anything this app produced is written into OPFS here, because there is
+ * nobody to ask for it later. See `docs/persistence-plan.md`.
+ */
+async function createAssetFromFile(
+  file: File,
+  kind: AssetType,
+  origin: AssetOrigin = 'imported',
+): Promise<MediaAsset> {
   const probe = await probeMediaFile(file, kind);
-  return {
-    id: uid('asset'),
+  const id = uid('asset');
+  const asset: MediaAsset = {
+    id,
     file,
     blobUrl: URL.createObjectURL(file),
     type: kind,
@@ -441,7 +499,11 @@ async function createAssetFromFile(file: File, kind: AssetType): Promise<MediaAs
     width: probe.width,
     height: probe.height,
     hasAudio: probe.hasAudio,
+    origin,
   };
+  if (origin === 'imported') return { ...asset, fingerprint: fingerprintOf(file) };
+  if (origin === 'derived') return { ...asset, opfsName: (await putMedia(id, file)) ?? undefined };
+  return asset;
 }
 
 function assetDurationFor(clip: Clip, mediaLibrary: Record<string, MediaAsset>): number {
@@ -514,7 +576,11 @@ export const useEditorStore = create<Store>((set, get) => {
     derivedFrom: DerivedFrom,
     replace?: { clipId: string; clearEffects?: boolean; followDetachedAudio?: boolean },
   ): Promise<{ asset: MediaAsset; swapped: string | null }> {
-    const created = await createAssetFromFile(new File([produced], name, { type: produced.type }), kind);
+    const created = await createAssetFromFile(
+      new File([produced], name, { type: produced.type }),
+      kind,
+      'derived',
+    );
     const asset: MediaAsset = { ...created, derivedFrom };
 
     set((s) => {
@@ -523,6 +589,21 @@ export const useEditorStore = create<Store>((set, get) => {
       libraryOrder.splice(at < 0 ? libraryOrder.length : at + 1, 0, asset.id);
       return { mediaLibrary: { ...s.mediaLibrary, [asset.id]: asset }, libraryOrder };
     });
+
+    // Written through now rather than on the debounce: this file took minutes to encode and
+    // nobody can be asked to supply it again.
+    notifyProducedFile();
+
+    // Storing it is what makes it survive a reload. If it did not store, the asset works for
+    // this session and vanishes on the next — which the user should hear now, while the
+    // source clip is still there to bake again, not after the reload.
+    if (!asset.opfsName) {
+      set({
+        libraryNotice:
+          `"${name}" was made, but could not be written to browser storage — it will not survive a reload. ` +
+          `Free up space, or use "Save a copy…" to keep it.`,
+      });
+    }
 
     const swapped = replace
       ? get().replaceClipSource(replace.clipId, asset.id, {
@@ -860,7 +941,9 @@ export const useEditorStore = create<Store>((set, get) => {
         try {
           const file = await fetchUrlAsFile(url);
           const kind = inferAssetKind(file.name, file.type);
-          const asset = await createAssetFromFile(file, kind);
+          // Stored like anything else the app made: the user picked a URL, not a file, and
+          // has nothing on disk to offer back if these bytes go missing.
+          const asset = await createAssetFromFile(file, kind, 'derived');
           set((state) => ({
             mediaLibrary: { ...state.mediaLibrary, [asset.id]: asset },
             libraryOrder: state.libraryOrder.includes(asset.id)
@@ -945,13 +1028,20 @@ export const useEditorStore = create<Store>((set, get) => {
       for (const recording of recordings) {
         const visual = recording.kind === 'screen' || recording.kind === 'camera';
         const kind: AssetType = visual ? 'video' : 'audio';
-        const asset = await createAssetFromFile(recording.file, kind);
+        const asset = await createAssetFromFile(recording.file, kind, 'recorded');
         // Prefer the length the capture reported. `probeMediaFile` substitutes a flat 10s
         // whenever a container says `Infinity`, which is exactly the state an unrepaired
         // recording is in — so trusting the probe here would silently truncate a recording
         // on the one path where repair failed.
         const duration = recording.duration > 0 ? recording.duration : asset.duration;
-        const resolved: MediaAsset = { ...asset, duration };
+        const resolved: MediaAsset = {
+          ...asset,
+          duration,
+          // Bound, not copied: the bytes are already in `recordings/`, and duplicating the
+          // largest files in the store to say so would be a poor trade.
+          recordingId: recording.recordingId,
+          opfsName: recording.storedName,
+        };
         set((state) => ({
           mediaLibrary: { ...state.mediaLibrary, [resolved.id]: resolved },
           libraryOrder: state.libraryOrder.includes(resolved.id)
@@ -1022,6 +1112,10 @@ export const useEditorStore = create<Store>((set, get) => {
       const asset = state.mediaLibrary[assetId];
       const preset = findPreset(presetId);
       if (!asset || !preset) return;
+      if (!asset.file) {
+        set({ libraryNotice: `"${asset.name}" is offline. Relink it before running a preset on it.` });
+        return;
+      }
       // Checked here as well as in the dialog: the dialog is one caller, not the contract.
       const refusal = replaceClipId ? replaceRefusal(preset) : null;
       if (refusal) {
@@ -1101,6 +1195,10 @@ export const useEditorStore = create<Store>((set, get) => {
       if (!clip || !('assetId' in clip)) return;
       const asset = state.mediaLibrary[clip.assetId];
       if (!asset) return;
+      if (!asset.file) {
+        set({ libraryNotice: `"${asset.name}" is offline. Relink it before baking this clip.` });
+        return;
+      }
 
       const controller = new AbortController();
       activeProcess = controller;
@@ -1214,9 +1312,22 @@ export const useEditorStore = create<Store>((set, get) => {
     removeLibraryItem: (assetId) => {
       const asset = get().mediaLibrary[assetId];
       if (!asset) return;
-      if (isAssetInUse(assetId, get().clips)) return;
+      if (isAssetInUse(assetId, get().clips)) {
+        set({
+          libraryNotice: `"${asset.name}" is on the timeline. Remove those clips first — deleting it here would take its file with it.`,
+        });
+        return;
+      }
 
-      URL.revokeObjectURL(asset.blobUrl);
+      if (asset.blobUrl) URL.revokeObjectURL(asset.blobUrl);
+      // Bytes this app made have nowhere else to exist, so removing the entry removes them.
+      // Undo does not bring them back — `mediaLibrary` is outside the undo document, and the
+      // confirm in the library says so.
+      // Not in a read-only tab: the deletion is not being saved, so dropping the bytes would
+      // take a file the owning tab still references.
+      if (asset.origin === 'derived' && asset.opfsName && !get().readOnly) {
+        void dropMedia(asset.opfsName);
+      }
       clearWaveformCache(assetId);
       clearVideoThumbnailCache(assetId);
       set((state) => {
@@ -1227,6 +1338,91 @@ export const useEditorStore = create<Store>((set, get) => {
         };
       });
     },
+
+    restoreProject: async (loaded, files) => {
+      const assets = await rehydrate(loaded.assets, files);
+      // Files in `media/` that no restored asset claims belonged to a project that no longer
+      // exists — but only if they predate this save. A file newer than the project cannot be
+      // described by it yet, and sweeping those deletes work that was merely unsaved. The
+      // sweep is also skipped entirely in a read-only tab, which by definition holds a
+      // project that is behind the one on disk.
+      // Skipped for a folder bundle too (`files` given): those assets live in the folder, so
+      // what OPFS holds says nothing about whether they are still wanted.
+      if (!files && !get().readOnly && loaded.savedAt > 0) {
+        void collectGarbage(reachableMedia(loaded.assets), loaded.savedAt);
+      }
+
+      set((state) => {
+        for (const asset of Object.values(state.mediaLibrary)) {
+          if (asset.blobUrl) URL.revokeObjectURL(asset.blobUrl);
+        }
+        const mediaLibrary: Record<string, MediaAsset> = {};
+        for (const asset of assets) mediaLibrary[asset.id] = asset;
+        return {
+          ...loaded.doc,
+          mediaLibrary,
+          // Reopening is not an edit. A fresh history is also the only honest one: the
+          // states those entries described are gone with the page that held them.
+          past: [],
+          future: [],
+          selectedClipIds: [],
+          playhead: 0,
+          isPlaying: false,
+          libraryNotice: restoreNotice(loaded, assets),
+        } as Partial<EditorState>;
+      });
+    },
+
+    relinkFiles: async (inputs) => {
+      const state = get();
+      const offline = state.libraryOrder
+        .map((id) => state.mediaLibrary[id])
+        .filter((a): a is MediaAsset => !!a && !a.file);
+
+      const candidates = inputs.map((input) => ({
+        name: input.file.name,
+        size: input.file.size,
+        lastModified: input.file.lastModified,
+        input,
+      }));
+      const plan = planRelink(candidates, offline);
+
+      const attached: Record<string, MediaAsset> = {};
+      for (const pair of plan.pairs) {
+        const asset = get().mediaLibrary[pair.assetId];
+        if (!asset) continue;
+        const { file, handle } = pair.file.input;
+        attached[asset.id] = { ...attachFile(asset, file), fingerprint: fingerprintOf(file) };
+        // Storing the handle is what can make the *next* open silent, where the browser
+        // remembers the grant. It never makes this one silent, and nothing depends on it.
+        if (handle) void putHandle(asset.id, handle);
+      }
+      if (Object.keys(attached).length > 0) {
+        set((s) => ({ mediaLibrary: { ...s.mediaLibrary, ...attached } }));
+      }
+
+      const message = relinkSummary(plan);
+      set({ libraryNotice: message });
+      return message;
+    },
+
+    relinkAsset: async (assetId, file) => {
+      await get().relinkFiles([{ file }]);
+      const asset = get().mediaLibrary[assetId];
+      // The picker was opened for one specific asset, so an unmatched file is still meant
+      // for it — the name simply changed since. Honour that rather than refuse it.
+      if (asset && !asset.file) {
+        set((s) => ({
+          mediaLibrary: {
+            ...s.mediaLibrary,
+            [assetId]: { ...attachFile(asset, file), fingerprint: fingerprintOf(file) },
+          },
+        }));
+        set({ libraryNotice: `Relinked ${asset.name} to ${file.name}.` });
+      }
+    },
+
+    setReadOnly: (readOnly) => set({ readOnly }),
 
     // ------------------------------------------------------------------ clips
 
