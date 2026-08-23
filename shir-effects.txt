@@ -1,0 +1,151 @@
+const kh = {
+		name: "Edit: Force 9:16 with Black Bars",
+		value: "force-9-16",
+		args: ["-threads", "0", "-vf", "scale=iw*sar:ih,setsar=1,pad='if(gt(iw/ih,9/16),iw,round(ih*9/16/2)*2)':'if(gt(iw/ih,9/16),round(iw*16/9/2)*2,ih)':(ow-iw)/2:(oh-ih)/2:black", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	Jh = {
+		name: "Edit: Force 16:9 with Black Bars",
+		value: "force-16-9",
+		args: ["-threads", "0", "-vf", "scale=iw*sar:ih,setsar=1,pad='if(gt(iw/ih,16/9),iw,round(ih*16/9/2)*2)':'if(gt(iw/ih,16/9),round(iw*9/16/2)*2,ih)':(ow-iw)/2:(oh-ih)/2:black", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	Fh = {
+		name: "Memes: Vertically Squeezed Video",
+		value: "wide-walk",
+		args: ["-threads", "0", "-c:a", "copy", "-vf", "setdar=3/1", "-c:v", "libx264", "-preset", "ultrafast", "output.mp4"]
+	},
+	$h = {
+		name: "Edit: Resize video to 4K (with black bars if needed)",
+		value: "resize-4k",
+		args: ["-threads", "0", "-vf", "scale=iw*sar:ih:flags=lanczos,setsar=1,scale=3840:2160:force_original_aspect_ratio=decrease:flags=lanczos,pad=3840:2160:(ow-iw)/2:(oh-ih)/2:black", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	Wh = {
+		name: "Edit: Resize video to 2K (with black bars if needed)",
+		value: "resize-2k",
+		args: ["-threads", "0", "-vf", "scale=iw*sar:ih:flags=lanczos,setsar=1,scale=2560:1440:force_original_aspect_ratio=decrease:flags=lanczos,pad=2560:1440:(ow-iw)/2:(oh-ih)/2:black", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	Ph = {
+		name: "Edit: Resize video to 1080p (with black bars if needed)",
+		value: "resize-1080p",
+		args: ["-threads", "0", "-vf", "scale=iw*sar:ih:flags=lanczos,setsar=1,scale=1920:1080:force_original_aspect_ratio=decrease:flags=lanczos,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:black", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	Ih = {
+		name: "Edit: Resize video to 720p (with black bars if needed)",
+		value: "resize-720p",
+		args: ["-threads", "0", "-vf", "scale=iw*sar:ih:flags=lanczos,setsar=1,scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos,pad=1280:720:(ow-iw)/2:(oh-ih)/2:black", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	t1 = {
+		name: "Convert video to 60 fps (optic flow, no AI)",
+		value: "convert-60fps",
+		args: ["-threads", "0", "-vf", "minterpolate=fps=60:mi_mode=mci:mc_mode=aobmc:vsbmc=1", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	e1 = {
+		name: "Convert video to 120 fps (optic flow, no AI)",
+		value: "convert-120fps",
+		args: ["-threads", "0", "-vf", "minterpolate=fps=120:mi_mode=mci:mc_mode=aobmc:vsbmc=1", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	l1 = {
+		name: "Effect: Cinematic Grade Video (2.35:1 Letterbox)",
+		value: "cinematic-grade-letterbox",
+		args: ["-threads", "0", "-vf", "eq=contrast=1.1:brightness=0.02:saturation=1.2, colorbalance=rs=.05:bs=-.05,scale=1920:816:force_original_aspect_ratio=decrease,pad=1920:816:(ow-iw)/2:(oh-ih)/2:black,format=yuv420p", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	a1 = {
+		name: "Edit: Reverse Playback Video",
+		value: "reverse-playback",
+		args: ["-threads", "0", "-vf", "reverse", "-af", "areverse", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	n1 = {
+		name: "Restoration: Video Stabilization",
+		value: "stabilize-deshake",
+		args: ["-threads", "0", "-vf", "deshake=rx=16:ry=16:edge=mirror,scale=iw*1.05:-1,crop=iw/1.05:ih/1.05", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	u1 = {
+		name: "Edit: Time-lapse Source Video",
+		value: "time-lapse",
+		args: ["-threads", "0", "-vf", "setpts=0.125*PTS", "-af", "atempo=2.0,atempo=2.0,atempo=2.0", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	i1 = {
+		name: "Effect: Black & White Noir Video",
+		value: "black-white",
+		args: ["-threads", "0", "-vf", "hue=s=0", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	c1 = {
+		name: "Edit: Sharpen Video",
+		value: "sharpen",
+		args: ["-threads", "0", "-vf", "unsharp=5:5:1.0:5:5:0.0", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	s1 = {
+		name: "Restoration: Denoise & Reduce Grain Video",
+		value: "denoise",
+		args: ["-threads", "0", "-vf", "hqdn3d=4:3:6:4", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	f1 = {
+		name: "Restoration: Enhance Brightness & Contrast in the Video",
+		value: "enhance",
+		args: ["-threads", "0", "-vf", "eq=contrast=1.1:brightness=0.02:saturation=1.1", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	o1 = {
+		name: "Effect: Sketch Lines Video (A-ha Take On Me style)",
+		value: "edge-detect",
+		args: ["-threads", "0", "-vf", "edgedetect=low=0.1:high=0.3,negate", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	r1 = {
+		name: "Edit: Rotate 90В° Video",
+		value: "rotate-90",
+		args: ["-threads", "0", "-vf", "transpose=1", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	d1 = {
+		name: "Edit: Elegant Fade Video Transition",
+		value: "fade-in-out-1s",
+		args: ["-threads", "0", "-vf", "fade=t=in:st=0:d=1,fade=t=out:st=20:d=1", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-af", "afade=t=in:st=0:d=1,afade=t=out:st=20:d=1", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	m1 = {
+		name: "Edit: Horizontal Flip Video",
+		value: "horizontal-flip",
+		args: ["-threads", "0", "-vf", "hflip", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+	h1 = {
+		name: "Restoration: Deflicker Video (For Ancient Videos or Timelapses)",
+		value: "deflicker",
+		args: ["-threads", "0", "-vf", "deflicker=size=7:mode=am", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	g1 = {
+		name: "Effect: Pixelate Video",
+		value: "pixelate",
+		args: ["-threads", "0", "-vf", "scale=160:90:force_original_aspect_ratio=decrease:flags=neighbor,scale=iw*12:ih*12:flags=neighbor", "-c:v", "libx264", "-crf", "18", "-preset", "medium", "-c:a", "aac", "-b:a", "192k", "output.mp4"]
+	},
+
+
+
+	const Th = {
+		name: "Compress: The best compression level suitable for most modern content creator use cases",
+		value: "x264-slow",
+		args: ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-crf", "23", "-preset", "slow", "-threads", "0", "-x264-params", "threads=0", "-c:a", "aac", "-b:a", "192k", "-ac", "2", "output.mp4"]
+	},
+	Ah = {
+		name: "Compress: Maximum compression for web landings, with broad browser compatibility",
+		value: "x264-web-saas",
+		args: ["-fflags", "+nofillin", "-r", "60", "-crf", "25", "-preset", "veryslow", "-movflags", "+faststart", "-tune", "film", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "baseline", "-level", "3", "output.mp4"]
+	},
+
+
+
+const Rh = {
+		name: "GIF: Convert video to optimized GIF with good quality and reasonable file size",
+		value: "to-gif",
+		args: ["-threads", "0", "-filter_complex", "[0:v] fps=12,scale=480:-1:flags=lanczos,palettegen=stats_mode=diff [p]; [0:v] fps=12,scale=480:-1:flags=lanczos [v]; [v][p] paletteuse=dither=bayer:bayer_scale=5", "-y", "output.gif"]
+	},
+	qh = {
+		name: "Edit: Audio removed and quality compression applied",
+		value: "mute",
+		args: ["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", "-c:v", "libx264", "-crf", "23", "-preset", "slow", "-threads", "0", "-x264-params", "threads=0", "-an", "output.mp4"]
+	},
+	Bh = {
+		name: "Effect: Psychedelic echo with color trails, like in the 1960s",
+		value: "echo-effect",
+		args: ["-vf", "lagfun=decay=0.98[tmp];[tmp]hue=h=180*sin(t)", "-c:v", "libx264", "-crf", "23", "-preset", "medium", "-movflags", "+faststart", "-pix_fmt", "yuv420p", "-r", "30", "output.mp4"]
+	},
+	Hh = {
+		name: "Memes: Floating Camera Pan вЂ“ Smooth Moving Viewport Effect",
+		value: "moving-window",
+		args: ["-vf", "crop=in_w/2:in_h/2:(in_w-out_w)/2+((in_w-out_w)/2)*sin(t*1.25):(in_h-out_h)/2+((in_h-out_h)/2)*sin(t*1.625)", "-c:v", "libx264", "-crf", "23", "-preset", "medium", "-movflags", "+faststart", "-pix_fmt", "yuv420p", "output.mp4"]
+	},
