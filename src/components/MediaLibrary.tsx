@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useCaptureSession } from '../capture/useCaptureSession';
 import { RecordPanel } from './RecordPanel';
 import { useEditorStore } from '../store/editorStore';
@@ -12,6 +12,18 @@ import { StorageBar } from './StorageBar';
 import { ProjectFolderButtons } from './ProjectFolderButtons';
 import { pickMediaFiles } from '../project/pickFiles';
 import { formatBytes } from '../utils/storageBudget';
+import { PanelTabs } from './PanelTabs';
+import type { PanelTab } from './PanelTabs';
+import { resolveTab } from '../utils/panelLayout';
+import { LIBRARY_TAB_KEY } from '../project/projectStore';
+
+type LibraryTab = 'media' | 'record' | 'storage';
+
+const LIBRARY_TABS: PanelTab<LibraryTab>[] = [
+  { id: 'media', label: 'Media' },
+  { id: 'record', label: 'Record' },
+  { id: 'storage', label: 'Storage' },
+];
 
 const TYPE_LABEL: Record<AssetType, string> = {
   video: 'Video',
@@ -19,7 +31,7 @@ const TYPE_LABEL: Record<AssetType, string> = {
   image: 'Image',
 };
 
-export function MediaLibrary() {
+export function MediaLibrary({ width }: { width: number }) {
   const fileRef = useRef<HTMLInputElement>(null);
   const libraryOrder = useEditorStore((s) => s.libraryOrder);
   const mediaLibrary = useEditorStore((s) => s.mediaLibrary);
@@ -39,10 +51,22 @@ export function MediaLibrary() {
   const capture = useCaptureSession();
   const recording = capture.phase === 'recording';
   const busy = capture.phase !== 'idle';
-  // The panel stays open while a recording or a recovery offer is live, so neither can be
-  // hidden by a stray click.
-  const [panelOpen, setPanelOpen] = useState(false);
-  const showPanel = panelOpen || busy || capture.orphans.length > 0;
+
+  const [tab, setTab] = useState<LibraryTab>(
+    () => (localStorage.getItem(LIBRARY_TAB_KEY) as LibraryTab) ?? 'media',
+  );
+  const active = resolveTab(LIBRARY_TABS.map((t) => t.id), tab) ?? 'media';
+  useEffect(() => {
+    localStorage.setItem(LIBRARY_TAB_KEY, active);
+  }, [active]);
+
+  // A capture in progress, or a crash leftover waiting to be claimed, is the one thing that
+  // must not sit unseen behind a tab. It is pulled forward rather than merely dotted: both
+  // states have a control the user is expected to reach.
+  const wantsRecordTab = busy || capture.orphans.length > 0;
+  useEffect(() => {
+    if (wantsRecordTab) setTab('record');
+  }, [wantsRecordTab]);
 
   const onFiles = async (list: FileList | null) => {
     if (!list || list.length === 0) return;
@@ -57,20 +81,11 @@ export function MediaLibrary() {
   };
 
   return (
-    <aside className="media-library">
+    <aside className="media-library" style={{ width }}>
       <div className="media-library-header">
-        <h3>Media Library</h3>
+        <h3>Library</h3>
         <button type="button" onClick={() => fileRef.current?.click()} disabled={recording || busy}>
           + Import
-        </button>
-        <button
-          type="button"
-          className={recording ? 'btn-record-active' : undefined}
-          aria-expanded={showPanel}
-          title="Record screen, microphone and system audio (works during playback)"
-          onClick={() => setPanelOpen((open) => !open)}
-        >
-          {recording ? 'Recording' : 'Record'}
         </button>
         <input
           ref={fileRef}
@@ -81,6 +96,14 @@ export function MediaLibrary() {
           onChange={(e) => void onFiles(e.target.files)}
         />
       </div>
+
+      <PanelTabs
+        tabs={LIBRARY_TABS.map((t) =>
+          t.id === 'record' && recording ? { ...t, label: 'Recording', marked: true } : t,
+        )}
+        active={active}
+        onSelect={setTab}
+      />
 
       {/*
         Relinking is one picker for the whole project rather than one per file: imported
@@ -103,20 +126,24 @@ export function MediaLibrary() {
         </div>
       )}
 
+      {/* Never tucked behind a tab: it explains why nothing anywhere is being saved. */}
       {readOnly && (
         <p className="media-library-notice is-warning">
           Open in another tab — nothing here is being saved.
         </p>
       )}
-
-      <StorageBar />
-      <ProjectFolderButtons />
-
-      <p className="hint">Import once, add to timeline many times.</p>
-      {showPanel && <RecordPanel capture={capture} />}
       {libraryNotice && <p className="media-library-notice">{libraryNotice}</p>}
 
-      {processJob && (
+      {active === 'storage' && (
+        <>
+          <StorageBar />
+          <ProjectFolderButtons />
+        </>
+      )}
+
+      {active === 'record' && <RecordPanel capture={capture} />}
+
+      {active === 'media' && processJob && (
         <div className="process-running">
           <div className="process-bar">
             <div className="process-bar-fill" style={{ width: `${processJob.progress}%` }} />
@@ -134,6 +161,7 @@ export function MediaLibrary() {
         <ProcessDialog assetId={processTarget} onClose={() => setProcessTarget(null)} />
       )}
 
+      {active === 'media' && (
       <ul className="media-library-list">
         {libraryOrder.length === 0 && (
           <li className="media-library-empty">No media yet</li>
@@ -223,6 +251,11 @@ export function MediaLibrary() {
           );
         })}
       </ul>
+      )}
+
+      {active === 'media' && (
+        <p className="hint">Import once, add to timeline many times.</p>
+      )}
     </aside>
   );
 }

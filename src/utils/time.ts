@@ -22,6 +22,21 @@ export function formatTimecode(seconds: number, fps: number = DEFAULT_FPS): stri
   return `${pad(mins)}:${pad(secs)}:${pad(frames)}`;
 }
 
+/**
+ * A watching clock: `M:SS`, or `H:MM:SS` once there is an hour of it.
+ *
+ * Deliberately not `formatTimecode`: frames are what you edit against, and a frame counter
+ * ticking thirty times a second is exactly the sort of detail the expanded player exists to
+ * get out of the way.
+ */
+export function formatClock(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const secs = total % 60;
+  const mins = Math.floor(total / 60) % 60;
+  const hours = Math.floor(total / 3600);
+  return hours > 0 ? `${hours}:${pad(mins)}:${pad(secs)}` : `${mins}:${pad(secs)}`;
+}
+
 /** Compact duration label for the media library: MM:SS. */
 export function formatDuration(seconds: number): string {
   const s = Math.max(0, Math.round(seconds));

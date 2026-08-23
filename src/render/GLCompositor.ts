@@ -5,7 +5,13 @@ import type {
   OverlayTransform,
   TextClip,
 } from '../types/editor';
-import { clampRect, normalizeOverlayTransform, textFrameForClip } from '../utils/overlayTransform';
+import {
+  clampFrame,
+  clampRect,
+  normalizeOverlayTransform,
+  rotationRadians,
+  textFrameForClip,
+} from '../utils/overlayTransform';
 import { drawTextClip as paintTextClip } from '../preview/textRenderer';
 import type { ResolvedRegion } from './effects/registry';
 import {
@@ -68,6 +74,7 @@ interface ProgramEntry {
   uDest: WebGLUniformLocation | null;
   uSrc: WebGLUniformLocation | null;
   uResolution: WebGLUniformLocation | null;
+  uRotate: WebGLUniformLocation | null;
   uAlpha: WebGLUniformLocation | null;
   uTexel: WebGLUniformLocation | null;
   uPass: WebGLUniformLocation | null;
@@ -977,6 +984,7 @@ export class GLCompositor {
 
     let dest: NormalizedRect;
     let src: NormalizedRect;
+    let rotate = 0;
 
     if (!transform) {
       const scale = Math.min(this.width / sourceWidth, this.height / sourceHeight);
@@ -987,7 +995,10 @@ export class GLCompositor {
     } else {
       const t = normalizeOverlayTransform(transform);
       const crop = clampRect(t.crop);
-      const frame = clampRect(t.frame);
+      // Signed on purpose: a frame hung off the edge draws a quad that starts outside the
+      // viewport, and the rasterizer discards what falls off.
+      const frame = clampFrame(t.frame);
+      rotate = rotationRadians(t);
       src = crop;
       dest = {
         x: frame.x * this.width,
@@ -997,7 +1008,21 @@ export class GLCompositor {
       };
     }
 
-    this.drawQuad(entry.texture, dest, mirrorRect(src, flip), alpha);
+    this.drawPlaced(entry.texture, dest, mirrorRect(src, flip), alpha, rotate);
+  }
+
+  /**
+   * A plain blit of a placed picture. Only the trailing rotation separates it from the
+   * default `drawQuad` call, and naming it beats a run of `undefined` arguments.
+   */
+  private drawPlaced(
+    texture: WebGLTexture,
+    dest: NormalizedRect,
+    src: NormalizedRect,
+    alpha: number,
+    rotate: number,
+  ): void {
+    this.drawQuad(texture, dest, src, alpha, this.blit, undefined, 0, undefined, undefined, rotate);
   }
 
   /**
@@ -1074,6 +1099,8 @@ export class GLCompositor {
     region?: ResolvedRegion,
     /** Destination size, when it is not the frame — a custom effect's scaled buffers. */
     size?: { width: number; height: number },
+    /** Clockwise radians about the destination's centre. */
+    rotate = 0,
   ): void {
     const gl = this.gl;
     if (!gl || !entry) return;
@@ -1086,6 +1113,9 @@ export class GLCompositor {
     const dw = size?.width ?? this.width;
     const dh = size?.height ?? this.height;
     gl.uniform2f(entry.uResolution, dw, dh);
+    // Set on every draw, never conditionally: the uniform belongs to the program and would
+    // otherwise keep the last rotated draw's angle and turn the next, unrelated pass with it.
+    if (entry.uRotate) gl.uniform1f(entry.uRotate, rotate);
     if (entry.uAlpha) gl.uniform1f(entry.uAlpha, alpha);
     if (entry.uTexel) gl.uniform2f(entry.uTexel, 1 / dw, 1 / dh);
     if (entry.uPass) gl.uniform1f(entry.uPass, pass);
@@ -1228,6 +1258,7 @@ function buildProgram(gl: WebGL2RenderingContext, fragSource: string): ProgramEn
     uDest: gl.getUniformLocation(program, 'uDest'),
     uSrc: gl.getUniformLocation(program, 'uSrc'),
     uResolution: gl.getUniformLocation(program, 'uResolution'),
+    uRotate: gl.getUniformLocation(program, 'uRotate'),
     uAlpha: gl.getUniformLocation(program, 'uAlpha'),
     uTexel: gl.getUniformLocation(program, 'uTexel'),
     uPass: gl.getUniformLocation(program, 'uPass'),

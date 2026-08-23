@@ -33,7 +33,7 @@ import type {
 } from '../types/editor';
 import { REGION_CHANNELS, REGION_MODE } from '../render/effects/registry';
 import { evaluateChannel } from './keyframes';
-import { clampRect } from './overlayTransform';
+import { clampFrame, clampRect } from './overlayTransform';
 
 export interface CanvasSize {
   width: number;
@@ -89,10 +89,21 @@ function axisMaps(rect: NormalizedRect, from: CanvasSize, to: CanvasSize): [Axis
   ];
 }
 
-/** Re-anchor a canvas-relative rect onto a differently shaped canvas. */
-export function refitRect(rect: NormalizedRect, from: CanvasSize, to: CanvasSize): NormalizedRect {
+/**
+ * Re-anchor a canvas-relative rect onto a differently shaped canvas.
+ *
+ * The clamp is a parameter because the two kinds of rect that come through here disagree
+ * about the canvas edge: a text box is laid out inside it, an overlay's frame may hang off
+ * it. Reshaping a project should not quietly haul a deliberately half-off PiP back into shot.
+ */
+export function refitRect(
+  rect: NormalizedRect,
+  from: CanvasSize,
+  to: CanvasSize,
+  clamp: (r: NormalizedRect) => NormalizedRect = clampRect,
+): NormalizedRect {
   const [mx, my] = axisMaps(rect, from, to);
-  return clampRect({
+  return clamp({
     x: mapPos(mx, rect.x, rect.w),
     y: mapPos(my, rect.y, rect.h),
     w: mapSize(mx, rect.w),
@@ -124,7 +135,7 @@ export function contentRect(
   transform: OverlayTransform | undefined,
   asset: MediaAsset | undefined,
 ): NormalizedRect {
-  if (transform) return clampRect(transform.frame);
+  if (transform) return clampFrame(transform.frame);
   const sw = asset?.width;
   const sh = asset?.height;
   if (!sw || !sh) return { x: 0, y: 0, w: 1, h: 1 };
@@ -208,7 +219,7 @@ export function reframeClips(
     let updated = clip;
 
     if ('transform' in clip && clip.transform) {
-      const frame = refitRect(clip.transform.frame, from, to);
+      const frame = refitRect(clip.transform.frame, from, to, clampFrame);
       const [mx, my] = axisMaps(clip.transform.frame, from, to);
       let transformKeyframes = clip.transformKeyframes;
       if (transformKeyframes) {
@@ -242,7 +253,9 @@ export function reframeClips(
       // two members that have a transform ever reach this branch.
       updated = {
         ...updated,
-        transform: { crop: clip.transform.crop, frame },
+        // Rotation is an angle, so reshaping the canvas means nothing to it — but it has to
+        // be carried across explicitly, or a reframe would quietly straighten every clip.
+        transform: { crop: clip.transform.crop, frame, ...(clip.transform.rotate === undefined ? {} : { rotate: clip.transform.rotate }) },
         transformKeyframes,
       } as Clip;
       changed = true;

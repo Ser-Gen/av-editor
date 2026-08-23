@@ -166,6 +166,15 @@ export interface OverlayTransform {
   crop: NormalizedRect;
   /** Placement on the composition canvas. */
   frame: NormalizedRect;
+  /**
+   * Clockwise rotation of the placed picture in **degrees**, about the frame's own centre.
+   * Absent means none. Degrees rather than radians because this is what the field shows and
+   * what the project file stores; every renderer converts at its own boundary.
+   *
+   * Not wrapped to a single turn: an animated channel going 0 → 720 is two spins, and
+   * wrapping would silently make it none.
+   */
+  rotate?: number;
 }
 
 /**
@@ -370,6 +379,13 @@ export interface EditorState extends EditorDoc {
   viewportHeight: number;
   followPlayhead: boolean;
   snapEnabled: boolean;
+  /**
+   * Monitoring loudness for the preview, 0..1, and whether it is muted. Neither is part of
+   * the project: turning the speakers down while you work must not turn the export down too,
+   * so this never reaches `docSnapshot` and never reaches an encoder.
+   */
+  previewVolume: number;
+  previewMuted: boolean;
   /** Timeline position of the engaged snap target, for the indicator line. */
   snapIndicator: number | null;
   ffmpegStatus: 'idle' | 'loading' | 'ready' | 'error';

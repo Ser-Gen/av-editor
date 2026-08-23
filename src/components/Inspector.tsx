@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
 import { clipDuration, formatTimecode } from '../utils/time';
 import type { OverlayTransform, TextTemplate, TransitionType } from '../types/editor';
@@ -7,15 +7,27 @@ import {
   normalizeOverlayTransform,
   textFrameForClip,
 } from '../utils/overlayTransform';
-import { TRANSFORM_CHANNELS, maxFade, transformAt } from '../utils/clipRender';
+import { TRANSFORM_CHANNELS, maxFade, sourceTimeAt, transformAt } from '../utils/clipRender';
 import { TRANSITION_LABELS, incomingTransition } from '../utils/transitions';
 import { EffectStack } from './EffectStack';
 import { ProcessDialog } from './ProcessDialog';
 import { BakeDialog } from './BakeDialog';
 import { MediaOverlayEditor } from './MediaOverlayEditor';
 import { TextPlacementEditor } from './TextPlacementEditor';
+import { PanelTabs } from './PanelTabs';
+import type { PanelTab } from './PanelTabs';
+import { resolveTab } from '../utils/panelLayout';
+import { INSPECTOR_TAB_KEY } from '../project/projectStore';
 
-export function Inspector() {
+type InspectorTab = 'clip' | 'placement' | 'effects';
+
+const TAB_LABEL: Record<InspectorTab, string> = {
+  clip: 'Clip',
+  placement: 'Placement',
+  effects: 'Effects',
+};
+
+export function Inspector({ width }: { width: number }) {
   const selectedClipIds = useEditorStore((s) => s.selectedClipIds);
   const clips = useEditorStore((s) => s.clips);
   const tracks = useEditorStore((s) => s.tracks);
@@ -33,10 +45,19 @@ export function Inspector() {
   const processJob = useEditorStore((s) => s.processJob);
   const [processOpen, setProcessOpen] = useState(false);
   const [bakeOpen, setBakeOpen] = useState(false);
+  const [wantedTab, setWantedTab] = useState<InspectorTab>(
+    () => (localStorage.getItem(INSPECTOR_TAB_KEY) as InspectorTab) ?? 'clip',
+  );
+  // The *wanted* tab is remembered, not the resolved one: selecting an audio clip falls back
+  // to Clip for as long as it is selected, and selecting a video clip again returns to
+  // Placement rather than making you find it a second time.
+  useEffect(() => {
+    localStorage.setItem(INSPECTOR_TAB_KEY, wantedTab);
+  }, [wantedTab]);
 
   if (selectedClipIds.length > 1) {
     return (
-      <aside className="inspector">
+      <aside className="inspector" style={{ width }}>
         <h3>Inspector</h3>
         <p className="hint">{selectedClipIds.length} clips selected.</p>
         <p className="hint">
@@ -50,7 +71,7 @@ export function Inspector() {
 
   if (!clip) {
     return (
-      <aside className="inspector">
+      <aside className="inspector" style={{ width }}>
         <h3>Inspector</h3>
         <p className="hint">Select a clip to edit its properties.</p>
       </aside>
@@ -70,14 +91,28 @@ export function Inspector() {
   const editedTransform =
     clip.kind === 'video' || clip.kind === 'image' ? transformAt(clip, playhead) : undefined;
 
+  // A tab is offered only when this clip has something to put in it. An audio clip has no
+  // placement and no effect chain, so it gets no tab strip at all rather than two dead ends.
+  const canPlace = clip.kind === 'video' || clip.kind === 'image' || clip.kind === 'text';
+  const canEffect = clip.kind !== 'audio' || track?.kind === 'video';
+  const available: InspectorTab[] = [
+    'clip',
+    ...(canPlace ? (['placement'] as const) : []),
+    ...(canEffect ? (['effects'] as const) : []),
+  ];
+  const tab = resolveTab(available, wantedTab) ?? 'clip';
+  const tabs: PanelTab<InspectorTab>[] = available.map((id) => ({ id, label: TAB_LABEL[id] }));
+
   return (
-    <aside className="inspector">
+    <aside className="inspector" style={{ width }}>
       <h3>Inspector</h3>
 
       <div className="inspector-summary">
         <span className="inspector-kind">{clip.kind}</span>
         <span>{track?.label}</span>
       </div>
+
+      <PanelTabs tabs={tabs} active={tab} onSelect={setWantedTab} />
       <dl className="inspector-facts">
         <div>
           <dt>Start</dt>
@@ -97,7 +132,7 @@ export function Inspector() {
         )}
       </dl>
 
-      {(clip.kind === 'video' || clip.kind === 'image') && (
+      {tab === 'placement' && (clip.kind === 'video' || clip.kind === 'image') && (
         <section className="inspector-section">
           <label>Placement</label>
           <label className="checkbox">
@@ -146,12 +181,14 @@ export function Inspector() {
               sourceWidth={asset.width ?? 1920}
               sourceHeight={asset.height ?? 1080}
               transform={editedTransform ?? clip.transform}
+              sourceTime={sourceTimeAt(clip, playhead, 1 / 60)}
               onChange={(transform: OverlayTransform) => updateClipTransform(clip.id, transform)}
             />
           )}
         </section>
       )}
 
+      {tab === 'clip' && (
       <section className="inspector-section">
         <label>Fade</label>
         <div className="slider-row">
@@ -184,8 +221,9 @@ export function Inspector() {
             : 'Or drag the triangles in the clip’s top corners.'}
         </p>
       </section>
+      )}
 
-      {transition && (
+      {tab === 'clip' && transition && (
         <section className="inspector-section">
           <label>Transition in</label>
           <select
@@ -205,7 +243,7 @@ export function Inspector() {
         </section>
       )}
 
-      {clip.kind !== 'audio' && (
+      {tab === 'effects' && clip.kind !== 'audio' && (
         <EffectStack
           target={clip.id}
           effects={clip.effects ?? []}
@@ -214,21 +252,21 @@ export function Inspector() {
         />
       )}
 
-      {track?.kind === 'video' && (
+      {tab === 'effects' && track?.kind === 'video' && (
         <EffectStack
           target={{ kind: 'track', id: track.id }}
           effects={track.effects ?? []}
           label={`Grade on ${track.label}`}
         />
       )}
-      {track?.kind === 'video' && (track.effects?.length ?? 0) > 0 && (
+      {tab === 'effects' && track?.kind === 'video' && (track.effects?.length ?? 0) > 0 && (
         <p className="hint">
           A track grade applies to everything composited up to and including {track.label} —
           tracks above it are unaffected. Hiding the track disables it.
         </p>
       )}
 
-      {clip.kind === 'video' && (
+      {tab === 'clip' && clip.kind === 'video' && (
         <section className="inspector-section">
           <label>Audio</label>
           {clip.hasAudio ? (
@@ -267,7 +305,7 @@ export function Inspector() {
         </section>
       )}
 
-      {clip.kind === 'video' && (
+      {tab === 'clip' && clip.kind === 'video' && (
         <section className="inspector-section">
           <label className="checkbox">
             <input
@@ -280,7 +318,7 @@ export function Inspector() {
         </section>
       )}
 
-      {clip.kind === 'video' && asset && (
+      {tab === 'clip' && clip.kind === 'video' && asset && (
         <section className="inspector-section">
           <label>Process</label>
           <button
@@ -318,7 +356,7 @@ export function Inspector() {
         </section>
       )}
 
-      {clip.kind === 'audio' && (
+      {tab === 'clip' && clip.kind === 'audio' && (
         <section className="inspector-section">
           <label>Volume</label>
           <div className="slider-row">
@@ -335,7 +373,7 @@ export function Inspector() {
         </section>
       )}
 
-      {clip.kind === 'text' && (
+      {tab === 'clip' && clip.kind === 'text' && (
         <section className="inspector-section">
           <label>Text</label>
           <textarea
@@ -352,6 +390,13 @@ export function Inspector() {
             <option value="centerTitle">Center title</option>
             <option value="subtitle">Subtitle</option>
           </select>
+        </section>
+      )}
+
+      {/* A text box is placed on the canvas like any overlay, so it belongs to the same tab. */}
+      {tab === 'placement' && clip.kind === 'text' && (
+        <section className="inspector-section">
+          <label>Text box on screen</label>
           <TextPlacementEditor
             text={clip.text}
             template={clip.template}

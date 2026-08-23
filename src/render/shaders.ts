@@ -17,11 +17,21 @@ in vec2 aPos;              // unit quad, 0..1
 uniform vec4 uDest;        // x, y, w, h in destination pixels (y down)
 uniform vec4 uSrc;         // x, y, w, h in UV space
 uniform vec2 uResolution;  // destination size in pixels
+uniform float uRotate;     // radians, clockwise, about uDest's centre
 
 out vec2 vUv;
 
 void main() {
-  vec2 px = uDest.xy + aPos * uDest.zw;
+  // Rotation happens in *pixels*, not in the unit quad: rotating first and scaling by a
+  // non-square uDest afterwards would shear the picture rather than turn it.
+  vec2 half_ = uDest.zw * 0.5;
+  vec2 offset = (aPos - 0.5) * uDest.zw;
+  float c = cos(uRotate);
+  float s = sin(uRotate);
+  // y grows downward here, so a positive angle turns clockwise on screen — the same
+  // direction Canvas2D's rotate() and FFmpeg's rotate filter take a positive angle.
+  offset = vec2(offset.x * c - offset.y * s, offset.x * s + offset.y * c);
+  vec2 px = uDest.xy + half_ + offset;
   vec2 clip = (px / uResolution) * 2.0 - 1.0;
   // Destination y grows downward; clip space y grows upward.
   gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);

@@ -13,6 +13,7 @@ import {
   clipClock,
   enabledEffects,
   fadeGainAt,
+  sourceTimeAt,
   timelineClock,
   transformAt,
 } from '../../utils/clipRender';
@@ -40,8 +41,7 @@ function isVideoClipWithSource(clip: VisualClip): clip is Extract<VisualClip, { 
 }
 
 function sourceTimeFor(clip: Clip, t: number): number {
-  const raw = clip.sourceTrimIn + (t - clip.timelineStart);
-  return Math.min(clip.sourceTrimOut - 1e-6, Math.max(clip.sourceTrimIn, raw));
+  return sourceTimeAt(clip, t, 1e-6);
 }
 
 export async function exportWithWebCodecs(

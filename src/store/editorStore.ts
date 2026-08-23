@@ -99,6 +99,8 @@ import { DEFAULT_FULL_FRAME } from '../utils/overlayTransform';
 import { clampTrackVolume } from '../utils/trackVolume';
 import { detachedAudio, detachedAudioOutcome } from '../utils/detachedAudio';
 import { overlapIsTransition } from '../utils/transitions';
+import { clampVolume, mutedAfterVolumeChange } from '../utils/transport';
+import { PREVIEW_VOLUME_KEY } from '../project/projectStore';
 import {
   clipDuration,
   clipEnd,
@@ -258,6 +260,16 @@ function playheadInRange(clips: Clip[], playhead: number): number | null {
   return playhead > end ? end : null;
 }
 
+/** Monitoring volume outlives a reload; nothing else about the preview does. */
+function storedVolume(): number {
+  try {
+    const raw = Number(localStorage.getItem(PREVIEW_VOLUME_KEY));
+    return Number.isFinite(raw) ? clampVolume(raw) : 1;
+  } catch {
+    return 1;
+  }
+}
+
 const initialState: EditorState = {
   settings: { ...DEFAULT_SETTINGS },
   exportSettings: { ...DEFAULT_EXPORT_SETTINGS },
@@ -278,6 +290,8 @@ const initialState: EditorState = {
   viewportHeight: 300,
   followPlayhead: true,
   snapEnabled: true,
+  previewVolume: storedVolume(),
+  previewMuted: false,
   snapIndicator: null,
   ffmpegStatus: 'idle',
   ffmpegError: null,
@@ -333,6 +347,8 @@ interface EditorActions {
   zoomToFit: () => void;
   zoomToSelection: () => void;
   setFollowPlayhead: (follow: boolean) => void;
+  setPreviewVolume: (volume: number) => void;
+  togglePreviewMute: () => void;
   toggleSnap: () => void;
   setSnapIndicator: (t: number | null) => void;
 
@@ -874,6 +890,21 @@ export const useEditorStore = create<Store>((set, get) => {
       }),
 
     setFollowPlayhead: (followPlayhead) => set({ followPlayhead }),
+
+    setPreviewVolume: (volume) => {
+      const previewVolume = clampVolume(volume);
+      set((s) => ({
+        previewVolume,
+        previewMuted: mutedAfterVolumeChange(previewVolume, s.previewMuted),
+      }));
+      try {
+        localStorage.setItem(PREVIEW_VOLUME_KEY, String(previewVolume));
+      } catch {
+        // Storage disabled; the volume simply will not be remembered.
+      }
+    },
+
+    togglePreviewMute: () => set((s) => ({ previewMuted: !s.previewMuted })),
     toggleSnap: () => set((s) => ({ snapEnabled: !s.snapEnabled })),
     setSnapIndicator: (snapIndicator) => set({ snapIndicator }),
 
@@ -1558,11 +1589,16 @@ export const useEditorStore = create<Store>((set, get) => {
               if (c.id !== id) return c;
               let next = c;
               for (const channel of TRANSFORM_CHANNELS) {
-                const [group, axis] = channel.split('.') as [
-                  'crop' | 'frame',
-                  'x' | 'y' | 'w' | 'h',
-                ];
-                const value = transform[group][axis];
+                let value: number;
+                if (channel === 'rotate') {
+                  value = transform.rotate ?? 0;
+                } else {
+                  const [group, axis] = channel.split('.') as [
+                    'crop' | 'frame',
+                    'x' | 'y' | 'w' | 'h',
+                  ];
+                  value = transform[group][axis];
+                }
                 next = withChannel(next, { effectId: null, param: channel }, (keys) =>
                   upsertKey(keys, at, value),
                 );

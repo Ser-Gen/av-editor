@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Toolbar } from './components/Toolbar';
 import { MediaLibrary } from './components/MediaLibrary';
 import { PreviewPanel } from './components/PreviewPanel';
@@ -9,25 +9,64 @@ import { useUrlMediaImport } from './hooks/useUrlMediaImport';
 import { useEditorStore } from './store/editorStore';
 // Defined beside the eraser, so "Clear everything" cannot drift out of date with what is
 // actually written.
-import { TIMELINE_HEIGHT_KEY } from './project/projectStore';
+import {
+  INSPECTOR_WIDTH_KEY,
+  LIBRARY_WIDTH_KEY,
+  TIMELINE_HEIGHT_KEY,
+} from './project/projectStore';
+import { PanelSplitter } from './components/PanelSplitter';
+import { clampPanelWidth, clampTimelineHeight } from './utils/panelLayout';
 
-const MIN_TIMELINE_HEIGHT = 140;
+const DEFAULT_LIBRARY_WIDTH = 220;
+const DEFAULT_INSPECTOR_WIDTH = 280;
 
-function initialTimelineHeight(): number {
-  const stored = Number(localStorage.getItem(TIMELINE_HEIGHT_KEY));
-  return Number.isFinite(stored) && stored >= MIN_TIMELINE_HEIGHT ? stored : 280;
+/** A stored size that is missing, corrupt or now impossible falls back to the default. */
+function storedSize(key: string, fallback: number, clamp: (px: number) => number): number {
+  const raw = Number(localStorage.getItem(key));
+  return Number.isFinite(raw) && raw > 0 ? clamp(raw) : fallback;
 }
 
 export default function App() {
   useUrlMediaImport();
   const [textModalOpen, setTextModalOpen] = useState(false);
-  const [timelineHeight, setTimelineHeight] = useState(initialTimelineHeight);
-  const resizeRef = useRef<{ startY: number; startHeight: number } | null>(null);
   const addTextClip = useEditorStore((s) => s.addTextClip);
+
+  // Clamped against the window, not stored blindly: a layout saved on a 32-inch display must
+  // not open on a laptop with both sidebars wider than the screen and no preview between them.
+  const clampWidth = useCallback((px: number) => clampPanelWidth(px, window.innerWidth), []);
+  const clampHeight = useCallback((px: number) => clampTimelineHeight(px, window.innerHeight), []);
+
+  const [timelineHeight, setTimelineHeight] = useState(() =>
+    storedSize(TIMELINE_HEIGHT_KEY, 280, (px) => clampTimelineHeight(px, window.innerHeight)),
+  );
+  const [libraryWidth, setLibraryWidth] = useState(() =>
+    storedSize(LIBRARY_WIDTH_KEY, DEFAULT_LIBRARY_WIDTH, (px) => clampPanelWidth(px, window.innerWidth)),
+  );
+  const [inspectorWidth, setInspectorWidth] = useState(() =>
+    storedSize(INSPECTOR_WIDTH_KEY, DEFAULT_INSPECTOR_WIDTH, (px) => clampPanelWidth(px, window.innerWidth)),
+  );
 
   useEffect(() => {
     localStorage.setItem(TIMELINE_HEIGHT_KEY, String(Math.round(timelineHeight)));
   }, [timelineHeight]);
+  useEffect(() => {
+    localStorage.setItem(LIBRARY_WIDTH_KEY, String(Math.round(libraryWidth)));
+  }, [libraryWidth]);
+  useEffect(() => {
+    localStorage.setItem(INSPECTOR_WIDTH_KEY, String(Math.round(inspectorWidth)));
+  }, [inspectorWidth]);
+
+  // A window that shrinks can make a stored width illegal; re-clamping is cheaper than
+  // discovering it as a preview squeezed to nothing.
+  useEffect(() => {
+    const onResize = () => {
+      setLibraryWidth((w) => clampPanelWidth(w, window.innerWidth));
+      setInspectorWidth((w) => clampPanelWidth(w, window.innerWidth));
+      setTimelineHeight((h) => clampTimelineHeight(h, window.innerHeight));
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   /*
    * A file dropped anywhere the app does not handle would otherwise make the browser leave
@@ -54,25 +93,6 @@ export default function App() {
     return () => {
       window.removeEventListener('dragover', allow);
       window.removeEventListener('drop', stray);
-    };
-  }, []);
-
-  useEffect(() => {
-    const onMove = (e: PointerEvent) => {
-      const drag = resizeRef.current;
-      if (!drag) return;
-      const next = drag.startHeight - (e.clientY - drag.startY);
-      setTimelineHeight(Math.min(window.innerHeight - 220, Math.max(MIN_TIMELINE_HEIGHT, next)));
-    };
-    const onUp = () => {
-      resizeRef.current = null;
-      document.body.classList.remove('is-resizing');
-    };
-    window.addEventListener('pointermove', onMove);
-    window.addEventListener('pointerup', onUp);
-    return () => {
-      window.removeEventListener('pointermove', onMove);
-      window.removeEventListener('pointerup', onUp);
     };
   }, []);
 
@@ -195,19 +215,35 @@ export default function App() {
     <div className="app">
       <Toolbar onAddText={() => setTextModalOpen(true)} />
       <div className="main-row">
-        <MediaLibrary />
+        <MediaLibrary width={libraryWidth} />
+        <PanelSplitter
+          axis="x"
+          size={libraryWidth}
+          clamp={clampWidth}
+          onChange={setLibraryWidth}
+          resetTo={DEFAULT_LIBRARY_WIDTH}
+          title="Drag to resize the library — double-click to reset"
+        />
         <PreviewPanel />
-        <Inspector />
+        <PanelSplitter
+          axis="x"
+          size={inspectorWidth}
+          invert
+          clamp={clampWidth}
+          onChange={setInspectorWidth}
+          resetTo={DEFAULT_INSPECTOR_WIDTH}
+          title="Drag to resize the inspector — double-click to reset"
+        />
+        <Inspector width={inspectorWidth} />
       </div>
 
-      <div
-        className="panel-splitter"
+      <PanelSplitter
+        axis="y"
+        size={timelineHeight}
+        invert
+        clamp={clampHeight}
+        onChange={setTimelineHeight}
         title="Drag to resize the timeline"
-        onPointerDown={(e) => {
-          e.preventDefault();
-          document.body.classList.add('is-resizing');
-          resizeRef.current = { startY: e.clientY, startHeight: timelineHeight };
-        }}
       />
 
       <div className="timeline-slot" style={{ height: timelineHeight }}>

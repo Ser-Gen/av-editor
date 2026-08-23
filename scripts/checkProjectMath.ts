@@ -9,6 +9,40 @@
  *   npm run check:math
  */
 import { refitRect, reframeClips, contentRect, countAnchored } from '../src/utils/reframe';
+import {
+  MIN_ON_SCREEN,
+  clampFrame,
+  clampRect,
+  normalizeOverlayTransform,
+  overlayTransformToPixels,
+  rotatedBounds,
+  rotatedOverlayBox,
+  rotationOf,
+} from '../src/utils/overlayTransform';
+import {
+  frameStageBudget,
+  lockedPartner,
+  lockedResize,
+  stageSize,
+} from '../src/utils/overlayEditorUtils';
+import {
+  clampVolume,
+  fractionAcross,
+  monitorGain,
+  mutedAfterVolumeChange,
+  progressFraction,
+  seekTimeAt,
+} from '../src/utils/transport';
+import { formatClock } from '../src/utils/time';
+import {
+  PANEL_MAX_FRACTION,
+  PANEL_MIN_WIDTH,
+  TIMELINE_MIN_HEIGHT,
+  clampPanelWidth,
+  clampTimelineHeight,
+  resolveTab,
+} from '../src/utils/panelLayout';
+import { TRANSFORM_CHANNELS, transformAt } from '../src/utils/clipRender';
 import { requantizeClips, summarize } from '../src/utils/requantize';
 import { sameAspect, clampDimension, normalizeSettings } from '../src/utils/resolution';
 import {
@@ -1061,6 +1095,215 @@ check('a drop before zero is clamped, not negative',
 check('and lands on the frame grid like every other edit',
   buildDropClips([{ assetId: 'a', asset: videoAsset(4) }], dropTracks, [], 'v1', 1.017, 30)
     .clips[0].timelineStart, 31 / 30);
+
+
+// --- 28. an overlay may hang off the edge -------------------------------------
+//
+// Two rects, two different rules, and they used to share one. A crop indexes into a source
+// file, so outside it there are no pixels to sample; a frame says where the picture lands on
+// the canvas, and hanging off the edge is a placement, not an error. The floor that used to
+// apply to both is why a PiP could not slide out of shot.
+
+const inset = { x: 0.6, y: 0.1, w: 0.3, h: 0.3 };
+
+check('a frame pushed off the left edge stays off it',
+  clampFrame({ ...inset, x: -0.2 }).x, -0.2);
+check('and off the right edge too',
+  clampFrame({ ...inset, x: 0.95 }).x, 0.95);
+check('but never further than a tenth of itself',
+  clampFrame({ ...inset, x: -5 }).x, MIN_ON_SCREEN * 0.3 - 0.3);
+check('at either end', clampFrame({ ...inset, x: 5 }).x, 1 - MIN_ON_SCREEN * 0.3);
+check('so something is always left to drag back',
+  clampFrame({ ...inset, x: -5 }).x + 0.3 > 0, true);
+check('the vertical axis reads the same rule',
+  clampFrame({ ...inset, y: -0.25 }).y, -0.25);
+check('a frame that fits is not touched at all', clampFrame(inset), inset);
+
+// The crop keeps the old rule, which is the half of the split that must not move.
+check('a crop is still confined to its source', clampRect({ ...inset, x: -0.2 }).x, 0);
+check('on the far side as well', clampRect({ ...inset, x: 0.95 }).x, 0.7);
+
+// The FFmpeg fallback: this is where the disagreement would have shown up, because a
+// negative overlay offset used to be floored at 2 while the compositor drew it negative.
+const offLeft = overlayTransformToPixels(
+  { crop: { x: 0, y: 0, w: 1, h: 1 }, frame: { x: -0.1, y: 0.05, w: 0.4, h: 0.4 } },
+  1280, 720, 1920, 1080);
+check('the export places a hung-off frame at a negative offset', offLeft.frameX, -192);
+check('and still sizes it positively', offLeft.frameW, 768);
+check('a full-frame crop starts at the origin, not two pixels in', offLeft.cropX, 0);
+check('and takes the whole source with it', offLeft.cropW, 1280);
+
+// Reshaping the project must not quietly haul it back into shot.
+const hungOff = refitRect({ x: -0.1, y: 0.05, w: 0.4, h: 0.4 },
+  { width: 1920, height: 1080 }, { width: 1080, height: 1920 }, clampFrame);
+check('reframing keeps a deliberately hung-off overlay hung off', hungOff.x < 0, true);
+
+
+// --- 29. rotation, and keeping proportions ------------------------------------
+//
+// Rotation is placement, not an effect: it animates through the same channels, and all three
+// renderers have to turn the picture the same way about the same point. The bounding box is
+// the part only FFmpeg needs — `rotate` draws into a fixed size and would otherwise cut the
+// corners off — and it is also the part that is easy to get subtly wrong.
+
+check('no rotation is the default, however the field is missing', rotationOf(undefined), 0);
+check('and a nonsense value is not a rotation', rotationOf({
+  crop: { x: 0, y: 0, w: 1, h: 1 }, frame: { x: 0, y: 0, w: 1, h: 1 }, rotate: NaN }), 0);
+check('a whole turn is not silently flattened to none — an animation may want two',
+  rotationOf({ crop: { x: 0, y: 0, w: 1, h: 1 }, frame: { x: 0, y: 0, w: 1, h: 1 }, rotate: 720 }), 720);
+
+check('an upright box needs no more room than itself', rotatedBounds(400, 200, 0), { w: 400, h: 200 });
+check('a quarter turn swaps the sides', rotatedBounds(400, 200, 90).w, 200);
+check('both of them', rotatedBounds(400, 200, 90).h, 400);
+check('a half turn is the same box again', rotatedBounds(400, 200, 180).w, 400);
+check('45 degrees needs the diagonal', rotatedBounds(400, 200, 45).w, (400 + 200) * Math.SQRT1_2);
+check('and turning the other way needs exactly as much',
+  rotatedBounds(400, 200, -30).w, rotatedBounds(400, 200, 30).w);
+
+// The overlay offset re-centres the widened box on the frame's centre. Get this wrong and
+// the export puts a rotated PiP somewhere the preview never had it — off by half the growth,
+// down and to the right, in the encoded file only.
+const upright = rotatedOverlayBox(240, 100, 768, 432, 0);
+check('an unrotated layer is placed exactly where the frame is', [upright.x, upright.y], [240, 100]);
+check('at exactly the frame size', [upright.w, upright.h], [768, 432]);
+
+const quarter = rotatedOverlayBox(240, 100, 768, 432, 90);
+check('a quarter turn needs the sides swapped', [quarter.w, quarter.h], [432, 768]);
+check('and the box centre still lands on the frame centre',
+  [quarter.x + quarter.w / 2, quarter.y + quarter.h / 2], [240 + 384, 100 + 216]);
+
+const tilted = rotatedOverlayBox(240, 100, 768, 432, 30);
+check('an awkward angle keeps its centre too',
+  [tilted.x + tilted.w / 2, tilted.y + tilted.h / 2], [240 + 384, 100 + 216]);
+check('the size stays even for the chroma planes', [tilted.w % 2, tilted.h % 2], [0, 0]);
+check('the offset is a whole pixel and needs no rounding at all',
+  [tilted.x % 1, tilted.y % 1], [0, 0]);
+check('a layer turned off the left edge keeps a negative offset',
+  rotatedOverlayBox(-192, 100, 768, 432, 0).x, -192);
+
+// Normalizing keeps rotation but does not invent it, so an untouched project stays byte-identical.
+const flat = normalizeOverlayTransform({ crop: { x: 0, y: 0, w: 1, h: 1 }, frame: { x: 0.1, y: 0.1, w: 0.4, h: 0.4 } });
+check('a transform with no rotation gains no rotate field', 'rotate' in flat, false);
+check('rotate survives normalizing', normalizeOverlayTransform({
+  crop: { x: 0, y: 0, w: 1, h: 1 }, frame: { x: 0.1, y: 0.1, w: 0.4, h: 0.4 }, rotate: 30 }).rotate, 30);
+
+check('rotation is one of the animatable placement channels',
+  TRANSFORM_CHANNELS.includes('rotate'), true);
+
+const spinning = {
+  id: 'c', kind: 'video', trackId: 't', timelineStart: 10, sourceTrimIn: 0, sourceTrimOut: 4,
+  assetId: 'a', hasAudio: false, audioEnabled: false, gain: 1, hideVideo: false,
+  transform: { crop: { x: 0, y: 0, w: 1, h: 1 }, frame: { x: 0.1, y: 0.1, w: 0.4, h: 0.4 }, rotate: 0 },
+  transformKeyframes: { rotate: [{ t: 0, value: 0, interp: 'linear' }, { t: 4, value: 180, interp: 'linear' }] },
+} as unknown as Parameters<typeof transformAt>[0];
+check('an animated rotation reads its start', rotationOf(transformAt(spinning, 10)), 0);
+check('its midpoint', rotationOf(transformAt(spinning, 12)), 90);
+check('and its end', rotationOf(transformAt(spinning, 14)), 180);
+check('while the frame it turns about is left alone',
+  transformAt(spinning, 12)?.frame.x, 0.1);
+
+// Keeping proportions is measured in pixels, not in the normalized numbers: 30% by 30% is
+// square only on a square canvas, and a lock that used those numbers would squash everything
+// it touched on a 16:9 project.
+const canvas16x9 = { w: 1920, h: 1080 };
+const box = { x: 0.1, y: 0.1, w: 0.3, h: 0.3 };
+const grown = lockedResize(box, 0.1, 0, canvas16x9);
+check('a locked resize drives from the axis the pointer moved further along', grown.w, 0.4);
+check('and keeps the on-screen ratio, not the normalized one',
+  (grown.w * canvas16x9.w) / (grown.h * canvas16x9.h), (box.w * canvas16x9.w) / (box.h * canvas16x9.h));
+check('dragging mostly vertically drives from the height instead',
+  lockedResize(box, 0.001, 0.1, canvas16x9).h, 0.4);
+check('typing a width moves the height with it',
+  (lockedPartner(box, 'w', 0.6, canvas16x9).h * canvas16x9.h) / (0.6 * canvas16x9.w),
+  (box.h * canvas16x9.h) / (box.w * canvas16x9.w));
+check('and typing a height moves the width',
+  lockedPartner(box, 'h', 0.6, canvas16x9).w, 0.6);
+
+
+// --- 30. panels: sizes that survive a different window, tabs that survive a selection ---
+//
+// Both of these fail in the same shape: a value stored on one machine, restored on another
+// where it is no longer possible. A width saved on a wide display would open with both
+// sidebars covering the preview; a tab saved on a video clip would be showing nothing at all
+// on an audio one.
+
+check('a dragged width is honoured', clampPanelWidth(340, 1600), 340);
+check('but never thinner than a strip', clampPanelWidth(20, 1600), PANEL_MIN_WIDTH);
+check('and never wide enough to swallow the preview',
+  clampPanelWidth(9000, 1600), Math.round(1600 * PANEL_MAX_FRACTION));
+check('a width from a wider display is brought back in',
+  clampPanelWidth(700, 1200) <= Math.round(1200 * PANEL_MAX_FRACTION), true);
+check('two sidebars at their maximum still leave the preview room',
+  clampPanelWidth(9000, 1600) * 2 < 1600, true);
+check('a corrupt stored width falls back rather than becoming NaN',
+  clampPanelWidth(Number.NaN, 1600), PANEL_MIN_WIDTH);
+check('a tiny window still yields a usable panel', clampPanelWidth(300, 320), PANEL_MIN_WIDTH);
+
+check('the timeline keeps its height', clampTimelineHeight(280, 900), 280);
+check('never collapses', clampTimelineHeight(10, 900), TIMELINE_MIN_HEIGHT);
+check('and leaves the preview somewhere to be', clampTimelineHeight(5000, 900), 900 - 220);
+check('even in a window too short for both', clampTimelineHeight(5000, 200), TIMELINE_MIN_HEIGHT);
+
+check('a remembered tab is honoured when it is still on offer',
+  resolveTab(['clip', 'placement', 'effects'], 'effects'), 'effects');
+check('and falls to the first one when it is not',
+  resolveTab(['clip'], 'placement'), 'clip');
+check('nothing remembered means the first tab', resolveTab(['clip', 'effects'], null), 'clip');
+check('and no tabs at all is null, not a crash', resolveTab([], 'clip'), null);
+
+// The stage is why the panel needed to resize at all: it was a fixed box inside a fixed
+// panel, and the bleed margin pushed it out of both.
+check('the default width is the size this stage always was',
+  stageSize(1920, 1080), { w: 196, h: 110 });
+check('a wider panel makes a bigger stage', stageSize(1920, 1080, 400).w, 400);
+check('a vertical project is capped by height, not width',
+  stageSize(1080, 1920, 400).h, Math.round(400 * (176 / 196)));
+check('and still keeps its shape',
+  stageSize(1080, 1920, 400).w / stageSize(1080, 1920, 400).h > 0.55, true);
+check('a frame stage leaves room for the bleed on both sides',
+  Math.round(frameStageBudget(300) * 1.36) <= 300, true);
+check('so the whole thing fits the panel it was measured against',
+  frameStageBudget(300) * (1 + 0.18 * 2) <= 300, true);
+
+
+// --- 31. the expanded player's transport ---------------------------------------
+//
+// Monitoring is not the mix. Everything here has to hold at the two ends nobody drags to on
+// purpose — an empty project, a bar clicked on its last pixel — because those are where a
+// scrub bar divides by zero and a clock renders a negative.
+
+check('the slider is the gain when nothing is muted', monitorGain(0.4, false), 0.4);
+check('and mute wins over whatever it was', monitorGain(0.4, true), 0);
+check('raising the slider off zero unmutes', mutedAfterVolumeChange(0.3, true), false);
+check('but sliding down to zero is quiet, not muted — the button stays as it was',
+  mutedAfterVolumeChange(0, false), false);
+check('and a muted track dragged to zero stays muted, so it un-mutes to a real volume',
+  mutedAfterVolumeChange(0, true), true);
+check('nonsense reads as full volume rather than silence', clampVolume(Number.NaN), 1);
+check('and the slider cannot leave its rail', [clampVolume(-3), clampVolume(9)], [0, 1]);
+
+check('the bar starts empty on an empty project', progressFraction(0, 0), 0);
+check('and cannot overrun on a stale playhead', progressFraction(99, 10), 1);
+check('halfway is halfway', progressFraction(5, 10), 0.5);
+check('a negative playhead does not draw backwards', progressFraction(-4, 10), 0);
+
+check('clicking the far end seeks to the end, not past it', seekTimeAt(1, 10), 10);
+check('clicking the start seeks to zero', seekTimeAt(0, 10), 0);
+check('an empty project has nowhere to seek to', seekTimeAt(0.5, 0), 0);
+
+const bar = { left: 100, width: 400 };
+check('the middle of the bar is the middle', fractionAcross(300, bar), 0.5);
+check('the last pixel is the end, not slightly past it', fractionAcross(9999, bar), 1);
+check('and dragging off the left edge is the start', fractionAcross(-50, bar), 0);
+check('a bar with no width yet does not divide by zero',
+  fractionAcross(300, { left: 0, width: 0 }), 0);
+
+// The simplified clock: what you want while watching, not while cutting.
+check('under a minute', formatClock(9), '0:09');
+check('minutes and seconds', formatClock(75), '1:15');
+check('an hour brings the hours out', formatClock(3661), '1:01:01');
+check('and it never shows a negative', formatClock(-5), '0:00');
+check('a frame short of a second has not got there yet', formatClock(0.98), '0:00');
 
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);

@@ -1,5 +1,5 @@
 import type { OverlayTransform } from '../types/editor';
-import { clampRect } from '../utils/overlayTransform';
+import { clampFrame } from '../utils/overlayTransform';
 
 /**
  * Where a camera lands when there is a screen recording underneath it.
@@ -73,6 +73,6 @@ export function pictureInPictureTransform(
 
   return {
     crop: { x: 0, y: 0, w: 1, h: 1 },
-    frame: clampRect({ x: 1 - marginX - w, y: 1 - marginY - h, w, h }),
+    frame: clampFrame({ x: 1 - marginX - w, y: 1 - marginY - h, w, h }),
   };
 }

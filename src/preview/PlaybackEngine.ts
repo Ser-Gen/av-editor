@@ -7,6 +7,7 @@ import {
   clipClock,
   enabledEffects,
   fadeGainAt,
+  sourceTimeAt,
   timelineClock,
   transformAt,
 } from '../utils/clipRender';
@@ -68,9 +69,37 @@ export class PlaybackEngine {
     this.onEnded = onEnded;
   }
 
+  /**
+   * Every clip route meets here before the speakers, so monitoring volume is one node rather
+   * than a multiplier smeared through the per-clip envelope. That matters because the clip
+   * gains are recomputed from fades and transitions on every frame: anything folded into them
+   * would be overwritten a sixtieth of a second later, and monitoring is not part of the
+   * project anyway — it must never reach an export.
+   */
+  private masterGain: GainNode | null = null;
+  private monitorGain = 1;
+
   private ensureAudioCtx(): AudioContext {
     if (!this.audioCtx) this.audioCtx = new AudioContext();
     return this.audioCtx;
+  }
+
+  private ensureMaster(): GainNode {
+    const ctx = this.ensureAudioCtx();
+    if (!this.masterGain) {
+      this.masterGain = ctx.createGain();
+      this.masterGain.gain.value = this.monitorGain;
+      this.masterGain.connect(ctx.destination);
+    }
+    return this.masterGain;
+  }
+
+  /** Preview loudness, 0..1. Silent monitoring is still a full-volume export. */
+  setMonitorGain(value: number): void {
+    this.monitorGain = value;
+    // Only touches the node if there is one: setting the volume must not be what starts an
+    // AudioContext, or a stored preference would provoke an autoplay warning on every load.
+    if (this.masterGain) this.masterGain.gain.value = value;
   }
 
   private elementKey(clip: Clip, state: StoreSlice): string {
@@ -130,9 +159,7 @@ export class PlaybackEngine {
     if (state.trimPreview?.clipId === clip.id) {
       return state.trimPreview.sourceTime;
     }
-    const raw = clip.sourceTrimIn + (t - clip.timelineStart);
-    const max = clip.sourceTrimOut - 1 / 60;
-    return Math.min(max, Math.max(clip.sourceTrimIn, raw));
+    return sourceTimeAt(clip, t, 1 / 60);
   }
 
   private seekElement(el: HTMLMediaElement, time: number): Promise<void> {
@@ -504,7 +531,7 @@ export class PlaybackEngine {
         const source = this.getOrCreateMediaSource(routed.key, el);
         const gain = ctx.createGain();
         source.connect(gain);
-        gain.connect(ctx.destination);
+        gain.connect(this.ensureMaster());
         route = {
           clipId: clip.id,
           assetId: clip.assetId,
@@ -514,7 +541,7 @@ export class PlaybackEngine {
         };
         this.clipRoutes.set(clip.id, route);
       } else if (!route.connectedToDest) {
-        route.gain.connect(ctx.destination);
+        route.gain.connect(this.ensureMaster());
         route.connectedToDest = true;
       }
 
@@ -627,6 +654,8 @@ export class PlaybackEngine {
     this.clipRoutes.clear();
     this.mediaSources.clear();
     this.compositor.dispose();
+    this.masterGain?.disconnect();
+    this.masterGain = null;
     void this.audioCtx?.close();
     this.audioCtx = null;
     this.pool.clear();

@@ -210,11 +210,10 @@ body.is-dragging * {
 }
 
 .media-library {
-  width: 220px;
+  /* Width is a prop now — the splitter beside it owns the number. */
   flex-shrink: 0;
   display: flex;
   flex-direction: column;
-  border-right: 1px solid var(--border);
   background: var(--surface);
   min-height: 0;
 }
@@ -597,8 +596,132 @@ body.is-dragging * {
   flex: 1;
   display: flex;
   flex-direction: column;
+  /* The splitters on either side are the divider now, so no border of its own. */
   min-width: 0;
-  border-right: 1px solid var(--border);
+}
+
+/* ------------------------------------------------------------- expanded player */
+
+/*
+ * Fixed over the whole viewport rather than moved anywhere in the tree: the canvas holds a
+ * live WebGL context and a running PlaybackEngine, and re-parenting it would throw both away
+ * to change how big it looks.
+ */
+.preview-area.is-theater {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  background: #000;
+}
+
+.preview-area.is-theater .preview-wrap {
+  padding: 0;
+}
+
+/*
+ * `max-width` alone caps the picture without ever growing it, so a 720p project sat at 1280px
+ * in the middle of a 4K window — capped, not expanded. Filling the box and letting
+ * `object-fit` letterbox is what actually makes the player the size of the viewport.
+ */
+.preview-area.is-theater .preview-wrap canvas {
+  width: 100%;
+  height: 100%;
+  max-width: none;
+  max-height: none;
+  object-fit: contain;
+  box-shadow: none;
+}
+
+/* The editing transport is not what this mode is for. */
+.preview-area.is-theater .transport {
+  display: none;
+}
+
+.theater-controls {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 28px 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  /* A scrim rather than a panel: the picture stays the thing you are looking at. */
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.78), transparent);
+  transition: opacity 220ms ease;
+}
+
+.preview-area.is-theater.is-idle .theater-controls {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* A cursor parked over the picture is as much of an intrusion as the bar is. */
+.preview-area.is-theater.is-idle {
+  cursor: none;
+}
+
+.theater-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.theater-clock {
+  font-variant-numeric: tabular-nums;
+  font-size: 13px;
+  color: #fff;
+}
+
+.theater-clock-total {
+  color: rgba(255, 255, 255, 0.6);
+}
+
+.scrub-bar {
+  padding: 6px 0;
+  cursor: pointer;
+  touch-action: none;
+}
+
+.scrub-track {
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.28);
+  overflow: hidden;
+}
+
+.scrub-bar:hover .scrub-track {
+  height: 6px;
+}
+
+.scrub-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+/* ------------------------------------------------------------------ volume */
+
+.volume-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.volume-mute {
+  padding: 2px 4px;
+  background: none;
+  border: none;
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.volume-slider {
+  width: 84px;
+}
+
+.volume-control.is-compact .volume-slider {
+  width: 72px;
 }
 
 .preview-wrap {
@@ -683,7 +806,6 @@ body.is-dragging * {
 }
 
 .inspector {
-  width: 240px;
   flex-shrink: 0;
   padding: 12px;
   background: var(--surface);
@@ -718,6 +840,21 @@ body.is-dragging * {
   font-size: 11px;
   font-weight: 600;
   color: var(--text-muted);
+}
+
+.overlay-lock {
+  margin: 2px 0 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.overlay-rotate {
+  margin-bottom: 10px;
+}
+
+.overlay-rotate-num {
+  width: 56px;
+  flex: none;
 }
 
 .overlay-editor-canvas {
@@ -908,19 +1045,93 @@ body.is-dragging * {
 /* ------------------------------------------------------------------ layout */
 
 .panel-splitter {
-  height: 6px;
   flex-shrink: 0;
   background: var(--border);
+  /* The hit area is the whole strip; the line is what you see. */
+  touch-action: none;
+}
+
+.panel-splitter--y {
+  height: 6px;
   cursor: row-resize;
+}
+
+.panel-splitter--x {
+  width: 5px;
+  cursor: col-resize;
 }
 
 .panel-splitter:hover {
   background: var(--accent);
 }
 
-body.is-resizing {
+body.is-resizing,
+body.is-resizing * {
   cursor: row-resize;
   user-select: none;
+}
+
+body.is-resizing-col,
+body.is-resizing-col * {
+  cursor: col-resize;
+  user-select: none;
+}
+
+/* ------------------------------------------------------------------ panel tabs */
+
+.panel-tabs {
+  display: flex;
+  gap: 2px;
+  padding: 0 8px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.panel-tab {
+  position: relative;
+  flex: 1;
+  padding: 6px 4px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  border-radius: 0;
+  background: none;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.panel-tab:hover {
+  color: var(--text);
+  background: none;
+}
+
+.panel-tab.is-active {
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.panel-tab-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-left: 4px;
+  border-radius: 50%;
+  background: #e53935;
+  vertical-align: middle;
+}
+
+/* The inspector scrolls, so its tab strip has to stay put rather than scroll away. */
+.inspector .panel-tabs {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  margin: 0 -12px;
+  padding: 0 12px;
+  background: var(--surface);
 }
 
 .timeline-slot {

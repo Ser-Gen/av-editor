@@ -1,10 +1,11 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { NormalizedRect, TextTemplate } from '../types/editor';
 import {
   frameRectHandlePx,
   fromPct,
   HANDLE_RADIUS_PX,
   pct,
+  STAGE_MAX_W,
   stageSize,
   pointerCanvasNorm,
   pointerCanvasPx,
@@ -22,7 +23,17 @@ interface Props {
 
 export function TextPlacementEditor({ text, template, textFrame, onChange }: Props) {
   const settings = useEditorStore((s) => s.settings);
-  const stage = stageSize(settings.width, settings.height);
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [available, setAvailable] = useState(STAGE_MAX_W);
+  useEffect(() => {
+    const el = rootRef.current;
+    if (!el) return;
+    const observer = new ResizeObserver(() => setAvailable(el.clientWidth));
+    observer.observe(el);
+    setAvailable(el.clientWidth);
+    return () => observer.disconnect();
+  }, []);
+  const stage = stageSize(settings.width, settings.height, available);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragRef = useRef<{
     kind: 'move' | 'resize';
@@ -134,7 +145,7 @@ export function TextPlacementEditor({ text, template, textFrame, onChange }: Pro
   );
 
   return (
-    <div className="video-overlay-editor">
+    <div className="video-overlay-editor" ref={rootRef}>
       <p className="overlay-editor-label">Text box on screen</p>
       <canvas
         ref={canvasRef}

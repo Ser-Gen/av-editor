@@ -89,6 +89,21 @@ export function clipClock(clip: Clip, t: number, fps: number): EffectClock {
   return { time, frame: Math.round(time * fps), fps };
 }
 
+/**
+ * Where in the source file a clip is at timeline time `t`.
+ *
+ * The clip clock, shared rather than restated: preview, export and the placement editor all
+ * have to agree about which frame a clip is showing, or the picture someone positions an
+ * overlay against is not the picture that gets encoded.
+ *
+ * `epsilon` is how far to stay clear of the out point — the two engines want different
+ * amounts, because one is seeking a `<video>` element and the other is decoding.
+ */
+export function sourceTimeAt(clip: Clip, t: number, epsilon: number): number {
+  const raw = clip.sourceTrimIn + (t - clip.timelineStart);
+  return Math.min(clip.sourceTrimOut - epsilon, Math.max(clip.sourceTrimIn, raw));
+}
+
 /** A track grade has no clip to belong to, so its clock is the timeline's. */
 export function timelineClock(t: number, fps: number): EffectClock {
   return { time: Math.max(0, t), frame: Math.round(Math.max(0, t) * fps), fps };
@@ -104,7 +119,7 @@ export function isAnimated(clip: Clip): boolean {
   );
 }
 
-/** The eight channel names a placement animation can drive. */
+/** The channel names a placement animation can drive. */
 export const TRANSFORM_CHANNELS = [
   'crop.x',
   'crop.y',
@@ -114,9 +129,12 @@ export const TRANSFORM_CHANNELS = [
   'frame.y',
   'frame.w',
   'frame.h',
+  'rotate',
 ] as const;
 
 function transformField(transform: OverlayTransform, channel: string): number {
+  // `rotate` is the one channel that is not part of a rect, so it has no group to index.
+  if (channel === 'rotate') return transform.rotate ?? 0;
   const [group, axis] = channel.split('.') as ['crop' | 'frame', 'x' | 'y' | 'w' | 'h'];
   return transform[group][axis];
 }
@@ -139,13 +157,19 @@ export function transformAt(
   const next: OverlayTransform = {
     crop: { ...base.crop },
     frame: { ...base.frame },
+    ...(base.rotate === undefined ? {} : { rotate: base.rotate }),
   };
   let animated = false;
   for (const channel of TRANSFORM_CHANNELS) {
     const keys = channels[channel];
     if (!keys || keys.length === 0) continue;
-    const [group, axis] = channel.split('.') as ['crop' | 'frame', 'x' | 'y' | 'w' | 'h'];
-    next[group][axis] = evaluateChannel(keys, rel, transformField(base, channel));
+    const value = evaluateChannel(keys, rel, transformField(base, channel));
+    if (channel === 'rotate') {
+      next.rotate = value;
+    } else {
+      const [group, axis] = channel.split('.') as ['crop' | 'frame', 'x' | 'y' | 'w' | 'h'];
+      next[group][axis] = value;
+    }
     animated = true;
   }
   return animated ? next : base;

@@ -1,5 +1,5 @@
 import type { Clip, EditorState, MediaAsset } from '../types/editor';
-import { overlayTransformToPixels } from '../utils/overlayTransform';
+import { overlayTransformToPixels, rotatedOverlayBox, rotationOf } from '../utils/overlayTransform';
 import { audibleClips, compositeLayers } from '../utils/compositeOrder';
 import { activeEffects, enabledEffects, isAnimated, transformAt } from '../utils/clipRender';
 import { ffmpegChain } from '../render/effects/registry';
@@ -248,13 +248,14 @@ export function buildExportPlan(
       const transition = transitionFilters(clip, state.clips);
       warnings.push(...transition.unsupported.map((label) => `FFmpeg cannot reproduce ${label}.`));
       const fades = [...fadeFilters(clip), ...transition.filters];
-      // Alpha fades need a pixel format that has an alpha plane to fade.
-      const pixelFormat = fades.length > 0 ? 'format=yuva420p' : 'format=yuv420p';
 
       const id = safeId(clip.id);
       let overlayAt = 'x=0:y=0';
       let preSteps: string[];
       let chain: ReturnType<typeof ffmpegChain>;
+      // Turning the layer needs somewhere for the corners to go, and a transparent fill to
+      // put in what they vacate — so a rotated layer always carries an alpha plane.
+      let rotateStep: string | null = null;
 
       if (!clip.transform) {
         // Full-frame: fit inside the canvas and letterbox, drawn at the origin.
@@ -279,6 +280,13 @@ export function buildExportPlan(
         ];
         chain = ffmpegChain(effects, { width: px.frameW, height: px.frameH });
         overlayAt = `${px.frameX}:${px.frameY}`;
+
+        const degrees = rotationOf(transformAt(clip, midpoint) ?? clip.transform);
+        if (degrees !== 0) {
+          const box = rotatedOverlayBox(px.frameX, px.frameY, px.frameW, px.frameH, degrees);
+          rotateStep = `rotate=${(degrees * Math.PI) / 180}:ow=${box.w}:oh=${box.h}:c=none`;
+          overlayAt = `${box.x}:${box.y}`;
+        }
       }
       warnings.push(...chain.unsupported.map((label) => `FFmpeg cannot reproduce ${label}.`));
 
@@ -291,7 +299,14 @@ export function buildExportPlan(
         filters.push(segment(cursor, next, `${id}_${index}`));
         cursor = next;
       });
-      filters.push(`[${cursor}]${[pixelFormat, ...fades].join(',')}[${layerLabel}]`);
+      // Alpha fades need a plane to fade, and so does a rotation's transparent fill.
+      const pixelFormat = fades.length > 0 || rotateStep ? 'format=yuva420p' : 'format=yuv420p';
+      // Rotation goes last, after the effect chain and the fades. The chain declares the
+      // size it was built for, and turning the picture under it would invalidate that; the
+      // compositor's chain runs over the whole frame rather than the layer box, so the two
+      // already differ in scope for anything that varies across the frame.
+      const finish = [pixelFormat, ...fades, ...(rotateStep ? [rotateStep] : [])];
+      filters.push(`[${cursor}]${finish.join(',')}[${layerLabel}]`);
       filters.push(
         `[${videoLabel}][${layerLabel}]overlay=${overlayAt}:enable='${between(clip)}':eof_action=pass[${out}]`,
       );

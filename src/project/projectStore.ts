@@ -8,8 +8,9 @@
  *     falls back to them. A project file is written by an app that might be killed at any
  *     instant; the cost of the extra copy is a few hundred kilobytes.
  *   - **One tab owns the project.** Two tabs autosaving into one origin is last-write-wins,
- *     and the loss is silent, which is the worst kind. A claim with a heartbeat makes the
- *     second tab read-only and say so, rather than quietly eating the first one's work.
+ *     and the loss is silent, which is the worst kind. A claim — asked over `BroadcastChannel`,
+ *     never inferred — makes the second tab read-only and say so, rather than quietly eating
+ *     the first one's work.
  *   - **Clearing means clearing.** Everything this app writes anywhere is listed here, so
  *     "Clear everything" cannot drift out of date with what is actually stored.
  */
@@ -34,11 +35,24 @@ const PROJECT_PREV = 'project.prev.json';
 export const OPFS_DIRS = ['media', 'recordings', 'exports'] as const;
 
 /**
- * Browser storage outside OPFS. Only UI preference lives here, but "Clear everything" has to
- * mean it, so the key is defined once and used by both the writer and the eraser.
+ * Browser storage outside OPFS. Only UI preference lives here — panel sizes and which tab was
+ * showing — but "Clear everything" has to mean it, so every key is named once, in one list,
+ * shared by the writers and the eraser.
  */
 export const TIMELINE_HEIGHT_KEY = 'editor.timelineHeight';
-const LOCAL_KEYS = [TIMELINE_HEIGHT_KEY];
+export const LIBRARY_WIDTH_KEY = 'editor.libraryWidth';
+export const INSPECTOR_WIDTH_KEY = 'editor.inspectorWidth';
+export const LIBRARY_TAB_KEY = 'editor.libraryTab';
+export const INSPECTOR_TAB_KEY = 'editor.inspectorTab';
+export const PREVIEW_VOLUME_KEY = 'editor.previewVolume';
+const LOCAL_KEYS = [
+  TIMELINE_HEIGHT_KEY,
+  LIBRARY_WIDTH_KEY,
+  INSPECTOR_WIDTH_KEY,
+  LIBRARY_TAB_KEY,
+  INSPECTOR_TAB_KEY,
+  PREVIEW_VOLUME_KEY,
+];
 
 export async function saveProject(project: ProjectFile): Promise<void> {
   if (!opfsAvailable()) return;

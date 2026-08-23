@@ -90,15 +90,24 @@ the preview and the FFmpeg export in agreement.
 
 ## Media Library
 
-The **Media Library** panel stores all imported media for reuse. Files are referenced by `assetId` — the same file can appear in multiple timeline clips without duplicating bytes in memory.
+The left sidebar has three tabs — **Media**, **Record** and **Storage** — and the inspector on
+the right has up to three of **Clip**, **Placement** and **Effects**, listing only the ones the
+selected clip has anything to put in. Drag either sidebar's inner edge to resize it, or
+double-click that edge to go back to the default width; the widths are remembered, and
+re-clamped on a smaller screen so a layout saved on a large display cannot open with both
+sidebars covering the preview. The placement and crop stages grow with the panel, so dragging
+the inspector wider is how you get a bigger one to work on.
+
+The **Media** tab stores all imported media for reuse. Files are referenced by `assetId` — the same file can appear in multiple timeline clips without duplicating bytes in memory.
 
 | Action | Where | Result |
 |--------|-------|--------|
 | Import Video / Audio / Image | Toolbar | File → library **and** timeline |
 | **+ Import** | Media Library | File → library only |
+| **Storage** tab | Media Library | Quota, what is using it, save/open a folder copy, Clear everything |
 | **+** on a library item | Media Library | Same asset added to timeline at playhead |
 | **×** on a library item | Media Library | Remove from library (disabled while used on timeline) |
-| **Record** | Media Library | Opens the capture panel: screen, microphone, system audio (see below) |
+| **Record** tab | Media Library | The capture panel: screen, microphone, system audio (see below). A recording in progress pulls this tab forward and marks it |
 | Drag files from Finder | Onto the timeline | File → library **and** a clip at the track and time you dropped on |
 
 A video file imports as **one clip** that carries its own audio — it moves, trims, splits and deletes as a single object. Use **Detach audio** in the Inspector to move that audio onto its own audio track when you need to slide it against the picture.
@@ -274,6 +283,33 @@ All editors share the same interaction model:
 
 Custom placement defaults to the top-right. New text uses the full canvas until you resize the box. Preview and export use the same transforms (canvas + FFmpeg `crop` / `scale` / `overlay` for media; framed `drawtext` for text).
 
+**An overlay may hang off the edge of the frame.** Drag it past any side and the part that
+leaves the canvas is simply not drawn — that is how a picture-in-picture slides in from
+the side or sits half out of shot. The placement stage shows a margin around the frame so
+you can see where the overlay went and still reach its resize handle; anything in that
+margin is dimmed, because it is real geometry that will not be in the render. X and Y
+accept negative percentages for the same reason.
+
+At least a tenth of the overlay always stays on the canvas. Something with no pixels in
+shot is invisible in the preview *and* in the editor, which would leave nothing to drag
+back — the clip would look empty with no way to find out why.
+
+A **crop** is a different rule and is unchanged: it addresses pixels of the source file,
+and outside the source there is nothing to sample.
+
+**Keep aspect ratio** under either stage locks that rectangle's proportions while you drag
+its handle or type a W or H. The ratio is the one you see on screen, not the raw
+percentages — 30% × 30% is square only on a square canvas.
+
+**Rotate** turns the placed picture about the frame's own centre, in degrees, clockwise. It
+is part of the placement rather than an effect, which means the placement stopwatch animates
+it along with everything else: arm **Animate placement**, move the playhead, set an angle,
+and the overlay spins between the keys. The value is not wrapped to one turn, so keying 0 →
+720 is two full spins.
+
+The crop stage follows the playhead while playback is paused, so you are cropping against
+the frame the clip is actually showing rather than the one it opened on.
+
 ### Video thumbnails
 
 | Location | Preview |
@@ -363,11 +399,29 @@ exact one.
 
 ## Preview
 
+### Expanded player
+
+Double-click the picture, or press **⛶** in the transport, to fill the window with the
+player. **Esc** or **Exit** leaves. It is a viewport overlay rather than a re-parenting of
+the canvas — the WebGL context and the running playback engine are the same ones, so
+expanding costs nothing and loses no state.
+
+The controls float over the picture and fade out, cursor included, after about two seconds
+without pointer movement; any movement brings them straight back. What they offer is
+deliberately less than the editing transport: a scrub bar over the whole project, a plain
+`M:SS` clock instead of a frame-accurate timecode, volume, and the way out. Frame stepping,
+timecode entry, frame capture and mask handles are editing controls and stay in the editing
+layout.
+
 ### Transport
 
 Play / pause, frame-step buttons, seek slider, and an **editable `MM:SS:FF` timecode** —
 type a timecode and press Enter to jump. **Save frame** captures the composited preview
 at the current playhead.
+
+**Preview volume** is monitoring only. It sits next to **Save frame**, is remembered between
+sessions, and never reaches an encoder — turning the speakers down while you work does not
+turn the export down. Track volume and clip gain are the ones that are part of the project.
 
 ### Save frame
 
