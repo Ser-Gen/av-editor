@@ -81,9 +81,15 @@ import { pictureInPictureTransform, PIP_MARGIN_PX, PIP_WIDTH_FRACTION } from '..
 import {
   AUDIO_BITRATE_DEFAULT,
   AUDIO_BITRATE_SYSTEM,
+  CAPTURE_BITRATE_CHOICES,
+  KEYFRAME_SECONDS_DEFAULT,
+  MIN_CAPTURE_BITRATE,
   QUALITY_SCALE,
+  bitrateLabel,
+  captureKeyFrameSeconds,
   captureVideoBitrate,
   estimatedBytesPerSecond,
+  isQualityPreset,
   qualityLabel,
 } from '../src/capture/bitrate';
 import {
@@ -108,7 +114,16 @@ import { isCollectable } from '../src/project/mediaStore';
 import { fastestRate, frameRateDecision } from '../src/capture/frameRate';
 import { describeCameras, resolveCameraChoice } from '../src/capture/cameraDevices';
 import { SOURCE_LANE, SOURCE_LABELS } from '../src/capture/recordingStore';
-import { MIN_CAPTURE_EDGE, cameraFailure, formatLabel, scaledSize } from '../src/capture/sources';
+import {
+  CAPTURE_STEP_LABELS,
+  MIN_CAPTURE_EDGE,
+  STALL_AFTER_MS,
+  cameraFailure,
+  formatLabel,
+  scaledSize,
+  stalledNote,
+} from '../src/capture/sources';
+import { settleWithin } from '../src/utils/deadline';
 import {
   detachedAudio,
   detachedAudioAdvice,
@@ -1481,6 +1496,109 @@ const halfScale = captureVideoBitrate(960, 540, 60, 'normal');
 check('half scale costs about a quarter as much', fullScale / halfScale, 4, 0.3);
 check('and half scale on Draft is cheaper still',
   captureVideoBitrate(960, 540, 60, 'draft') < halfScale, true);
+
+
+// --- 35. A bitrate said outright, for the hour-long call ------------------------------
+// The presets multiply a curve; this is the escape from it. The two rules that matter are
+// that a fixed rate really is fixed — it must not move when the share picker hands back a
+// different window — and that everything at or above Draft encodes exactly as it did
+// before the setting existed.
+check('a fixed rate is used as said', captureVideoBitrate(1920, 1080, 60, 600_000), 600_000);
+check('and does not move with the picture',
+  captureVideoBitrate(640, 360, 30, 600_000), captureVideoBitrate(3840, 2160, 60, 600_000));
+check('nor with the frame rate',
+  captureVideoBitrate(1920, 1080, 24, 1_000_000), captureVideoBitrate(1920, 1080, 60, 1_000_000));
+check('the presets are untouched by any of this',
+  captureVideoBitrate(1920, 1080, 30, 'normal'), 6_000_000);
+check('a rate below the floor is lifted to it',
+  captureVideoBitrate(1920, 1080, 30, 30_000), MIN_CAPTURE_BITRATE);
+check('and a nonsense one does not produce a nonsense encode',
+  captureVideoBitrate(1920, 1080, 30, Number.NaN) > MIN_CAPTURE_BITRATE, true);
+
+// The whole reason for the control: what an hour of a call costs at each end of the dial.
+const callSources = [{ width: 1920, height: 1080, fps: 30 }];
+const callAudio = [AUDIO_BITRATE_DEFAULT, AUDIO_BITRATE_SYSTEM];
+const hourAtNormal = estimatedBytesPerSecond(callSources, callAudio, 'normal') * 3600;
+const hourAtLow = estimatedBytesPerSecond(callSources, callAudio, 600_000) * 3600;
+check('an hour at Normal is the 2.9 GB that started this', hourAtNormal / 1e9, 2.9, 0.1);
+check('and 600 kbps brings the same hour under half a gigabyte', hourAtLow / 1e9 < 0.5, true);
+check('the audio is what is left, and is not reduced with it',
+  estimatedBytesPerSecond([], callAudio), estimatedBytesPerSecond([], callAudio, 300_000));
+
+// Labels: one dial, two kinds of answer, and the reader must be able to tell which is which.
+check('a preset reads as its name', bitrateLabel('draft'), 'Draft');
+check('a round rate reads in megabits', bitrateLabel(2_000_000), '2 Mbps');
+check('an unround one keeps a decimal', bitrateLabel(1_500_000), '1.5 Mbps');
+check('and a small one reads in kilobits', bitrateLabel(600_000), '600 kbps');
+check('every choice on the dial has a label',
+  CAPTURE_BITRATE_CHOICES.every((b) => bitrateLabel(b).length > 0), true);
+check('the presets come first', CAPTURE_BITRATE_CHOICES.findIndex((b) => !isQualityPreset(b)), 3);
+check('and the fixed rates descend',
+  CAPTURE_BITRATE_CHOICES.filter((b) => !isQualityPreset(b)) as number[],
+  [4_000_000, 2_000_000, 1_000_000, 600_000, 300_000]);
+
+// Key frames. A fragmented MP4 closes a fragment only on a key frame, so this interval is
+// the crash window and the seek grid as well as a cost — which is why it is derived from
+// the rate rather than offered as a fourth control, and why anything that was already
+// affordable keeps the one second it always had.
+check('Normal keeps its one-second key frames',
+  captureKeyFrameSeconds(1920, 1080, 30, 'normal'), KEYFRAME_SECONDS_DEFAULT);
+check('so does Draft', captureKeyFrameSeconds(1920, 1080, 30, 'draft'), KEYFRAME_SECONDS_DEFAULT);
+check('and so does High', captureKeyFrameSeconds(1920, 1080, 30, 'high'), KEYFRAME_SECONDS_DEFAULT);
+check('a rate at half the curve is still affordable',
+  captureKeyFrameSeconds(1920, 1080, 30, 3_000_000), KEYFRAME_SECONDS_DEFAULT);
+check('a quarter of it widens to two seconds',
+  captureKeyFrameSeconds(1920, 1080, 30, 2_000_000), 2);
+check('and the bottom of the dial to four',
+  captureKeyFrameSeconds(1920, 1080, 30, 300_000), 4);
+// The same absolute rate is generous for a small picture and mean for a large one, so the
+// interval follows the ratio rather than the number.
+check('600 kbps is not a low rate for a 360p camera',
+  captureKeyFrameSeconds(640, 360, 30, 600_000), KEYFRAME_SECONDS_DEFAULT);
+check('but it is for a 1080p screen', captureKeyFrameSeconds(1920, 1080, 30, 600_000), 4);
+check('the interval never exceeds four seconds',
+  captureKeyFrameSeconds(3840, 2160, 60, MIN_CAPTURE_BITRATE), 4);
+
+
+// --- 36. A start that waits forever ---------------------------------------------------
+// Starting a take is a chain of awaits on things outside the page, and every one of them can
+// sit there without ever rejecting. `ChunkSink` already grew a deadline for this reason; the
+// rest of the chain had none, which is how "Waiting for you to choose a screen, window or
+// tab…" became a sentence that could outlive the picker it described.
+
+// A wait with a defined fallback is given up on rather than escaped.
+const never = new Promise<number>(() => undefined);
+check('a promise that never settles is abandoned', await settleWithin(never, 20), { ok: false });
+check('a value that arrives in time comes back',
+  await settleWithin(Promise.resolve(7), 1000), { ok: true, value: 7 });
+check('a rejection reads the same as a timeout — both mean carry on without it',
+  await settleWithin(Promise.reject(new Error('no')), 1000), { ok: false });
+check('and the deadline does not delay a promise that already settled',
+  await settleWithin(Promise.resolve('x'), 60_000), { ok: true, value: 'x' });
+
+// A wait only the user can end gets a sentence and a Cancel button, not a deadline: there is
+// no honest timeout for how long someone should take to choose a window.
+check('a step that is progressing is not accused of hanging',
+  stalledNote('screen-picker', STALL_AFTER_MS - 1), null);
+check('and neither is one that has not started', stalledNote(null, 60_000), null);
+check('a picker that never came back says so, and says what to press',
+  (stalledNote('screen-picker', STALL_AFTER_MS) ?? '').includes('Cancel'), true);
+check('a prompt that was never answered points at the prompt',
+  (stalledNote('microphone', STALL_AFTER_MS) ?? '').includes('permission prompt'), true);
+check('the camera says the same thing as the microphone',
+  stalledNote('camera', STALL_AFTER_MS), stalledNote('microphone', STALL_AFTER_MS));
+check('a resize that hangs promises the recording anyway',
+  (stalledNote('sizing', STALL_AFTER_MS) ?? '').includes('its own size'), true);
+check('and every other step still has something to say',
+  (stalledNote('opening-files', STALL_AFTER_MS) ?? '').length > 0, true);
+check('nothing has been recorded when any of these fire',
+  (stalledNote('starting-encoders', STALL_AFTER_MS) ?? '').includes('nothing has been recorded'), true);
+
+// The resize now has a step of its own. Without one it happened inside 'screen-picker', so a
+// track that never answered left the panel blaming a picker the user had already dealt with.
+check('the resize is a step you can see', typeof CAPTURE_STEP_LABELS.sizing, 'string');
+check('every step has a label',
+  Object.values(CAPTURE_STEP_LABELS).every((label) => label.length > 0), true);
 
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);

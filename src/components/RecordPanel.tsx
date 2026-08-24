@@ -15,9 +15,12 @@ import type { SourceStatus } from '../capture/CaptureSession';
 import {
   AUDIO_BITRATE_DEFAULT,
   AUDIO_BITRATE_SYSTEM,
-  CAPTURE_QUALITIES,
-  QUALITY_LABEL,
+  CAPTURE_BITRATE_CHOICES,
+  bitrateLabel,
+  KEYFRAME_SECONDS_DEFAULT,
+  captureKeyFrameSeconds,
   estimatedBytesPerSecond,
+  isQualityPreset,
   qualityLabel,
 } from '../capture/bitrate';
 import { formatDuration } from '../utils/time';
@@ -30,7 +33,7 @@ import {
   headroomSeconds,
 } from '../utils/storageBudget';
 import type { SourceRequest } from '../capture/sources';
-import type { CaptureQuality } from '../capture/bitrate';
+import type { CaptureBitrate } from '../capture/bitrate';
 
 /**
  * What a video source is doing, in the two numbers that disagree.
@@ -103,7 +106,11 @@ function plannedBytesPerSecond(
   request: SourceRequest,
   settings: { width: number; height: number; fps: number },
 ): number {
-  return estimatedBytesPerSecond(plannedSources(request, settings), plannedAudio(request), request.quality);
+  return estimatedBytesPerSecond(
+    plannedSources(request, settings),
+    plannedAudio(request),
+    request.videoBitrate,
+  );
 }
 
 /** `1080p60 · Normal` — what the estimate below it is an estimate *of*. */
@@ -113,18 +120,18 @@ function plannedFormatLabel(
 ): string {
   const sources = plannedSources(request, settings);
   const shape = sources[0] ? qualityLabel(sources[0].height, sources[0].fps) : 'audio only';
-  return `${shape} · ${QUALITY_LABEL[request.quality]}`;
+  return `${shape} · ${bitrateLabel(request.videoBitrate)}`;
 }
 
 /** What this take is on course to write in an hour, from the formats in use right now. */
-function hourlyBytes(sources: SourceStatus[], quality: CaptureQuality): number {
+function hourlyBytes(sources: SourceStatus[], bitrate: CaptureBitrate): number {
   const video = sources
     .filter((s) => s.format)
     .map((s) => ({ width: s.format!.width, height: s.format!.height, fps: s.format!.frameRate }));
   const audio = sources
     .filter((s) => !s.format)
     .map((s) => (s.kind === 'system' ? AUDIO_BITRATE_SYSTEM : AUDIO_BITRATE_DEFAULT));
-  return estimatedBytesPerSecond(video, audio, quality) * 3600;
+  return estimatedBytesPerSecond(video, audio, bitrate) * 3600;
 }
 
 interface Props {
@@ -160,7 +167,7 @@ export function RecordPanel({ capture }: Props) {
   const { budget } = useStorageBudget();
   const measured = status?.sources.some((s) => s.format) ?? false;
   const bytesPerSecond = measured
-    ? hourlyBytes(status?.sources ?? [], request.quality) / 3600
+    ? hourlyBytes(status?.sources ?? [], request.videoBitrate) / 3600
     : plannedBytesPerSecond(request, settings);
   // The estimate is not refreshed during a take — the library does not change — so the bytes
   // this take has already written are subtracted to keep the figure honest as it counts down.
@@ -169,6 +176,16 @@ export function RecordPanel({ capture }: Props) {
   // Refusing is the kinder failure: a take that dies at minute 38 has already cost the
   // thing it was recording.
   const noRoom = !!budget && !recording && !canStartRecording(freeNow, bytesPerSecond);
+  // Only ever shown while idle, so the planned shape is the right one to ask about.
+  const plannedFirst = plannedSources(request, settings)[0];
+  const keyFrameSeconds = plannedFirst
+    ? captureKeyFrameSeconds(
+        plannedFirst.width,
+        plannedFirst.height,
+        plannedFirst.fps,
+        request.videoBitrate,
+      )
+    : KEYFRAME_SECONDS_DEFAULT;
 
   // The camera is held open only while this panel is on screen: elsewhere it would light
   // the indicator and lock the device against other applications for nothing.
@@ -216,9 +233,9 @@ export function RecordPanel({ capture }: Props) {
       </div>
 
       {/*
-        Both settings are requests, and both are locked once a take is running: the encoder
-        was configured from them at `start`, and a control that silently applied to the
-        *next* recording would be worse than one that is greyed out.
+        All three are locked once a take is running: the encoder and the tracks were
+        configured from them at `start`, and a control that silently applied to the *next*
+        recording would be worse than one that is greyed out.
       */}
       <div className="record-format">
         <label className="record-format-field">
@@ -252,18 +269,42 @@ export function RecordPanel({ capture }: Props) {
             ))}
           </select>
         </label>
-        <label className="record-format-field">
-          <span>Quality</span>
+        {/*
+          One control, two kinds of answer. A preset sizes itself to whatever the picture
+          turns out to be, which is right for anything that will be edited; a fixed rate is
+          for the recording nobody will edit and everybody has to store — an hour of a call
+          whose shared screen is a slide.
+        */}
+        <label
+          className="record-format-field"
+          title="A preset scales with the picture. A fixed rate does not — that is the point of naming one."
+        >
+          <span>Video bitrate</span>
           <select
-            value={request.quality}
+            value={String(request.videoBitrate)}
             disabled={recording || busy}
-            onChange={(e) => setRequest({ ...request, quality: e.target.value as CaptureQuality })}
+            onChange={(e) => {
+              const raw = e.target.value;
+              const next: CaptureBitrate = /^[0-9]+$/.test(raw)
+                ? Number(raw)
+                : (raw as CaptureBitrate);
+              setRequest({ ...request, videoBitrate: next });
+            }}
           >
-            {CAPTURE_QUALITIES.map((q) => (
-              <option key={q} value={q}>
-                {QUALITY_LABEL[q]}
-              </option>
-            ))}
+            <optgroup label="Sized to the picture">
+              {CAPTURE_BITRATE_CHOICES.filter(isQualityPreset).map((b) => (
+                <option key={b} value={b}>
+                  {bitrateLabel(b)}
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="Fixed rate, per video source">
+              {CAPTURE_BITRATE_CHOICES.filter((b) => !isQualityPreset(b)).map((b) => (
+                <option key={String(b)} value={String(b)}>
+                  {bitrateLabel(b)}
+                </option>
+              ))}
+            </optgroup>
           </select>
         </label>
       </div>
@@ -273,7 +314,19 @@ export function RecordPanel({ capture }: Props) {
           give — the panel reports what each track actually negotiated once recording starts.
           Scale is a fraction of the source, because a share picker decides the resolution and
           a window is whatever size you left it. Anything that would come out under
-          128&nbsp;px on an edge is left unscaled.
+          128&nbsp;px on an edge is left unscaled. A fixed bitrate is spent per video source,
+          and is spent only where the picture moves — a screen that sits still costs far less
+          than the number suggests.
+        </p>
+      )}
+
+      {phase === 'idle' && keyFrameSeconds > KEYFRAME_SECONDS_DEFAULT && (
+        <p className="record-option-note record-option-note--block">
+          At this rate a key frame is worth more than a whole second of video, so one is
+          written every {keyFrameSeconds} seconds instead of every one. That is what makes a
+          low bitrate look clean rather than smeared — the cost is that scrubbing lands on a{' '}
+          {keyFrameSeconds}-second grid, and a tab killed mid-take loses up to{' '}
+          {keyFrameSeconds} seconds of the recording instead of one.
         </p>
       )}
 
@@ -370,6 +423,18 @@ export function RecordPanel({ capture }: Props) {
         {phase === 'starting' && capture.step && (
           <span className="record-readout">{CAPTURE_STEP_LABELS[capture.step]}</span>
         )}
+        {/*
+          The only control that is live while starting, and it has to be: every step of a
+          start waits on something outside the page — a picker, a permission prompt, a track
+          being asked to resize — and any of them can sit there forever without erroring.
+          Without this the whole panel is disabled and the only way out is reloading the page
+          and losing the project.
+        */}
+        {phase === 'starting' && (
+          <button type="button" className="record-discard" onClick={() => capture.cancelStart()}>
+            Cancel
+          </button>
+        )}
         {recording && (
           <button type="button" className="record-discard" onClick={() => void capture.cancel()}>
             Discard
@@ -397,6 +462,10 @@ export function RecordPanel({ capture }: Props) {
         </ul>
       )}
 
+      {phase === 'starting' && capture.stalled && (
+        <p className="record-warning">{capture.stalled}</p>
+      )}
+
       {recording && status?.degraded && <p className="record-warning">{status.degraded}</p>}
 
       {recording && status && (
@@ -414,7 +483,7 @@ export function RecordPanel({ capture }: Props) {
               rather than as the fixed number a 30 fps assumption would print. */}
           {status.sources.some((s) => s.format) && (
             <>
-              {' '}≈ {formatBytes(hourlyBytes(status.sources, request.quality))} per hour at this rate
+              {' '}≈ {formatBytes(hourlyBytes(status.sources, request.videoBitrate))} per hour at this rate
               {budget && <>, room for {formatHeadroom(headroom)}</>}.
             </>
           )}

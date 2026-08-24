@@ -25,10 +25,10 @@ import { MediaRecorderSourceEngine, mediaRecorderExtension, mediaRecorderMime } 
 import type { CaptureSourceKind, RecordingMeta } from './recordingStore';
 import { deleteRecording, writeMeta } from './recordingStore';
 import { OUT_OF_SPACE } from './quota';
-import { acquireSources, browserSources, stopStream, trackFormat } from './sources';
+import { CaptureAborted, acquireSources, browserSources, stopStream, trackFormat } from './sources';
 import type { CaptureStepReporter, SourceProvider, SourceRequest, VideoFormat } from './sources';
-import { captureVideoBitrate } from './bitrate';
-import type { CaptureQuality } from './bitrate';
+import { captureKeyFrameSeconds, captureVideoBitrate } from './bitrate';
+import type { CaptureBitrate } from './bitrate';
 import {
   AUDIO_BITRATE_DEFAULT,
   AUDIO_BITRATE_SYSTEM,
@@ -180,8 +180,8 @@ export class CaptureSession {
   private dropWatch: { atMs: number; dropped: number }[] = [];
   /** Set once the camera has been reduced, so it only ever happens once. */
   private degraded: string | null = null;
-  /** The quality this take was started at; the encoder is the only thing that reads it. */
-  private quality: CaptureQuality = 'normal';
+  /** The bitrate this take was started at; the encoders are the only things that read it. */
+  private videoBitrate: CaptureBitrate = 'normal';
 
   readonly sessionId = uid('session');
   /** Non-null when system audio was requested and the platform did not provide it. */
@@ -207,12 +207,27 @@ export class CaptureSession {
     provider: SourceProvider = browserSources,
     enginePreference: EnginePreference = 'auto',
     onStep: CaptureStepReporter = () => undefined,
+    options: {
+      /** Set when the user gives up on a start that is waiting on a picker or a prompt. */
+      signal?: AbortSignal;
+      /**
+       * The engine choice, if it has already been made.
+       *
+       * The panel works it out on mount so it can say how it will record before anyone
+       * presses Record, and re-deciding it here put an `await` — `VideoEncoder`'s support
+       * probe, which can spin up the GPU process — between the click and
+       * `getDisplayMedia`. That call requires transient activation, which expires; the
+       * screen picker is the one thing that must be asked for while the click is still
+       * warm.
+       */
+      engineChoice?: EngineChoice;
+    } = {},
   ): Promise<CaptureSession> {
     const session = new CaptureSession();
     onStep('choosing-engine');
-    session.quality = request.quality;
-    session.engineChoice = await chooseEngine(enginePreference);
-    const sources = await acquireSources(request, provider, onStep);
+    session.videoBitrate = request.videoBitrate;
+    session.engineChoice = options.engineChoice ?? (await chooseEngine(enginePreference));
+    const sources = await acquireSources(request, provider, onStep, options.signal);
     session.systemAudioMissing = sources.systemAudioMissing;
     session.micMissing = sources.micMissing;
     session.cameraMissing = sources.cameraMissing;
@@ -229,11 +244,19 @@ export class CaptureSession {
       { kind: 'system', stream: sources.systemAudio, video: false },
     ];
 
+    // Every granted stream is handed to the session *before* anything can throw. Pushing
+    // them one at a time as they were opened meant a failure on the second source left the
+    // third's camera light on and its tracks live, because `cancel()` only stops what it has
+    // been given.
+    for (const entry of plan) {
+      if (entry.stream) session.streams.push(entry.stream);
+    }
+
     try {
+      if (options.signal?.aborted) throw new CaptureAborted();
       onStep('opening-files');
       for (const entry of plan) {
         if (!entry.stream) continue;
-        session.streams.push(entry.stream);
         session.sources.push(await session.buildSource(entry.kind, entry.stream, entry.video));
       }
       if (session.sources.length === 0) throw new Error('No capture sources were granted.');
@@ -285,8 +308,20 @@ export class CaptureSession {
     video: boolean,
     kind: CaptureSourceKind,
   ): Promise<SourceEngine> {
+    // Decided once, for both engines. The fallback used to encode at whatever the browser
+    // felt like, which made the setting a lie on exactly the browsers least able to afford
+    // one.
+    const format = video ? trackFormat(stream) : null;
+    // Sized from what the track actually negotiated, so a 60 fps capture is not encoded at a
+    // 30 fps budget. `QUALITY_HIGH` does not know the frame rate exists.
+    const videoBitrate = format
+      ? captureVideoBitrate(format.width, format.height, format.frameRate, this.videoBitrate)
+      : undefined;
+    // System audio is whatever the machine is playing — music, a game, a call — and is the
+    // one source where the encoder, not the microphone, is the weak link.
+    const audioBitrate = kind === 'system' ? AUDIO_BITRATE_SYSTEM : AUDIO_BITRATE_DEFAULT;
+
     if (this.engineChoice.engine === 'webcodecs') {
-      const format = video ? trackFormat(stream) : null;
       const frameRate = format?.frameRate || 30;
       // Audio-only sources get an audio extension: an `.mp4` holding nothing but sound would
       // be imported as a video clip with no picture.
@@ -294,20 +329,19 @@ export class CaptureSession {
         fileName: `${id}.raw.${video ? 'mp4' : 'm4a'}`,
         video,
         frameRate,
-        // Sized from what the track actually negotiated, so a 60 fps capture is not encoded
-        // at a 30 fps budget. `QUALITY_HIGH` does not know the frame rate exists.
-        videoBitrate: format
-          ? captureVideoBitrate(format.width, format.height, format.frameRate, this.quality)
+        videoBitrate,
+        keyFrameSeconds: format
+          ? captureKeyFrameSeconds(format.width, format.height, format.frameRate, this.videoBitrate)
           : undefined,
-        // System audio is whatever the machine is playing — music, a game, a call — and is
-        // the one source where the encoder, not the microphone, is the weak link.
-        audioBitrate: kind === 'system' ? AUDIO_BITRATE_SYSTEM : AUDIO_BITRATE_DEFAULT,
+        audioBitrate,
       });
     }
     const mimeType = mediaRecorderMime(video);
     return MediaRecorderSourceEngine.open(stream, {
       fileName: `${id}.raw.${mediaRecorderExtension(mimeType)}`,
       mimeType,
+      videoBitrate,
+      audioBitrate,
     });
   }
 

@@ -376,7 +376,7 @@ source becomes its own file, its own library asset and its own timeline track.
 |---------|---------|--------|
 | Frame rate | 24 / 30 / 60 fps | Asked of the display and the camera. A request, not a promise — a display that cannot do 60 hands back 30, and the panel reports what each track actually negotiated |
 | Scale | 100 / 75 / 50 / 25 % | A fraction of whatever the source turns out to be, applied to the screen and the camera alike |
-| Quality | Draft / Normal / High | Multiplies the derived video bitrate by 0.6 / 1 / 1.6. Audio is unaffected |
+| Video bitrate | Draft / Normal / High, or 4 / 2 / 1 Mbps / 600 / 300 kbps | A preset multiplies the derived bitrate by 0.6 / 1 / 1.6. A fixed rate replaces it outright, per video source. Audio is unaffected either way |
 
 **Scale, not resolution**, because for a screen capture the resolution is not the app's to
 choose: the browser's share picker decides it, and a program window is whatever size you
@@ -389,19 +389,75 @@ format, the bitrate, the sidecar, and the `MediaRecorder` fallback as much as th
 path. Both axes come out even (H.264 refuses an odd dimension), and anything that would
 land under 128 px on an edge is left unscaled rather than scaled badly.
 
-Bitrate is otherwise derived from resolution and frame rate: 6 Mbps at 1080p30, scaled by
-`pixels^0.95 × √(fps/30)`. **Normal is exactly 1×**, so it is the bitrate every recording
+A **preset** derives the bitrate from resolution and frame rate: 6 Mbps at 1080p30, scaled
+by `pixels^0.95 × √(fps/30)`. **Normal is exactly 1×**, so it is the bitrate every recording
 made before this setting existed used. Draft is for long screen captures, where two-thirds
 the size is worth more than detail nobody will look at; High is for anything that will be
 graded or scaled afterwards.
 
-All three are locked once a take is running — the encoder was configured from them at the start,
-and a control that silently applied to the *next* recording would be worse than one that is
-greyed out.
+A **fixed rate** is the escape from that curve, and exists for one recording in particular:
+an hour-long call whose shared screen is a static slide for minutes at a time. The presets
+cannot go where that needs to go — the smallest of them is still 3.6 Mbps at 1080p, about
+1.6 GB an hour — and reaching 500 kbps would need a multiplier of 0.08, at which point the
+number on the dial is a fiction. A fixed rate deliberately does **not** scale with the
+picture: the reason for naming a number is that the curve's answer was the wrong one, and a
+"fixed" rate that moved when the share picker handed back a different window would not be.
+It is spent per video source, so screen + camera costs twice the number shown. Below
+100 kbps it is lifted to 100 kbps.
+
+Encoding is **variable bitrate**, which is what makes a static screen cheap: under a
+constant bitrate an encoder with nothing to say pads until it has spent the bits anyway, so
+an hour of a motionless picture would cost the same as an hour of motion. This is what
+WebCodecs already defaults to; it is now said explicitly, because it is the one setting
+whose absence would be silent — nothing in the file records which mode wrote it, only the
+size, an hour later.
+
+**Key frames widen as the rate narrows** — every 1 second at or above Draft, every 2 at a
+quarter of the curve, every 4 below that. A 1080p key frame is a whole picture encoded from
+nothing, call it 100 KB, and one second of a 500 kbps stream is 62 KB in total: asking for
+both every second means the encoder wrecks the key frame or starves the 29 frames after it,
+and the low rate that was meant to make a small clean file makes a small smeared one. The
+cost is stated where you choose it: a fragmented MP4 closes a fragment only on a key frame,
+so at the bottom of the dial scrubbing lands on a 4-second grid and a killed tab loses up
+to 4 seconds instead of 1. Nothing at or above Draft changes.
+
+All three controls are locked once a take is running — the encoder and the tracks were
+configured from them at the start, and a control that silently applied to the *next*
+recording would be worse than one that is greyed out.
 
 The size line under the controls is priced at the rate the capture will **request** and at
 what each audio stream will really encode at (192 kbps for a microphone, 256 for system
 audio), and it names the format it is estimating: `≈ 3.62 GB per hour at 1080p60 · Normal`.
+
+### Starting a take, and getting out of one that will not start
+
+Pressing Record begins a chain of waits on things the page does not control: choosing an
+engine, the screen picker, asking the chosen source to resize, the camera prompt, the
+microphone prompt, opening files on disk, starting the encoders. The panel names the one it
+is waiting on, because "the button went dead" and "it is waiting for the microphone" are
+very different problems.
+
+Every one of those can sit there forever without ever failing. So:
+
+- **Cancel is live for the whole start.** It is the only control that is, and it has to be —
+  everything else was used to configure the encoder. Without it the only way out of a wait
+  that never ends is reloading the page and losing the project. Anything already granted is
+  stopped, including a stream that arrives after you gave up, so the browser never goes on
+  claiming your screen is shared over a page that has gone back to idle.
+- **A step that stops making sense says so** after 20 seconds — that the picker never came
+  back, that a prompt is behind another window. It is advisory and cancels nothing: there is
+  no honest timeout for how long someone should take to choose a window.
+- **The resize is given up on rather than escaped**, after 4 seconds. `applyConstraints` on a
+  display track is answered by the capturer, and a window capturer producing no frames —
+  minimised, occluded, on another desktop — has nothing to answer with. The recording then
+  proceeds at the source's own size, which the panel reports truthfully. This wait sat between
+  the picker and every other step with no deadline, so a window that would not resize stopped
+  the take there with the panel still saying it was waiting for the picker.
+
+The screen picker is also asked for **before** anything else is awaited, because
+`getDisplayMedia` needs the click to still be warm — the engine choice is normally already
+made, on page load, which is also what lets the panel say how it will record before you press
+anything. It is only worked out at Record time if you get there first.
 
 ### How recordings are written
 

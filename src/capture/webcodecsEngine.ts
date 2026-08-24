@@ -89,6 +89,14 @@ export interface WebCodecsEngineOptions {
    */
   videoBitrate?: number;
   /**
+   * How often to force a key frame, in seconds.
+   *
+   * It is the crash window and the seek grid as well as a cost — a fragmented MP4 closes a
+   * fragment only on a key frame — so it is derived from the chosen bitrate rather than
+   * chosen separately. See `captureKeyFrameSeconds`.
+   */
+  keyFrameSeconds?: number;
+  /**
    * AAC bitrate. Speech survives 128k; a soundtrack captured from the system does not, and
    * a recording encoded below what the exporter uses would cap the quality of everything
    * made from it.
@@ -186,7 +194,19 @@ export class WebCodecsSourceEngine implements SourceEngine {
       engine.videoSource = new VideoSampleSource({
         codec: 'avc',
         bitrate: options.videoBitrate ?? QUALITY_HIGH,
-        keyFrameInterval: FRAGMENT_SECONDS,
+        keyFrameInterval: options.keyFrameSeconds ?? FRAGMENT_SECONDS,
+        /*
+         * Said out loud, though it is what WebCodecs already defaults to.
+         *
+         * It matters most for exactly the recording this app is worst at: a call where the
+         * shared screen is a static slide. Under a constant bitrate an encoder that has
+         * nothing to say pads until it has said enough bits anyway — some hardware encoders
+         * emit filler NAL units to hold the rate — so an hour of a motionless picture costs
+         * the same as an hour of motion. Variable is what makes a still picture cheap, and
+         * it is the one setting here whose absence would be silent: nothing in the file
+         * says which mode wrote it, only the size, an hour later.
+         */
+        bitrateMode: 'variable',
       });
       output.addVideoTrack(engine.videoSource, { frameRate: options.frameRate ?? 30 });
     }

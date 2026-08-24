@@ -52,13 +52,30 @@ export class MediaRecorderSourceEngine implements SourceEngine {
     };
   }
 
+  /**
+   * The bitrates are passed here too, and were not before.
+   *
+   * They were easy to forget because this engine only runs on browsers that cannot do the
+   * other one — but a fallback that ignores the setting is worse than no setting: someone
+   * picks 600 kbps for an hour-long call, gets Chrome's own default of about 2.5 Mbps, and
+   * has no way to tell which engine wrote the file that filled the disk. Two engines, one
+   * rule.
+   */
   static async open(
     stream: MediaStream,
-    options: { fileName: string; mimeType: string },
+    options: {
+      fileName: string;
+      mimeType: string;
+      videoBitrate?: number;
+      audioBitrate?: number;
+    },
   ): Promise<MediaRecorderSourceEngine> {
-    const recorder = options.mimeType
-      ? new MediaRecorder(stream, { mimeType: options.mimeType })
-      : new MediaRecorder(stream);
+    const config: MediaRecorderOptions = {
+      ...(options.mimeType ? { mimeType: options.mimeType } : {}),
+      ...(options.videoBitrate ? { videoBitsPerSecond: options.videoBitrate } : {}),
+      ...(options.audioBitrate ? { audioBitsPerSecond: options.audioBitrate } : {}),
+    };
+    const recorder = new MediaRecorder(stream, config);
     const sink = await ChunkSink.open(options.fileName);
     return new MediaRecorderSourceEngine(
       recorder,

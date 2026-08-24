@@ -10,7 +10,8 @@
  * stream itself after the picker returns, never assumed from the request.
  */
 
-import type { CaptureQuality } from './bitrate';
+import type { CaptureBitrate } from './bitrate';
+import { settleWithin } from '../utils/deadline';
 
 export type MimeChoice = { mimeType: string; container: 'webm' | 'mp4' };
 
@@ -110,8 +111,11 @@ export interface SourceRequest {
    * A request, not a promise: a display that cannot do 60 hands back 30.
    */
   fps: number;
-  /** How generous to be with bits. See `QUALITY_SCALE`. */
-  quality: CaptureQuality;
+  /**
+   * How generous to be with bits: a preset that sizes itself to the picture, or a rate said
+   * outright. See `CaptureBitrate`.
+   */
+  videoBitrate: CaptureBitrate;
   /** Fraction of the source's own size to encode at. 1 leaves every source alone. */
   scale: number;
 }
@@ -222,6 +226,21 @@ export function scaledSize(
 }
 
 /**
+ * How long to wait for a track to agree to resize before recording without it.
+ *
+ * A track that is going to resize does it in a frame or two. A track that is not going to
+ * may never say so: `applyConstraints` on a *display* track is answered by the capturer, and
+ * a window capturer that is producing no frames — minimised, occluded, on another desktop —
+ * has nothing to answer with. The promise then neither resolves nor rejects, and since this
+ * call sits between the screen picker and every other step of starting a take, the whole
+ * recording stops there with the panel still saying it is waiting for the picker.
+ *
+ * That is the bug this constant exists to close. Four seconds is far longer than a resize
+ * takes and far shorter than a person will sit looking at a dead button.
+ */
+export const SCALE_DEADLINE_MS = 4_000;
+
+/**
  * Ask a live video track to hand over smaller frames.
  *
  * Done to the track rather than to the frames because everything downstream then follows for
@@ -229,9 +248,10 @@ export function scaledSize(
  * records it, and the MediaRecorder fallback gets the same treatment as the WebCodecs path
  * without either of them knowing this happened.
  *
- * `ideal`, and failure is swallowed: a browser that will not resize a display track leaves it
- * at its native size, and the panel goes on reporting what the track actually negotiated. A
- * capture that ran bigger than asked is a far better outcome than one that refused to start.
+ * `ideal`, failure is swallowed, and now the *silence* is swallowed too: a browser that will
+ * not resize a display track — or will not say whether it did — leaves it at its native size,
+ * and the panel goes on reporting what the track actually negotiated. A capture that ran
+ * bigger than asked is a far better outcome than one that refused to start.
  */
 export async function applyCaptureScale(stream: MediaStream | null, scale: number): Promise<void> {
   const track = stream?.getVideoTracks()[0];
@@ -239,14 +259,13 @@ export async function applyCaptureScale(stream: MediaStream | null, scale: numbe
   const settings = track.getSettings();
   const target = scaledSize(settings.width ?? 0, settings.height ?? 0, scale);
   if (target.width === (settings.width ?? 0) && target.height === (settings.height ?? 0)) return;
-  try {
-    await track.applyConstraints({
-      width: { ideal: target.width },
-      height: { ideal: target.height },
-    });
-  } catch {
-    // Left at its native size, which `trackFormat` will report truthfully.
-  }
+  // Not awaited directly: see `SCALE_DEADLINE_MS`. If the answer arrives after the deadline
+  // it still takes effect on the track, and `trackFormat` still reports the truth — the only
+  // thing given up on is *waiting* for it.
+  await settleWithin(
+    track.applyConstraints({ width: { ideal: target.width }, height: { ideal: target.height } }),
+    SCALE_DEADLINE_MS,
+  );
 }
 
 export function cameraConstraints(deviceId?: string, fps: number = TARGET_FPS): MediaTrackConstraints {
@@ -339,6 +358,7 @@ export const browserSources: SourceProvider = {
 export type CaptureStep =
   | 'choosing-engine'
   | 'screen-picker'
+  | 'sizing'
   | 'camera'
   | 'microphone'
   | 'opening-files'
@@ -347,18 +367,66 @@ export type CaptureStep =
 export const CAPTURE_STEP_LABELS: Record<CaptureStep, string> = {
   'choosing-engine': 'Checking what this browser can encode…',
   'screen-picker': 'Waiting for you to choose a screen, window or tab…',
+  sizing: 'Asking the source for a smaller picture…',
   camera: 'Opening the camera — look for the browser’s prompt.',
   microphone: 'Waiting for microphone permission — look for the browser’s prompt.',
   'opening-files': 'Opening the recording files on disk…',
   'starting-encoders': 'Starting the encoders…',
 };
 
+/**
+ * How long a step may take before the panel stops trusting it.
+ *
+ * Not a timeout — nothing is cancelled by reaching it. Only the user knows whether the
+ * picker is still on screen, so all this does is stop the panel from calmly repeating a
+ * sentence that has become a lie, and point at the way out.
+ */
+export const STALL_AFTER_MS = 20_000;
+
+export function stalledNote(step: CaptureStep | null, elapsedMs: number): string | null {
+  if (!step || elapsedMs < STALL_AFTER_MS) return null;
+  switch (step) {
+    case 'screen-picker':
+      return 'The screen picker has not come back. If you already chose something, the browser did not hand it over — press Cancel and try again.';
+    case 'camera':
+    case 'microphone':
+      return 'The browser has not answered the permission prompt. It may be behind this window, or already dismissed — press Cancel and try again.';
+    case 'sizing':
+      return 'The source is not answering the request to resize. It will be recorded at its own size in a moment.';
+    default:
+      return 'This is taking longer than it should. Press Cancel to stop waiting; nothing has been recorded yet.';
+  }
+}
+
 export type CaptureStepReporter = (step: CaptureStep) => void;
+
+/**
+ * Thrown when the user gives up on a start that is waiting on something outside the page.
+ *
+ * Its own class rather than a `DOMException`, because it must not be reported: the person
+ * who pressed Cancel does not need to be told that cancelling worked.
+ */
+export class CaptureAborted extends Error {
+  constructor() {
+    super('Recording was cancelled before it started.');
+    this.name = 'CaptureAborted';
+  }
+}
+
+function throwIfAborted(signal: AbortSignal | undefined, ...streams: (MediaStream | null)[]): void {
+  if (!signal?.aborted) return;
+  // Whatever was granted before the user gave up is stopped here rather than left running:
+  // a live display track keeps the browser's "you are sharing" bar up over a page that has
+  // gone back to idle, which is the most alarming way to be wrong about this.
+  for (const stream of streams) stopStream(stream);
+  throw new CaptureAborted();
+}
 
 export async function acquireSources(
   request: SourceRequest,
   provider: SourceProvider = browserSources,
   onStep: CaptureStepReporter = () => undefined,
+  signal?: AbortSignal,
 ): Promise<AcquiredSources> {
   const result: AcquiredSources = {
     screen: null,
@@ -397,10 +465,13 @@ export async function acquireSources(
 
     if (request.screen) {
       result.screen = new MediaStream(display.getVideoTracks());
+      throwIfAborted(signal, result.screen, result.systemAudio);
+      onStep('sizing');
       await applyCaptureScale(result.screen, request.scale);
     } else {
       for (const track of display.getVideoTracks()) track.stop();
     }
+    throwIfAborted(signal, result.screen, result.systemAudio);
   }
 
 
@@ -414,11 +485,14 @@ export async function acquireSources(
       });
       // After acquisition, like the screen: the camera negotiates the best format it has and
       // is then asked down from it, so one rule covers both sources.
+      onStep('sizing');
       await applyCaptureScale(result.camera, request.scale);
     } catch (e) {
+      if (e instanceof CaptureAborted) throw e;
       if (!result.screen && !result.systemAudio && !request.mic) throw e;
       result.cameraMissing = cameraFailure(e);
     }
+    throwIfAborted(signal, result.screen, result.systemAudio, result.camera);
   }
 
   if (request.mic) {
@@ -433,6 +507,7 @@ export async function acquireSources(
         audio: request.processMic ? PROCESSED_AUDIO : UNPROCESSED_AUDIO,
       });
     } catch (e) {
+      if (e instanceof CaptureAborted) throw e;
       if (!result.screen && !result.systemAudio) throw e;
       const why = e instanceof Error ? e.message : 'the browser refused it';
       result.micMissing =
@@ -440,6 +515,7 @@ export async function acquireSources(
           ? 'Microphone permission was refused, so no microphone track was recorded.'
           : `The microphone could not be opened (${why}), so no microphone track was recorded.`;
     }
+    throwIfAborted(signal, result.screen, result.systemAudio, result.camera, result.mic);
   }
 
   return result;

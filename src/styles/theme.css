@@ -216,6 +216,10 @@ body.is-dragging * {
   flex-direction: column;
   background: var(--surface);
   min-height: 0;
+  /* The column clips; each tab's own body scrolls. Without this a tab taller than the
+     window painted straight over the splitter and the timeline below it — text sitting on
+     top of the tracks, belonging to a panel whose box had ended well above it. */
+  overflow: hidden;
 }
 
 .media-library-header {
@@ -241,7 +245,7 @@ body.is-dragging * {
 /* ------------------------------------------------------------------ record panel */
 
 .record-panel {
-  margin: 8px 12px 0;
+  margin: 8px 12px;
   padding: 8px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -249,6 +253,16 @@ body.is-dragging * {
   display: flex;
   flex-direction: column;
   gap: 8px;
+  /* The same rule the inspector already needed: a flex item will not shrink below its
+     content without this. The record tab has grown a long way — three format selects, the
+     notes that explain them, the camera preview, the recovery list — and was the first
+     thing here tall enough to run off the bottom of the column. It scrolls itself, the way
+     `.media-library-list` does for the media tab, rather than the column scrolling around
+     it. */
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .record-sources {

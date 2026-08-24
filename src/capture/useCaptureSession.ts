@@ -8,7 +8,7 @@ import { SOURCE_LABELS } from './recordingStore';
 import type { RecordedSource } from './recordingStore';
 import { discardRecording, findOrphans, finalizeRecording, recoverRecording } from './recovery';
 import type { OrphanRecording } from './recovery';
-import { cameraConstraints, systemAudioSupport } from './sources';
+import { CaptureAborted, cameraConstraints, stalledNote, systemAudioSupport } from './sources';
 import { TARGET_FPS } from './sources';
 import type { CaptureStep, SourceProvider, SourceRequest } from './sources';
 import { listCameras, onDeviceChange, resolveCameraChoice } from './cameraDevices';
@@ -23,6 +23,8 @@ export interface CaptureController {
   phase: CapturePhase;
   /** While starting: which external thing is being waited on. Null at any other time. */
   step: CaptureStep | null;
+  /** Set when the step being waited on has stopped looking like it will finish. */
+  stalled: string | null;
   request: SourceRequest;
   setRequest: (next: SourceRequest) => void;
   status: CaptureStatus | null;
@@ -46,6 +48,8 @@ export interface CaptureController {
   start: () => Promise<void>;
   stop: () => Promise<void>;
   cancel: () => Promise<void>;
+  /** Abandons a start that is waiting on a picker or a permission prompt. */
+  cancelStart: () => void;
   restore: (orphan: OrphanRecording) => Promise<void>;
   discard: (orphan: OrphanRecording) => Promise<void>;
 }
@@ -65,6 +69,10 @@ export function useCaptureSession(
    * never coming.
    */
   const stopRef = useRef<() => Promise<void>>(async () => undefined);
+  /** True from the moment Record is pressed, before React has committed the phase. */
+  const startingRef = useRef(false);
+  /** Non-null only while a start is in flight, so Cancel has something to pull. */
+  const startAbortRef = useRef<AbortController | null>(null);
   const [phase, setPhase] = useState<CapturePhase>('idle');
   const [request, setRequest] = useState<SourceRequest>({
     screen: true,
@@ -73,7 +81,7 @@ export function useCaptureSession(
     systemAudio: true,
     processMic: true,
     fps: TARGET_FPS,
-    quality: 'normal',
+    videoBitrate: 'normal',
     scale: 1,
   });
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
@@ -84,6 +92,9 @@ export function useCaptureSession(
   const [orphans, setOrphans] = useState<OrphanRecording[]>([]);
   const [engine, setEngine] = useState<EngineChoice | null>(null);
   const [step, setStep] = useState<CaptureStep | null>(null);
+  /** When the current step began, so the panel can notice one that is not progressing. */
+  const [stepSinceMs, setStepSinceMs] = useState(0);
+  const [stalled, setStalled] = useState<string | null>(null);
   /**
    * Recordings already pulled into this session's library.
    *
@@ -207,17 +218,48 @@ export function useCaptureSession(
     };
   }, []);
 
+  /**
+   * Every step reported also restarts the stall clock. Passing `setStep` straight to the
+   * session left the clock measuring the whole start rather than the step actually stuck,
+   * so a slow-but-progressing start would have been accused of hanging.
+   */
+  const reportStep = useCallback((next: CaptureStep) => {
+    setStep(next);
+    setStepSinceMs(performance.now());
+    setStalled(null);
+  }, []);
+
   const start = useCallback(async () => {
-    if (phase !== 'idle') return;
+    // The ref, not `phase`: two clicks inside one frame both read the same committed state,
+    // and the second would open a second screen picker. Whichever one the user answered,
+    // the other would still be pending and the panel would sit on "waiting for you to
+    // choose" over a stream nobody was going to use.
+    if (phase !== 'idle' || startingRef.current) return;
     if (!request.screen && !request.camera && !request.mic && !request.systemAudio) {
       setNotice('Pick at least one source.');
       return;
     }
+    startingRef.current = true;
+    const abort = new AbortController();
+    startAbortRef.current = abort;
     setPhase('starting');
     setNotice(null);
-    setStep('choosing-engine');
+    setStalled(null);
+    reportStep('choosing-engine');
     try {
-      const session = await CaptureSession.start(request, provider, enginePreference, setStep);
+      const session = await CaptureSession.start(request, provider, enginePreference, reportStep, {
+        signal: abort.signal,
+        // Already decided on mount; deciding it again here would sit between the click and
+        // the screen picker, which needs the click to still be warm.
+        engineChoice: engine ?? undefined,
+      });
+      // The user gave up while the picker was still open and the picker answered anyway.
+      // The session is real, its tracks are live and its files are on disk — it has to be
+      // torn down rather than dropped, or the browser goes on saying the screen is shared.
+      if (abort.signal.aborted) {
+        void session.cancel();
+        return;
+      }
       sessionRef.current = session;
       session.onSourceEnded = (kind, reason) => {
         setNotice(`${SOURCE_LABELS[kind]}: ${reason}. It was saved as far as it got; the rest is still recording.`);
@@ -238,9 +280,17 @@ export function useCaptureSession(
       ].filter((s): s is string => !!s);
       setNotice(gaps.length > 0 ? gaps.join(' ') : null);
     } catch (e) {
+      // An abandoned attempt must not touch state a newer one has since claimed: press
+      // Cancel, press Record again, and this rejection arrives to find a live start it would
+      // otherwise reset to idle and strip of its session.
+      if (startAbortRef.current !== abort) return;
       sessionRef.current = null;
       setPhase('idle');
       setStep(null);
+      setStalled(null);
+      // Cancelling is not a failure and does not get reported as one: `cancelStart` has
+      // already said what happened, in the words of the button that was pressed.
+      if (e instanceof CaptureAborted) return;
       const message =
         e instanceof DOMException && e.name === 'NotAllowedError'
           ? 'Permission denied — nothing was recorded.'
@@ -248,8 +298,53 @@ export function useCaptureSession(
             ? e.message
             : 'Could not start recording.';
       setNotice(message);
+    } finally {
+      // Only if this is still the start in flight. `cancelStart` clears both the moment it
+      // is pressed, so that Record can be pressed again straight away — if this stomped on
+      // that unconditionally it would be doing so *after* a newer start had claimed them,
+      // and the abandoned attempt would silently disarm the live one.
+      if (startAbortRef.current === abort) {
+        startingRef.current = false;
+        startAbortRef.current = null;
+      }
     }
-  }, [phase, request, provider, enginePreference]);
+  }, [phase, request, provider, enginePreference, engine, reportStep]);
+
+  /**
+   * Gives up on a start that is waiting on something outside the page.
+   *
+   * The panel is otherwise completely disabled while starting, which is right — the encoder
+   * is being configured from these settings — but it left no way out of a wait that never
+   * ends except reloading the page and losing the project. The phase returns to idle at
+   * once rather than waiting for the abandoned promise: whatever it eventually hands over
+   * is stopped by the check above, and a person who pressed Cancel should not then have to
+   * wait on the thing they cancelled.
+   */
+  // Watches the step that is currently being waited on, and says so if it stops making
+  // sense. Deliberately advisory: nothing here cancels anything, because there is no honest
+  // deadline for "how long should someone take to choose a window".
+  useEffect(() => {
+    if (phase !== 'starting' || !step) {
+      setStalled(null);
+      return;
+    }
+    const id = window.setInterval(() => {
+      setStalled(stalledNote(step, performance.now() - stepSinceMs));
+    }, 1000);
+    return () => window.clearInterval(id);
+  }, [phase, step, stepSinceMs]);
+
+  const cancelStart = useCallback(() => {
+    if (!startAbortRef.current) return;
+    startAbortRef.current.abort();
+    startAbortRef.current = null;
+    // Cleared here rather than left to the abandoned start's `finally`, which may never run:
+    // the whole point of cancelling a wait that never ends is being able to try again.
+    startingRef.current = false;
+    setPhase('idle');
+    setStep(null);
+    setNotice('Cancelled before recording started — nothing was saved.');
+  }, []);
 
   const stop = useCallback(async () => {
     const session = sessionRef.current;
@@ -363,6 +458,7 @@ export function useCaptureSession(
   return {
     phase,
     step,
+    stalled,
     request,
     setRequest,
     status,
@@ -377,6 +473,7 @@ export function useCaptureSession(
     start,
     stop,
     cancel,
+    cancelStart,
     restore,
     discard,
   };
