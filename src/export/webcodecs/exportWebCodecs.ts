@@ -6,6 +6,7 @@ import {
   StreamTarget,
   canEncodeAudio,
 } from 'mediabunny';
+import type { MetadataTags } from 'mediabunny';
 import type { Clip, EditorState, MediaAsset, VisualClip } from '../../types/editor';
 import { audibleClips, compositeLayers, compositeOrderedClips } from '../../utils/compositeOrder';
 import {
@@ -49,6 +50,8 @@ export async function exportWithWebCodecs(
   spec: ResolvedExport,
   onProgress: (fraction: number) => void,
   signal: AbortSignal,
+  /** Descriptive tags from the export dialog. The date below fills in what was not typed. */
+  tags: MetadataTags = {},
 ): Promise<WebCodecsExportResult> {
   if (!(await webCodecsExportSupported())) {
     throw new WebCodecsUnsupportedError('This browser cannot encode H.264 through WebCodecs.');
@@ -118,12 +121,13 @@ export async function exportWithWebCodecs(
       target: new StreamTarget(scratch.writable, { chunked: true }),
     });
 
-    // Creation date is the one descriptive field the editor can honestly fill in: a project has
-    // no name to put in a title until projects can be saved. Without this an exported file has
-    // no date at all, and players fall back to whenever it was copied.
+    // Whatever was typed into the tag form wins; the date and comment are what the editor can
+    // fill in by itself. Without a date at all, players fall back to whenever the file was
+    // copied, which is never the right answer.
     output.setMetadataTags({
       date: new Date(),
       comment: 'Encoded in the browser with WebCodecs.',
+      ...tags,
     });
 
     const videoSource = new CanvasSource(compositor.canvas, {

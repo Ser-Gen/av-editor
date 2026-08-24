@@ -6,8 +6,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A multi-track audio/video editor that runs entirely in the browser — no backend. React 19 +
 zustand + TypeScript on Vite. Rendering is WebGL; export is WebCodecs with FFmpeg WASM as the
-fallback. `README.md` documents the app from the user's side; `docs/capture-effects-plan.md` is
-the phased plan of record, with a results section and a DOD checklist per phase.
+fallback. `README.md` documents the app from the user's side; `docs/capture-effects-plan.md` and
+`docs/audio-export-plan.md` are the phased plans of record, each with a results section and a
+DOD checklist per phase.
 
 ## Commands
 
@@ -38,7 +39,7 @@ src/store/      editorStore.ts (one zustand store, all actions), history.ts, cli
 src/project/    persistence: project file, OPFS stores, autosave, relink, folder bundle
 src/render/     GLCompositor.ts + effects/ (registry, custom shader compiler, presets)
 src/preview/    PlaybackEngine.ts — drives <video>/<audio> elements against the compositor
-src/export/     runExport.ts, webcodecs/ (fast path), buildFilterGraph.ts (FFmpeg fallback)
+src/export/     runExport.ts, webcodecs/ (fast path), audio/ (audio-only), buildFilterGraph.ts
 src/capture/    recording: CaptureSession, source acquisition, two engines, OPFS store, recovery
 src/tools/      FFmpeg preset jobs (presets.ts) and the GPU bake (bakeClip.ts)
 src/utils/      shared semantics — see below; most of the pure logic lives here

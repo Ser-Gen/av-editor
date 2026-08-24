@@ -9,7 +9,22 @@
  * Bitrate is derived from the *pixel rate* rather than fixed, so "Web" means the same thing at
  * 720p and at 4K. A fixed number would be generous at one size and unusable at the other.
  */
-import type { ExportQuality, ExportSettings, ProjectSettings } from '../types/editor';
+import type {
+  AudioFormat,
+  ExportOutput,
+  ExportQuality,
+  ExportSettings,
+  ProjectSettings,
+} from '../types/editor';
+
+/**
+ * The enum values a project file is allowed to contain. Listed here rather than derived from
+ * the format table, which lives in `audioExport.ts` and imports this module — the dependency
+ * only runs one way.
+ */
+const QUALITIES: ExportQuality[] = ['master', 'web', 'small'];
+const OUTPUTS: ExportOutput[] = ['video', 'audio'];
+const AUDIO_FORMAT_NAMES: AudioFormat[] = ['mp3', 'm4a', 'wav', 'flac', 'ogg'];
 
 interface QualityPreset {
   label: string;
@@ -45,15 +60,53 @@ export const QUALITY_PRESETS: Record<ExportQuality, QualityPreset> = {
 };
 
 export const DEFAULT_EXPORT_SETTINGS: ExportSettings = {
+  output: 'video',
   quality: 'web',
   videoBitrate: null,
   keyframeInterval: QUALITY_PRESETS.web.keyframeInterval,
   audioBitrate: QUALITY_PRESETS.web.audioBitrate,
   audioChannels: 2,
+  audioFormat: 'mp3',
+  // The rate the whole app mixes at. 44.1 kHz is offered but not the default: matching the
+  // mix means an export resamples nothing.
+  audioSampleRate: 48_000,
   width: null,
   height: null,
   fps: null,
 };
+
+/**
+ * An export settings object read from a project file, with anything missing filled in.
+ *
+ * Every field added to `ExportSettings` since the project format was frozen arrives as
+ * `undefined` in a project written before it — the file is read back with a cast, not a
+ * schema. Merging the defaults underneath means an older project opens with a working
+ * setting instead of an empty control, and it covers the next field added as well as this one.
+ */
+export function repairExportSettings(raw: unknown): ExportSettings {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    return { ...DEFAULT_EXPORT_SETTINGS };
+  }
+  const stored = raw as Record<string, unknown>;
+  const merged: Record<string, unknown> = { ...DEFAULT_EXPORT_SETTINGS };
+  for (const key of Object.keys(DEFAULT_EXPORT_SETTINGS)) {
+    // `null` is meaningful for the override fields, so only `undefined` falls back.
+    if (stored[key] !== undefined) merged[key] = stored[key];
+  }
+  // The three enum fields are used as lookup keys — by the quality table, the audio format
+  // table and the export branch. An unrecognised one would not degrade, it would throw on a
+  // property of undefined, so a value nobody knows is treated the same as no value at all.
+  if (!QUALITIES.includes(merged.quality as ExportQuality)) {
+    merged.quality = DEFAULT_EXPORT_SETTINGS.quality;
+  }
+  if (!OUTPUTS.includes(merged.output as ExportOutput)) {
+    merged.output = DEFAULT_EXPORT_SETTINGS.output;
+  }
+  if (!AUDIO_FORMAT_NAMES.includes(merged.audioFormat as AudioFormat)) {
+    merged.audioFormat = DEFAULT_EXPORT_SETTINGS.audioFormat;
+  }
+  return merged as unknown as ExportSettings;
+}
 
 /** Everything the encoders actually need, with presets and overrides already resolved. */
 export interface ResolvedExport {

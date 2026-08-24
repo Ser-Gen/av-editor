@@ -1001,6 +1001,11 @@ body.is-dragging * {
   display: flex;
   flex-direction: column;
   gap: 12px;
+  /* Export settings with the tag form open is taller than a laptop screen. Without this the
+     Save button simply sits below the bottom of the window with no way to reach it. */
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 
 .modal h2 {
@@ -1085,6 +1090,80 @@ body.is-dragging * {
   font-size: 11px;
   color: var(--text-muted);
   line-height: 1.4;
+}
+
+/*
+ * The output switch. Two mutually exclusive answers to "what kind of file", so a pair of
+ * segments rather than a dropdown: the alternative should be visible without opening anything,
+ * because it changes what every control below it means.
+ */
+.output-switch {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface2);
+}
+
+.output-option {
+  border: none;
+  background: none;
+  padding: 6px 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.output-option:hover {
+  color: var(--text);
+}
+
+.output-option.is-on {
+  color: var(--text);
+  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 26%, var(--surface));
+}
+
+/* Tag fields: label beside its input, so eleven of them fit without becoming a scroll. */
+.metadata-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.metadata-row {
+  display: grid;
+  grid-template-columns: 78px 1fr;
+  gap: 8px;
+  align-items: center;
+}
+
+.metadata-row > label {
+  /* Overrides the stacked-label nudge .modal-settings sets for the rest of the dialog. */
+  margin-bottom: 0;
+}
+
+.metadata-row input,
+.metadata-row textarea,
+.metadata-row select {
+  width: 100%;
+  min-width: 0;
+}
+
+.metadata-row textarea {
+  resize: vertical;
+  font: inherit;
+}
+
+.metadata-cover {
+  width: 32px;
+  height: 32px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
 }
 
 .disclosure {

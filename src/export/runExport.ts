@@ -10,6 +10,10 @@ import { clearExportScratch } from './webcodecs/opfs';
 import { exportBlockedBy } from '../utils/offlineMedia';
 import { formatBitrate, resolveExport } from '../utils/exportSettings';
 import type { ResolvedExport } from '../utils/exportSettings';
+import { AUDIO_FORMATS, audioFileName, resolveAudioExport } from '../utils/audioExport';
+import type { ResolvedAudioExport } from '../utils/audioExport';
+import { ffmpegMetadataArgs, wavMetadataFormat } from '../utils/audioMetadata';
+import { buildMetadataTags } from './metadataTags';
 import { sameAspect } from '../utils/resolution';
 
 let activeExport: AbortController | null = null;
@@ -56,6 +60,14 @@ export async function runExport(options: { forceFfmpeg?: boolean } = {}): Promis
   store.setExportProgress(0);
 
   try {
+    // Audio-only takes neither engine's video path: it has no frames to composite, and
+    // `webCodecsExportSupported()` asks about an H.264 encoder — the wrong question when
+    // WAV needs no encoder at all.
+    if (store.exportSettings.output === 'audio') {
+      await runAudioExport(controller.signal);
+      return;
+    }
+
     if (!options.forceFfmpeg && (await webCodecsExportSupported())) {
       try {
         await runWebCodecsExport(controller.signal);
@@ -116,6 +128,60 @@ function describeSpec(spec: ResolvedExport): string {
   );
 }
 
+/** One line describing the audio file afterwards, matching `describeSpec` on the video side. */
+function describeAudio(resolved: ResolvedAudioExport): string {
+  const spec = AUDIO_FORMATS[resolved.format];
+  const rate = resolved.lossless ? '16-bit' : formatBitrate(resolved.bitrate);
+  return (
+    `${spec.label} · ${rate} · ${(resolved.sampleRate / 1000).toFixed(1).replace(/\.0$/, '')} kHz · ` +
+    `${resolved.channels === 1 ? 'mono' : 'stereo'}`
+  );
+}
+
+async function runAudioExport(signal: AbortSignal): Promise<void> {
+  const store = useEditorStore.getState();
+  store.setExportEngine('webcodecs');
+  await clearExportScratch();
+
+  // Lazily loaded for the same reason the video path is: mediabunny's muxers and codec tables
+  // are not worth loading until an export actually runs.
+  const { exportAudioTrack } = await import('./audio/exportAudioTrack');
+
+  const resolved = resolveAudioExport(store.exportSettings);
+  const metadata = store.audioMetadata;
+  // Only the date is filled in by the app. The video path adds a canned comment; a music file's
+  // comment field is read by people, so nothing is put there that the user did not type.
+  const { tags, warning } = await buildMetadataTags(metadata, store.mediaLibrary, {
+    date: new Date(),
+  });
+  if (warning) store.setExportNotice(warning);
+
+  console.log('[Export] audio settings', describeAudio(resolved));
+  const started = performance.now();
+  const result = await exportAudioTrack(
+    { clips: store.clips, mediaLibrary: store.mediaLibrary, tracks: store.tracks },
+    resolved,
+    tags,
+    wavMetadataFormat(metadata),
+    (fraction: number) => store.setExportProgress(Math.round(fraction * 100)),
+    signal,
+  );
+
+  const seconds = (performance.now() - started) / 1000;
+  downloadFile(result.file, audioFileName(metadata.title, resolved, Date.now()));
+  store.setExportProgress(100);
+  store.setExportNotice(
+    [
+      warning,
+      `Exported ${result.durationSeconds.toFixed(1)}s of audio in ${seconds.toFixed(1)}s — ` +
+        `${describeAudio(resolved)}.`,
+    ]
+      .filter(Boolean)
+      .join(' '),
+  );
+  console.log('[Export] audio done:', result.file.size, 'bytes');
+}
+
 async function runWebCodecsExport(signal: AbortSignal): Promise<void> {
   const store = useEditorStore.getState();
   store.setExportEngine('webcodecs');
@@ -129,6 +195,11 @@ async function runWebCodecsExport(signal: AbortSignal): Promise<void> {
   const spec = outputSpec();
   console.log('[Export] settings', describeSpec(spec));
 
+  // An MP4 carries the same descriptive fields as an MP3 — there is no reason for the video
+  // export to say less about a file than the audio export does.
+  const { tags, warning } = await buildMetadataTags(store.audioMetadata, store.mediaLibrary);
+  if (warning) store.setExportNotice(warning);
+
   const started = performance.now();
   const result = await exportWithWebCodecs(
     {
@@ -140,6 +211,7 @@ async function runWebCodecsExport(signal: AbortSignal): Promise<void> {
     spec,
     (fraction: number) => store.setExportProgress(Math.round(fraction * 100)),
     signal,
+    tags,
   );
 
   const seconds = (performance.now() - started) / 1000;
@@ -199,6 +271,14 @@ async function runFfmpegExport(signal: AbortSignal): Promise<void> {
     console.warn('[Export]', notice);
   }
 
+  if (store.audioMetadata.coverAssetId) {
+    // Attaching an image through FFmpeg needs a second input and a second -map, which is a
+    // different shape of change than adding a flag. Saying so beats a silently missing cover.
+    const existing = useEditorStore.getState().exportNotice;
+    const notice = 'Cover art is written by the WebCodecs export only, so it was left out.';
+    store.setExportNotice(existing ? `${existing} ${notice}` : notice);
+  }
+
   console.group('[Export] Starting');
   console.log('Settings:', describeSpec(spec));
   console.log('Duration:', plan.duration, 's');
@@ -245,6 +325,8 @@ async function runFfmpegExport(signal: AbortSignal): Promise<void> {
     `creation_time=${new Date().toISOString()}`,
     '-metadata',
     'comment=Encoded in the browser with FFmpeg.',
+    // After the canned comment, so a typed one replaces it rather than sitting beside it.
+    ...ffmpegMetadataArgs(store.audioMetadata),
     '-movflags',
     '+faststart',
     'output.mp4',

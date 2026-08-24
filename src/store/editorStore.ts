@@ -90,6 +90,8 @@ import { uid } from '../utils/id';
 import { probeMediaFile } from '../utils/probeMedia';
 import { clampDimension, clampFps, DEFAULT_SETTINGS, sameAspect } from '../utils/resolution';
 import { DEFAULT_EXPORT_SETTINGS } from '../utils/exportSettings';
+import { EMPTY_AUDIO_METADATA } from '../utils/audioMetadata';
+import type { AudioMetadata } from '../utils/audioMetadata';
 import { reframeClips, reframeTracks } from '../utils/reframe';
 import { requantizeClips } from '../utils/requantize';
 import { fetchUrlAsFile } from '../utils/urlMedia';
@@ -298,6 +300,7 @@ const initialState: EditorState = {
   exportProgress: null,
   exportEngine: null,
   exportNotice: null,
+  audioMetadata: { ...EMPTY_AUDIO_METADATA },
   libraryNotice: null,
   processJob: null,
   readOnly: false,
@@ -328,6 +331,7 @@ interface EditorActions {
   setExportProgress: (p: number | null) => void;
   setExportEngine: (engine: EditorState['exportEngine']) => void;
   setExportNotice: (message: string | null) => void;
+  setAudioMetadata: (metadata: AudioMetadata) => void;
   setLibraryNotice: (message: string | null) => void;
   getProjectDuration: () => number;
   /** What the timeline draws: content, plus tail, never less than the minimum span. */
@@ -820,6 +824,9 @@ export const useEditorStore = create<Store>((set, get) => {
     setExportProgress: (exportProgress) => set({ exportProgress }),
     setExportEngine: (exportEngine) => set({ exportEngine }),
     setExportNotice: (exportNotice) => set({ exportNotice }),
+    // Deliberately not `commit`: tags are not part of the document yet, so typing a title is
+    // not an undoable edit and does not mark the project dirty. See `AudioMetadata`.
+    setAudioMetadata: (audioMetadata) => set({ audioMetadata }),
     setLibraryNotice: (libraryNotice) => set({ libraryNotice }),
 
     // -------------------------------------------------------------- selection

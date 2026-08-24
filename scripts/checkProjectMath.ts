@@ -125,6 +125,26 @@ import {
 } from '../src/capture/sources';
 import { settleWithin } from '../src/utils/deadline';
 import {
+  AUDIO_FORMATS,
+  AUDIO_FORMAT_ORDER,
+  audioFileName,
+  audioSummary,
+  estimateAudioBytes,
+  pcmBytesPerSecond,
+  resolveAudioExport,
+} from '../src/utils/audioExport';
+import {
+  EMPTY_AUDIO_METADATA,
+  ffmpegMetadataArgs,
+  metadataFieldCount,
+  metadataIsEmpty,
+  parseTagDate,
+  toMetadataTags,
+  wavMetadataFormat,
+} from '../src/utils/audioMetadata';
+import { DEFAULT_EXPORT_SETTINGS, repairExportSettings } from '../src/utils/exportSettings';
+import { PROJECT_FILE_VERSION } from '../src/types/editor';
+import {
   detachedAudio,
   detachedAudioAdvice,
   detachedAudioOutcome,
@@ -1600,6 +1620,181 @@ check('the resize is a step you can see', typeof CAPTURE_STEP_LABELS.sizing, 'st
 check('every step has a label',
   Object.values(CAPTURE_STEP_LABELS).every((label) => label.length > 0), true);
 
+
+// --- 37. audio export: formats, sizes, names, tags -------------------------------
+// An audio-only export is the mix in a different container. What can go wrong is not the
+// audio — that is the same generator the video export uses — but everything around it: a
+// bitrate handed to a format that has none, an .mp4 extension on a file with no picture,
+// an empty ID3 frame where the user typed nothing.
+
+// Every format must be distinguishable from every other, or the download name and the muxer
+// disagree about what was written.
+const audioExtensions = AUDIO_FORMAT_ORDER.map((f) => AUDIO_FORMATS[f].extension);
+check('every audio format has its own extension',
+  new Set(audioExtensions).size, AUDIO_FORMAT_ORDER.length);
+check('every audio format has a codec',
+  AUDIO_FORMAT_ORDER.every((f) => AUDIO_FORMATS[f].codec.length > 0), true);
+check('every audio format says what it is for',
+  AUDIO_FORMAT_ORDER.every((f) => AUDIO_FORMATS[f].description.length > 0), true);
+// Mediabunny's Mp4OutputFormat reports '.mp4'. A .mp4 with no video track reads as a broken
+// video to phones and players, which is why this one is overridden.
+check('AAC audio is named .m4a, not .mp4', AUDIO_FORMATS.m4a.extension, '.m4a');
+check('only WAV and FLAC are lossless',
+  AUDIO_FORMAT_ORDER.filter((f) => AUDIO_FORMATS[f].lossless), ['wav', 'flac']);
+check('lossless formats offer no bitrate choice',
+  AUDIO_FORMAT_ORDER.every((f) => AUDIO_FORMATS[f].lossless === (AUDIO_FORMATS[f].bitrates === null)),
+  true);
+
+const audioSettings = { ...DEFAULT_EXPORT_SETTINGS, output: 'audio' as const, audioBitrate: 192_000 };
+const mp3Spec = resolveAudioExport(audioSettings);
+check('a lossy format carries the bitrate through', mp3Spec.bitrate, 192_000);
+check('and its codec', mp3Spec.codec, 'mp3');
+// Zero rather than the leftover 192_000: nothing downstream can then pass a meaningless
+// bitrate to an encoder that would honour it. Mediabunny rejects a bitrate for PCM outright.
+const wavSpec = resolveAudioExport({ ...audioSettings, audioFormat: 'wav' });
+check('a lossless format reports no bitrate at all', wavSpec.bitrate, 0);
+check('a lossless format is marked lossless', wavSpec.lossless, true);
+
+check('PCM bytes per second, 48k stereo 16-bit', pcmBytesPerSecond(48_000, 2), 192_000);
+check('PCM bytes per second, mono halves it', pcmBytesPerSecond(48_000, 1), 96_000);
+// An hour of these is the case this feature exists for, and the difference between them is
+// the whole reason the format choice is the first control in the dialog.
+check('an hour of 192 kbps MP3', estimateAudioBytes(mp3Spec, 3600), 86_400_000);
+check('an hour of 48k stereo WAV', estimateAudioBytes(wavSpec, 3600), 691_200_044);
+check('FLAC is estimated at 0.6 of PCM',
+  estimateAudioBytes(resolveAudioExport({ ...audioSettings, audioFormat: 'flac' }), 3600),
+  Math.round(691_200_000 * 0.6));
+check('a mono MP3 is the same size as a stereo one — the bitrate is the bitrate',
+  estimateAudioBytes(resolveAudioExport({ ...audioSettings, audioChannels: 1 }), 60),
+  estimateAudioBytes(mp3Spec, 60));
+
+check('a typed title becomes the file name',
+  audioFileName('Team sync', mp3Spec, 1000), 'Team sync.mp3');
+check('and loses what a file system objects to',
+  audioFileName('Q3: plans / notes', mp3Spec, 1000), 'Q3 plans notes.mp3');
+// Checked after cleaning rather than before: a title that is entirely punctuation leaves
+// nothing behind, and an empty name is not a name.
+check('a title of nothing but punctuation falls back to the timestamp',
+  audioFileName('///', mp3Spec, 1000), 'export_1000.mp3');
+check('no title at all falls back too',
+  audioFileName('   ', wavSpec, 1000), 'export_1000.wav');
+check('the extension follows the format',
+  audioFileName('Take', resolveAudioExport({ ...audioSettings, audioFormat: 'ogg' }), 1), 'Take.ogg');
+
+check('the toolbar says the rate for a lossy format', audioSummary(mp3Spec), 'MP3 · 192 kbps');
+check('and the sample rate for a lossless one', audioSummary(wavSpec), 'WAV · 48 kHz');
+
+// --- tags ---------------------------------------------------------------------
+check('an untouched form is empty', metadataIsEmpty(EMPTY_AUDIO_METADATA), true);
+check('and writes no tags at all',
+  Object.keys(toMetadataTags(EMPTY_AUDIO_METADATA)).length, 0);
+// An empty ID3 frame is not the same as no frame: players show it as a title of one space,
+// and taggers preserve it. Whatever was not filled in must leave no trace.
+check('blank fields are absent, not written empty',
+  Object.keys(toMetadataTags({ ...EMPTY_AUDIO_METADATA, title: '   ', artist: 'Ann' })),
+  ['artist']);
+check('and are trimmed when they are not blank',
+  toMetadataTags({ ...EMPTY_AUDIO_METADATA, title: '  Take one  ' }).title, 'Take one');
+
+const fullTags = toMetadataTags({
+  ...EMPTY_AUDIO_METADATA,
+  title: 'Take one',
+  artist: 'Ann',
+  album: 'Calls',
+  albumArtist: 'Various',
+  trackNumber: 3,
+  tracksTotal: 12,
+  date: '2026-08-25',
+});
+check('the tags that were typed are all there',
+  Object.keys(fullTags).sort(),
+  ['album', 'albumArtist', 'artist', 'date', 'title', 'trackNumber', 'tracksTotal']);
+check('track numbers stay numbers', fullTags.trackNumber, 3);
+
+// `new Date('2026-08-25')` is UTC midnight, which anywhere west of Greenwich is the day
+// before — the tag would read the 24th for everyone in the Americas.
+const tagDate = parseTagDate('2026-08-25');
+check('a typed date is the date that was typed, in any timezone',
+  [tagDate?.getFullYear(), (tagDate?.getMonth() ?? -1) + 1, tagDate?.getDate()],
+  [2026, 8, 25]);
+check('a half-typed date is no date', parseTagDate('2026-08'), null);
+check('and neither is nothing', parseTagDate(''), null);
+
+check('a cover image becomes one front-cover attachment',
+  toMetadataTags({ ...EMPTY_AUDIO_METADATA, coverAssetId: 'a1' },
+    { data: new Uint8Array([1, 2]), mimeType: 'image/png' }).images?.[0].kind,
+  'coverFront');
+
+// FFmpeg's key names are its own, and they differ in exactly the places that matter.
+check('FFmpeg gets flag/value pairs',
+  ffmpegMetadataArgs({ ...EMPTY_AUDIO_METADATA, artist: 'Ann' }), ['-metadata', 'artist=Ann']);
+check('album artist is one word to FFmpeg',
+  ffmpegMetadataArgs({ ...EMPTY_AUDIO_METADATA, albumArtist: 'Various' }),
+  ['-metadata', 'album_artist=Various']);
+check('a track with a total is written the conventional way',
+  ffmpegMetadataArgs({ ...EMPTY_AUDIO_METADATA, trackNumber: 3, tracksTotal: 12 }),
+  ['-metadata', 'track=3/12']);
+check('and without one it is just the number',
+  ffmpegMetadataArgs({ ...EMPTY_AUDIO_METADATA, trackNumber: 3 }), ['-metadata', 'track=3']);
+check('a total on its own says nothing and is dropped',
+  ffmpegMetadataArgs({ ...EMPTY_AUDIO_METADATA, tracksTotal: 12 }), []);
+check('an unparseable date is not passed on',
+  ffmpegMetadataArgs({ ...EMPTY_AUDIO_METADATA, date: 'last tuesday' }), []);
+
+// A RIFF INFO list is what other editors read, but it cannot hold artwork or lyrics.
+check('a plain WAV keeps its tags where DAWs look',
+  wavMetadataFormat({ ...EMPTY_AUDIO_METADATA, title: 'Take' }), 'info');
+check('artwork moves them to an ID3 chunk',
+  wavMetadataFormat({ ...EMPTY_AUDIO_METADATA, coverAssetId: 'a1' }), 'id3');
+check('so do lyrics', wavMetadataFormat({ ...EMPTY_AUDIO_METADATA, lyrics: 'la' }), 'id3');
+
+check('the disclosure counts what is filled in',
+  metadataFieldCount({ ...EMPTY_AUDIO_METADATA, title: 'A', artist: 'B', trackNumber: 1 }), 3);
+check('whitespace is not a filled-in field',
+  metadataFieldCount({ ...EMPTY_AUDIO_METADATA, title: '   ' }), 0);
+
+// --- an older project file ------------------------------------------------------
+// The project file is read back with a cast, not a schema, so every field added to
+// ExportSettings since the format was frozen arrives as undefined in a project written
+// before it. Merging the defaults underneath fixes this addition and the next one.
+const oldSettings = repairExportSettings({ quality: 'small', videoBitrate: null, audioChannels: 1 });
+check('an older project gets a working audio format', oldSettings.audioFormat, DEFAULT_EXPORT_SETTINGS.audioFormat);
+check('and a sample rate', oldSettings.audioSampleRate, DEFAULT_EXPORT_SETTINGS.audioSampleRate);
+check('and still exports video, as it always did', oldSettings.output, 'video');
+check('what it did say is kept', oldSettings.quality, 'small');
+check('including a channel count', oldSettings.audioChannels, 1);
+// null is a real answer for the override fields — "follow the project" — so only undefined falls back.
+check('an explicit null override is not overwritten by a default',
+  repairExportSettings({ width: null }).width, null);
+check('nonsense in that slot yields the defaults whole',
+  repairExportSettings('not an object'), DEFAULT_EXPORT_SETTINGS);
+
+// These three are used as lookup keys, so an unrecognised one would throw on a property of
+// undefined rather than degrade. A hand-edited file, or one from a build that had a format
+// this one does not, must still open.
+check('an unknown audio format falls back to a known one',
+  repairExportSettings({ audioFormat: 'aiff' }).audioFormat, DEFAULT_EXPORT_SETTINGS.audioFormat);
+check('an unknown output falls back to video',
+  repairExportSettings({ output: 'gif' }).output, 'video');
+check('an unknown quality falls back to the default preset',
+  repairExportSettings({ quality: 'ultra' }).quality, DEFAULT_EXPORT_SETTINGS.quality);
+check('the format table has a row for every name the repair allows',
+  AUDIO_FORMAT_ORDER.every((f) => repairExportSettings({ audioFormat: f }).audioFormat === f), true);
+
+const oldFile = fromProjectFile({
+  version: PROJECT_FILE_VERSION,
+  savedAt: 1,
+  doc: {
+    settings: { width: 1920, height: 1080, fps: 30 },
+    exportSettings: { quality: 'web' },
+    tracks: [],
+    clips: [],
+    libraryOrder: [],
+  },
+  assets: [],
+});
+check('a project file missing the new fields still loads',
+  oldFile?.doc.exportSettings.audioFormat, DEFAULT_EXPORT_SETTINGS.audioFormat);
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

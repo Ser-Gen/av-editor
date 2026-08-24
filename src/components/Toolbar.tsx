@@ -6,6 +6,7 @@ import { formatExportError, logExportError } from '../export/exportLog';
 import { ProjectSettingsDialog } from './ProjectSettingsDialog';
 import { ExportSettingsDialog } from './ExportSettingsDialog';
 import { QUALITY_PRESETS } from '../utils/exportSettings';
+import { AUDIO_FORMATS, audioSummary, resolveAudioExport } from '../utils/audioExport';
 
 interface Props {
   onAddText: () => void;
@@ -25,7 +26,8 @@ export function Toolbar({ onAddText }: Props) {
   const exportEngine = useEditorStore((s) => s.exportEngine);
   const exportNotice = useEditorStore((s) => s.exportNotice);
   const clips = useEditorStore((s) => s.clips);
-  const exportQuality = useEditorStore((s) => s.exportSettings.quality);
+  const exportSettings = useEditorStore((s) => s.exportSettings);
+  const audioOnly = exportSettings.output === 'audio';
 
   const importFiles = useEditorStore((s) => s.importFiles);
   const setFfmpegStatus = useEditorStore((s) => s.setFfmpegStatus);
@@ -159,17 +161,27 @@ export function Toolbar({ onAddText }: Props) {
       <button
         type="button"
         className="toolbar-settings"
-        title="Quality, bitrate and output size"
+        title={
+          audioOnly
+            ? 'Format, bitrate and tags'
+            : 'Quality, bitrate, output size and tags'
+        }
         onClick={() => setExportOpen(true)}
       >
-        {QUALITY_PRESETS[exportQuality].label}
+        {audioOnly
+          ? audioSummary(resolveAudioExport(exportSettings))
+          : QUALITY_PRESETS[exportSettings.quality].label}
       </button>
 
       <button
         type="button"
-        title="Force the FFmpeg pipeline instead of WebCodecs"
+        title={
+          audioOnly
+            ? 'FFmpeg has no part in an audio export — it is muxed directly'
+            : 'Force the FFmpeg pipeline instead of WebCodecs'
+        }
         onClick={() => void handleExport(true)}
-        disabled={clips.length === 0 || exporting}
+        disabled={clips.length === 0 || exporting || audioOnly}
       >
         Export (FFmpeg)
       </button>
@@ -185,7 +197,7 @@ export function Toolbar({ onAddText }: Props) {
           onClick={() => void handleExport()}
           disabled={clips.length === 0}
         >
-          Export MP4
+          {audioOnly ? `Export ${AUDIO_FORMATS[exportSettings.audioFormat].label}` : 'Export MP4'}
         </button>
       )}
     </header>

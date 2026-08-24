@@ -550,6 +550,57 @@ turn the export down. Track volume and clip gain are the ones that are part of t
 
 Prefer H.264/AAC MP4 inputs for reliable export. Large projects may hit browser memory limits.
 
+### Exporting audio
+
+The export settings dialog opens with a choice of what kind of file to make. Switch it to
+**Audio only** and the Export button makes one of these instead of an MP4 — the same mix, in a
+container with no picture in it. The video settings are left exactly as they were; switching
+back finds them unchanged.
+
+| Format | What it is for |
+|---|---|
+| **MP3** | Plays everywhere, including on things that play nothing else |
+| **M4A (AAC)** | Better than MP3 at the same size. The default on Apple devices |
+| **Ogg (Opus)** | The best of these at low bitrates — good for speech and long calls |
+| **WAV** | Uncompressed, for handing to another editor. Large, and always works |
+| **FLAC** | Lossless but compressed, for archiving. About half the size of WAV |
+
+Bitrate applies to the three lossy formats; WAV and FLAC grey it out, because they have no such
+setting. Sample rate is 48 kHz (what the app mixes at, so nothing is resampled) or 44.1 kHz.
+Mono and stereo are the same choice the video export offers. The line under the controls
+estimates the finished size, which is the number worth reading before exporting an hour of WAV.
+
+No browser can encode MP3 through WebCodecs, so picking MP3 loads a LAME encoder — about
+310 kB, fetched the first time you use it and not before. Everything else encodes natively.
+WAV needs no encoder at all, which makes it the one that works when nothing else does.
+
+Audio export goes through the mediabunny pipeline only; the **Export (FFmpeg)** button is
+disabled in audio mode, because FFmpeg plays no part in it. The file streams to disk as it is
+written, so an hour-long recording exports without the tab's memory climbing.
+
+### Tags
+
+The **Tags** section of the same dialog fills in what the file says about itself: title,
+artist, album, album artist, genre, comment, lyrics, track and disc numbers, a date, and a
+cover image chosen from the media library.
+
+These are written into **whatever you export, audio or video** — an MP4 carries the same
+descriptive fields as an MP3. Each format stores them in its own native convention, and you do
+not have to care which: ID3v2 in an MP3, `ilst` atoms in an M4A, Vorbis comments in FLAC and
+Ogg, a RIFF INFO chunk in a WAV. A WAV switches to an ID3 chunk when the tags include artwork
+or lyrics, which RIFF INFO cannot hold.
+
+A field left blank is left out of the file rather than written empty. A typed title also
+becomes the download's file name.
+
+Two limits worth knowing:
+
+- **Tags are remembered while the tab is open, not saved with the project.** They survive
+  closing the dialog and exporting twice; a reload clears them.
+- **Cover art is written by the WebCodecs path only.** Forcing an FFmpeg export says so and
+  leaves the artwork out. An image that has gone offline since it was imported does the same —
+  the export still runs, and the notice tells you to relink it.
+
 ---
 
 ## References

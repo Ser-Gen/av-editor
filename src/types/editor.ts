@@ -1,3 +1,5 @@
+import type { AudioMetadata } from '../utils/audioMetadata';
+
 export type ResolutionPreset = '480p' | '720p' | '1080p' | '4K';
 /** Tracks are an ordered layer stack: video tracks composite bottom-up, audio tracks mix. */
 export type TrackKind = 'video' | 'audio';
@@ -22,6 +24,11 @@ export interface ProjectSettings {
 /** How much the exporter spends on quality. Presets set every field below at once. */
 export type ExportQuality = 'master' | 'web' | 'small';
 
+/** What the Export button makes. Audio-only is a different file, not a smaller one. */
+export type ExportOutput = 'video' | 'audio';
+
+export type AudioFormat = 'mp3' | 'm4a' | 'wav' | 'flac' | 'ogg';
+
 /**
  * How the project is encoded on the way out.
  *
@@ -30,14 +37,21 @@ export type ExportQuality = 'master' | 'web' | 'small';
  * why the size override lives here — a 1080p web copy of a 4K project is an export, not an edit.
  */
 export interface ExportSettings {
+  /** Video (MP4) or audio only. The fields below are shared where they mean the same thing. */
+  output: ExportOutput;
   quality: ExportQuality;
   /** Bits per second. Null follows the preset, scaled to the frame size and rate. */
   videoBitrate: number | null;
   /** Seconds between keyframes. Shorter seeks better and costs size. */
   keyframeInterval: number;
+  /** Bits per second. Shared by both outputs; ignored by lossless audio formats. */
   audioBitrate: number;
-  /** 1 = mono, 2 = stereo. */
+  /** 1 = mono, 2 = stereo. Shared by both outputs. */
   audioChannels: number;
+  /** Audio-only exports. The container and codec the file is written as. */
+  audioFormat: AudioFormat;
+  /** Audio-only exports. The mix renders at this rate rather than resampling afterwards. */
+  audioSampleRate: number;
   /** Output size. Null follows the project. Must be the project's aspect — scale, not reshape. */
   width: number | null;
   height: number | null;
@@ -395,6 +409,15 @@ export interface EditorState extends EditorDoc {
   exportEngine: 'webcodecs' | 'ffmpeg' | null;
   /** Why the fast path was declined, or how the export ended. */
   exportNotice: string | null;
+  /**
+   * Descriptive tags written into the exported file.
+   *
+   * Session state, deliberately outside `EditorDoc`: typing a title is not yet an edit to the
+   * project, so it is not undoable and not saved. Moving it into the document later means
+   * moving this line into `EditorDoc` and routing its setter through `commit` — the value is
+   * already plain and serializable for exactly that reason.
+   */
+  audioMetadata: AudioMetadata;
   /** Short-lived status after URL-based library import. */
   libraryNotice: string | null;
   /** The library preset currently running, if any. */

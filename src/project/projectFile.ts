@@ -24,6 +24,7 @@ import type {
 } from '../types/editor';
 import { PROJECT_FILE_VERSION } from '../types/editor';
 import { docSnapshot } from '../store/history';
+import { repairExportSettings } from '../utils/exportSettings';
 
 const ASSET_TYPES: AssetType[] = ['video', 'audio', 'image'];
 
@@ -148,7 +149,7 @@ export function fromProjectFile(raw: unknown): LoadedProject | null {
   return {
     doc: {
       settings: doc.settings as unknown as EditorDoc['settings'],
-      exportSettings: doc.exportSettings as EditorDoc['exportSettings'],
+      exportSettings: repairExportSettings(doc.exportSettings),
       tracks: doc.tracks as EditorDoc['tracks'],
       clips,
       libraryOrder: order,

@@ -125,6 +125,12 @@ export async function* mixdownWindows(
   signal?: AbortSignal,
   /** Every clip on the timeline, so audio can cross-fade across a transition. */
   allClips: Clip[] = audible.map((a) => a.clip),
+  /**
+   * Rendering at the output's rate means an audio-only export resamples nothing: the
+   * OfflineAudioContext converts each decoded segment once, on its way into the mix, instead
+   * of the whole mix being converted again afterwards.
+   */
+  sampleRate: number = MIX_SAMPLE_RATE,
 ): AsyncGenerator<AudioBuffer> {
   const trackCache = new Map<string, InputAudioTrack | null>();
 
@@ -139,8 +145,8 @@ export async function* mixdownWindows(
   for (let windowStart = 0; windowStart < duration; windowStart += MIX_WINDOW_SECONDS) {
     signal?.throwIfAborted();
     const windowEnd = Math.min(duration, windowStart + MIX_WINDOW_SECONDS);
-    const frames = Math.max(1, Math.round((windowEnd - windowStart) * MIX_SAMPLE_RATE));
-    const ctx = new OfflineAudioContext(MIX_CHANNELS, frames, MIX_SAMPLE_RATE);
+    const frames = Math.max(1, Math.round((windowEnd - windowStart) * sampleRate));
+    const ctx = new OfflineAudioContext(MIX_CHANNELS, frames, sampleRate);
 
     for (const { clip, gain } of audible) {
       if (clip.kind !== 'audio' && clip.kind !== 'video') continue;
