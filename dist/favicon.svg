@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="AV Editor">
+  <!-- Two clips on two lanes with the playhead across them: the timeline, which is what this
+       app is, rather than a play triangle, which is what every player already uses. Colours
+       are the theme's own --surface2, --clip-video, --clip-audio and --text. The tile stays
+       opaque so the light playhead has something to sit on in a dark tab strip. -->
+  <rect width="32" height="32" rx="7" fill="#1e1e24"/>
+  <rect x="4" y="7" width="18" height="7" rx="2" fill="#3d6eb5"/>
+  <rect x="10" y="18" width="18" height="7" rx="2" fill="#3d9e6e"/>
+  <rect x="15" y="3" width="2" height="26" rx="1" fill="#e8e8ed"/>
+</svg>
