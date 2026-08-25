@@ -2,6 +2,7 @@ import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import ffmpegWorkerUrl from '@ffmpeg/ffmpeg/worker?worker&url';
 import { attachFfmpegLogging } from './exportLog';
+import { publicUrl } from '../utils/publicUrl';
 
 let instance: FFmpeg | null = null;
 
@@ -14,11 +15,10 @@ export async function loadFfmpeg(
   attachFfmpegLogging(ffmpeg, 'Load');
   ffmpeg.on('progress', ({ progress }) => onProgress?.(progress));
 
-  const base = '/ffmpeg';
   await ffmpeg.load({
     classWorkerURL: new URL(ffmpegWorkerUrl, import.meta.url).href,
-    coreURL: await toBlobURL(`${base}/ffmpeg-core.js`, 'text/javascript'),
-    wasmURL: await toBlobURL(`${base}/ffmpeg-core.wasm`, 'application/wasm'),
+    coreURL: await toBlobURL(publicUrl('ffmpeg/ffmpeg-core.js'), 'text/javascript'),
+    wasmURL: await toBlobURL(publicUrl('ffmpeg/ffmpeg-core.wasm'), 'application/wasm'),
   });
 
   instance = ffmpeg;

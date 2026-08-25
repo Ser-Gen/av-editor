@@ -1093,6 +1093,123 @@ body.is-dragging * {
 }
 
 /*
+ * The info window. Everything in it is a label/value pair, so the whole thing is one grid
+ * rhythm: a fixed label column and a value column that wraps. Values are tabular where they
+ * are numbers, because a column of sizes and rates is read by scanning down it.
+ */
+.modal-info {
+  min-width: 420px;
+  max-width: 520px;
+}
+
+.info-section {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface2);
+}
+
+.info-section h3 {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.info-row {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: 10px;
+  font-size: 12px;
+  align-items: baseline;
+}
+
+.info-label {
+  color: var(--text-muted);
+}
+
+.info-value {
+  /* Codec strings and colour-space names have no spaces to break at. */
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.info-track {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+
+.info-track:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.info-track-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.info-track-kind {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted);
+}
+
+.info-track-codec {
+  font-weight: 600;
+  font-size: 12px;
+}
+
+.info-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.info-badge.is-warn {
+  color: var(--text);
+  background: color-mix(in srgb, var(--danger) 20%, var(--surface));
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.info-tags {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.info-tag-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.info-cover {
+  width: 72px;
+  height: 72px;
+  object-fit: cover;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/*
  * The output switch. Two mutually exclusive answers to "what kind of file", so a pair of
  * segments rather than a dropdown: the alternative should be visible without opening anything,
  * because it changes what every control below it means.

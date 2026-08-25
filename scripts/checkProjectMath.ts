@@ -143,6 +143,21 @@ import {
   wavMetadataFormat,
 } from '../src/utils/audioMetadata';
 import { DEFAULT_EXPORT_SETTINGS, repairExportSettings } from '../src/utils/exportSettings';
+import {
+  aspectRatio,
+  codecLabel,
+  decodeSummary,
+  describeColorSpace,
+  describeRotation,
+  formatBitrateValue,
+  formatChannels,
+  formatFileSize,
+  formatFrameRate,
+  formatPreciseDuration,
+  formatSampleRate,
+} from '../src/utils/mediaInfoFormat';
+import type { TrackInfo } from '../src/utils/mediaInfoFormat';
+import { libraryMenuItems } from '../src/utils/libraryMenu';
 import { PROJECT_FILE_VERSION } from '../src/types/editor';
 import {
   detachedAudio,
@@ -1795,6 +1810,133 @@ const oldFile = fromProjectFile({
 });
 check('a project file missing the new fields still loads',
   oldFile?.doc.exportSettings.audioFormat, DEFAULT_EXPORT_SETTINGS.audioFormat);
+
+// --- 38. media info: reading a file back ----------------------------------------
+// The info window's job is to be trusted, so its arithmetic is the part worth asserting: an
+// aspect ratio reduced wrongly or a frame rate rounded to the wrong side of 29.97 looks
+// entirely plausible on screen and is wrong every time it is read.
+
+check('sizes stay in a unit a person can hold', formatFileSize(1536), '1.5 KB');
+check('and switch unit at the boundary', formatFileSize(1024 * 1024), '1.0 MB');
+check('a gigabyte gets two decimals, because the second one is 10 MB',
+  formatFileSize(3.25 * 1024 * 1024 * 1024), '3.25 GB');
+check('bytes below a kilobyte are just bytes', formatFileSize(512), '512 B');
+
+// This window is opened when a length is in question, so it shows the milliseconds that
+// "1:03" would hide.
+check('short durations drop the hour', formatPreciseDuration(63.5), '1:03.500');
+check('and long ones keep it', formatPreciseDuration(3723.25), '1:02:03.250');
+check('an hour exactly', formatPreciseDuration(3600), '1:00:00.000');
+// 59.9996 rounds to 1000 ms, which would otherwise print as :59.1000.
+check('a rounding carry does not produce a four-digit millisecond',
+  formatPreciseDuration(59.9996), '1:00.000');
+check('nothing is not zero', formatPreciseDuration(Number.NaN), '—');
+
+// Rates arrive from a measurement, as 29.969999999.
+check('a broadcast rate keeps its decimals', formatFrameRate(30000 / 1001), '29.97 fps');
+check('and so does its double', formatFrameRate(60000 / 1001), '59.94 fps');
+check('a whole rate prints whole — "30.00 fps" claims a precision nobody measured',
+  formatFrameRate(30.0000001), '30 fps');
+check('24 is 24', formatFrameRate(24), '24 fps');
+check('a rate of zero says nothing', formatFrameRate(0), '—');
+
+check('48 kHz', formatSampleRate(48_000), '48 kHz');
+check('44.1 kHz keeps its decimal', formatSampleRate(44_100), '44.1 kHz');
+check('one channel is mono', formatChannels(1), 'mono');
+check('two is stereo', formatChannels(2), 'stereo');
+check('six has a name', formatChannels(6), '5.1');
+check('and five does not', formatChannels(5), '5 channels');
+
+check('1920 by 1080 is 16:9', aspectRatio(1920, 1080), '16:9');
+check('a portrait phone video is 9:16', aspectRatio(1080, 1920), '9:16');
+check('4:3 still exists', aspectRatio(640, 480), '4:3');
+// A display size derived from a non-square pixel aspect is not exactly integral. 1918x1080
+// reduces to 959:540, which is true and useless; within half a percent it is 16:9.
+check('a size off by a pixel is still the ratio it obviously is', aspectRatio(1918, 1080), '16:9');
+check('something genuinely odd is reduced honestly', aspectRatio(1000, 300), '10:3');
+check('a zero dimension has no ratio', aspectRatio(0, 1080), '—');
+
+// A container may describe all of the colour space, some of it, or none. An absent field is
+// not a default — it means nobody wrote it down, and saying so is the honest answer.
+check('a full colour description reads in order',
+  describeColorSpace({ primaries: 'bt709', transfer: 'bt709', matrix: 'bt709', fullRange: false }),
+  'bt709 · bt709 · bt709 · limited range');
+check('a partial one lists only what is there',
+  describeColorSpace({ primaries: 'bt709' }), 'bt709');
+check('full range is worth saying out loud',
+  describeColorSpace({ fullRange: true }), 'full range');
+check('and an empty one says nobody wrote it down', describeColorSpace({}), 'not stated');
+
+check('no rotation is none, not 0°', describeRotation(0), 'none');
+check('a quarter turn', describeRotation(90), '90°');
+check('a full turn is none again', describeRotation(360), 'none');
+
+check('a stated bitrate reads in Mbps past a million', formatBitrateValue(5_400_000), '5.40 Mbps');
+check('and in kbps below it', formatBitrateValue(192_000), '192 kbps');
+check('a container that did not say gets a dash', formatBitrateValue(null), '—');
+
+// --- the headline sentence -------------------------------------------------------
+// An export that declines the fast path names the file but not the reason. The reason is
+// always one of these three answers, which is why this sentence is at the top of the window.
+const okVideo = { kind: 'video', id: 1, canDecode: true } as unknown as TrackInfo;
+const okAudio = { kind: 'audio', id: 2, canDecode: true } as unknown as TrackInfo;
+const badVideo = { kind: 'video', id: 1, canDecode: false } as unknown as TrackInfo;
+const badAudio = { kind: 'audio', id: 2, canDecode: false } as unknown as TrackInfo;
+
+check('one decodable track', decodeSummary([okAudio]), 'This browser can decode this track.');
+check('several decodable tracks',
+  decodeSummary([okVideo, okAudio]), 'This browser can decode every track in this file.');
+check('nothing decodable names the consequence',
+  decodeSummary([badVideo, badAudio]),
+  'This browser cannot decode this file. Export will fall back to FFmpeg.');
+check('a half-readable file names the half that is not',
+  decodeSummary([okVideo, badAudio]),
+  'This browser cannot decode the audio track. Export will fall back to FFmpeg.');
+check('and names both when both are bad',
+  decodeSummary([badVideo, badAudio, okAudio]),
+  'This browser cannot decode the video and audio track. Export will fall back to FFmpeg.');
+check('a file with no tracks is its own answer',
+  decodeSummary([]), 'No video or audio tracks in this file.');
+
+check('a codec gets the name people use', codecLabel('avc'), 'H.264 / AVC');
+check('an unlisted codec still reads', codecLabel('alaw'), 'ALAW');
+check('and no codec is honest about it', codecLabel(null), 'unknown');
+
+// --- the library's right-click menu ----------------------------------------------
+// Info is the one entry that is always there. An offline file is exactly when someone wants
+// to know what it was, and the window can answer from the library's own record.
+const onlineVideoMenu = libraryMenuItems({ type: 'video', online: true, inUse: false, producerBusy: false });
+check('info leads the menu', onlineVideoMenu[0].id, 'info');
+check('and is never disabled', onlineVideoMenu[0].disabled, undefined);
+check('a video offers presets', onlineVideoMenu.some((i) => i.id === 'preset'), true);
+check('an image does not — there is nothing for them to do to it',
+  libraryMenuItems({ type: 'image', online: true, inUse: false, producerBusy: false })
+    .some((i) => i.id === 'preset'), false);
+
+const offlineMenu = libraryMenuItems({ type: 'video', online: false, inUse: false, producerBusy: false });
+check('an offline file can still be inspected',
+  offlineMenu.find((i) => i.id === 'info')?.disabled, undefined);
+check('but not added to the timeline', offlineMenu.find((i) => i.id === 'add')?.disabled, true);
+check('and says why', (offlineMenu.find((i) => i.id === 'add')?.reason ?? '').includes('offline'), true);
+check('only an offline file offers a relink',
+  [offlineMenu, onlineVideoMenu].map((m) => m.some((i) => i.id === 'relink')), [true, false]);
+
+const inUseMenu = libraryMenuItems({ type: 'audio', online: true, inUse: true, producerBusy: false });
+check('a file the timeline uses cannot be removed',
+  inUseMenu.find((i) => i.id === 'remove')?.disabled, true);
+check('and it says which', (inUseMenu.find((i) => i.id === 'remove')?.reason ?? '').includes('timeline'), true);
+check('removal is always the dangerous one',
+  inUseMenu.find((i) => i.id === 'remove')?.danger, true);
+
+const busyMenu = libraryMenuItems({ type: 'video', online: true, inUse: false, producerBusy: true });
+check('a preset already running blocks another',
+  busyMenu.find((i) => i.id === 'preset')?.disabled, true);
+// Every disabled entry explains itself; a silent grey row is worse than a missing one.
+check('nothing is greyed out without a reason',
+  [onlineVideoMenu, offlineMenu, inUseMenu, busyMenu]
+    .flat()
+    .every((i) => !i.disabled || (i.reason ?? '').length > 0),
+  true);
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

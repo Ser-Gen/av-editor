@@ -6,16 +6,32 @@ export default defineConfig({
   optimizeDeps: {
     exclude: ['@ffmpeg/ffmpeg', '@ffmpeg/util'],
   },
-  server: {
-    headers: {
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
+  // Every URL the build emits is written relative to the document, so `dist/` can be dropped
+  // into any directory of any host — a project page under /repo/, a staging path, a file share
+  // — without being rebuilt for it. The two paths the app fetches by hand (the FFmpeg core and
+  // the overlay font) go through `publicUrl()` for the same reason.
+  base: './',
+  build: {
+    rollupOptions: {
+      output: {
+        // No content hashes: this is a single self-contained app served from a directory, and a
+        // stable name is what lets that directory be rsynced over, cached by path, or pointed at
+        // by hand. The trade is that a redeploy needs cache-busting from the server side —
+        // hashed names cannot be re-fetched wrongly, these can.
+        entryFileNames: 'assets/[name].js',
+        chunkFileNames: 'assets/[name].js',
+        assetFileNames: 'assets/[name][extname]',
+      },
     },
   },
-  preview: {
-    headers: {
-      'Cross-Origin-Opener-Policy': 'same-origin',
-      'Cross-Origin-Embedder-Policy': 'require-corp',
+  // Worker bundles are emitted by a separate rollup pass and do not inherit `build` above.
+  worker: {
+    rollupOptions: {
+      output: {
+        entryFileNames: 'assets/[name].js',
+        chunkFileNames: 'assets/[name].js',
+        assetFileNames: 'assets/[name][extname]',
+      },
     },
   },
 });

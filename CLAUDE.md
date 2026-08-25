@@ -7,15 +7,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 A multi-track audio/video editor that runs entirely in the browser — no backend. React 19 +
 zustand + TypeScript on Vite. Rendering is WebGL; export is WebCodecs with FFmpeg WASM as the
 fallback. `README.md` documents the app from the user's side; `docs/capture-effects-plan.md` and
-`docs/audio-export-plan.md` are the phased plans of record, each with a results section and a
-DOD checklist per phase.
+`docs/audio-export-plan.md` and `docs/media-info-plan.md` are the phased plans of record, each
+with a results section and a DOD checklist per phase.
 
 ## Commands
 
 | Command | Notes |
 |---|---|
 | `npm run bootstrap` | Required before the first `dev`: copies FFmpeg core into `public/ffmpeg/`, downloads the DejaVu font |
-| `npm run dev` | Vite dev server. COOP/COEP headers (set in `vite.config.ts`) are mandatory for FFmpeg WASM |
+| `npm run dev` | Vite dev server. No special headers: the bundled `@ffmpeg/core` is single-threaded, so nothing here needs cross-origin isolation |
 | `npm run build` | `tsc -b && vite build` |
 | `npm run check:math` | The only automated test suite — see below |
 
@@ -66,6 +66,12 @@ compound ones (a whole drag, a recording that also changes the project frame rat
 **A clip is a reference, never a copy**: `(assetId, sourceTrimIn, sourceTrimOut)`. Split, trim and
 duplicate move numbers only. All edits quantize to `1/fps` (`utils/time.ts`), which is what keeps
 preview and export agreeing about where a cut is.
+
+**The build is relative-based and unhashed**, so `dist/` can be hosted from any directory of
+any static host. Vite rewrites the URLs it can see; it cannot see a string passed to `fetch()`,
+so a new hand-written path to something in `public/` must go through `publicUrl()`
+(`src/utils/publicUrl.ts`) — an absolute `'/fonts/…'` works in dev and breaks everywhere else.
+See the README's Hosting section.
 
 **One shared FFmpeg WASM instance** (`export/ffmpegLoader.ts`) serves both export and the library
 tool presets. Two consequences that have already caused bugs: `ffmpeg.on()` *appends* handlers, so

@@ -7,6 +7,9 @@ import type { AssetType } from '../types/editor';
 import { inferAssetKind } from '../utils/assetKind';
 import { VideoPoster } from './VideoPoster';
 import { ProcessDialog } from './ProcessDialog';
+import { MediaInfoDialog } from './MediaInfoDialog';
+import { LibraryContextMenu } from './LibraryContextMenu';
+import type { LibraryMenuRequest } from './LibraryContextMenu';
 import { formatDuration } from '../utils/time';
 import { StorageBar } from './StorageBar';
 import { ProjectFolderButtons } from './ProjectFolderButtons';
@@ -44,6 +47,9 @@ export function MediaLibrary({ width }: { width: number }) {
   const cancelProcess = useEditorStore((s) => s.cancelProcess);
   /** Which asset the preset dialog is open for. */
   const [processTarget, setProcessTarget] = useState<string | null>(null);
+  /** Which asset the info window is open for. */
+  const [infoTarget, setInfoTarget] = useState<string | null>(null);
+  const [menu, setMenu] = useState<LibraryMenuRequest | null>(null);
   const relinkFiles = useEditorStore((s) => s.relinkFiles);
   const relinkAsset = useEditorStore((s) => s.relinkAsset);
   const readOnly = useEditorStore((s) => s.readOnly);
@@ -161,6 +167,22 @@ export function MediaLibrary({ width }: { width: number }) {
         <ProcessDialog assetId={processTarget} onClose={() => setProcessTarget(null)} />
       )}
 
+      {infoTarget && <MediaInfoDialog assetId={infoTarget} onClose={() => setInfoTarget(null)} />}
+
+      {menu && (
+        <LibraryContextMenu
+          request={menu}
+          onClose={() => setMenu(null)}
+          onInfo={setInfoTarget}
+          onPreset={setProcessTarget}
+          onRelink={(id) =>
+            void pickMediaFiles(false).then((picked) => {
+              if (picked[0]) void relinkAsset(id, picked[0].file);
+            })
+          }
+        />
+      )}
+
       {active === 'media' && (
       <ul className="media-library-list">
         {libraryOrder.length === 0 && (
@@ -177,9 +199,10 @@ export function MediaLibrary({ width }: { width: number }) {
               key={id}
               className={`media-library-item media-library-item--${asset.type}`}
               onContextMenu={(e) => {
-                if (asset.type !== 'video') return;
+                // Was video-only and opened the preset dialog outright. Every file now has
+                // something worth reaching by right-click, so it opens a menu instead.
                 e.preventDefault();
-                setProcessTarget(id);
+                setMenu({ assetId: id, x: e.clientX, y: e.clientY });
               }}
             >
               {!asset.file && <span className="media-library-thumb is-offline" title="Offline" />}
@@ -227,6 +250,13 @@ export function MediaLibrary({ width }: { width: number }) {
                   onClick={() => addAssetToTimeline(id)}
                 >
                   +
+                </button>
+                <button
+                  type="button"
+                  title="What is in this file"
+                  onClick={() => setInfoTarget(id)}
+                >
+                  ℹ
                 </button>
                 {asset.type === 'video' && (
                   <button

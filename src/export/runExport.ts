@@ -15,6 +15,7 @@ import type { ResolvedAudioExport } from '../utils/audioExport';
 import { ffmpegMetadataArgs, wavMetadataFormat } from '../utils/audioMetadata';
 import { buildMetadataTags } from './metadataTags';
 import { sameAspect } from '../utils/resolution';
+import { publicUrl } from '../utils/publicUrl';
 
 let activeExport: AbortController | null = null;
 
@@ -286,7 +287,7 @@ async function runFfmpegExport(signal: AbortSignal): Promise<void> {
   console.log('Inputs:', plan.inputSpecs);
   console.log('Filter complex:', plan.filterComplex);
 
-  const fontRes = await fetch('/fonts/DejaVuSans.ttf');
+  const fontRes = await fetch(publicUrl('fonts/DejaVuSans.ttf'));
   if (!fontRes.ok) {
     throw new Error(`Font not found (${fontRes.status}). Run npm run bootstrap.`);
   }

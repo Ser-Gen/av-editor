@@ -12,7 +12,7 @@ npm install
 npm run dev
 ```
 
-Open the dev server URL. COOP/COEP headers are required for FFmpeg WASM (configured in `vite.config.ts`).
+Open the dev server URL. No special server headers are needed — see [Hosting](#hosting).
 
 ## Scripts
 
@@ -21,6 +21,35 @@ Open the dev server URL. COOP/COEP headers are required for FFmpeg WASM (configu
 | `npm run bootstrap` | Copy FFmpeg core to `public/ffmpeg/`, download DejaVu font |
 | `npm run dev` | Development server |
 | `npm run build` | Production build |
+
+## Hosting
+
+`npm run build` produces a `dist/` that any plain static file server can serve. There is nothing
+to configure: no rewrite rules (the app is one page and does no routing), no MIME type for the
+`.wasm` (the FFmpeg core is fetched and handed to a blob URL, so the server's opinion of it never
+comes up), and **no COOP/COEP headers**. Cross-origin isolation exists to unlock
+`SharedArrayBuffer`; the core copied by `bootstrap` is `@ffmpeg/core`, the single-threaded build,
+which never asks for one. Switching to `@ffmpeg/core-mt` for a faster fallback export would
+change that, and is the only thing that would.
+
+**HTTPS is the actual requirement.** Screen and camera capture, OPFS and WebCodecs are all
+gated on a secure context. `https://` or `localhost` works; a bare `http://192.168.x.x` loads
+the page and then fails at recording and at every save.
+
+**It can live in any directory.** The build is relative-based, so `dist/` works dropped at
+`https://host/`, at `https://host/projects/editor/`, or anywhere else, unmoved and unrebuilt.
+Two files are fetched by hand rather than imported — the FFmpeg core and the overlay font — and
+they go through `publicUrl()` (`src/utils/publicUrl.ts`) to resolve the same way. One caveat
+from relative URLs generally: the directory needs its trailing slash. `…/editor` without one
+makes the browser resolve `./assets/index.js` against the parent.
+
+**Filenames carry no content hash** — `assets/index.js`, not `assets/index-a1b2c3.js` — so a
+deploy is an rsync over the directory and a path stays quotable. The trade is that cache-busting
+is now the server's job: serve `index.html` with `Cache-Control: no-cache` at least, or a
+returning visitor gets yesterday's bundle.
+
+Compress if you can. The core `.wasm` is 32 MB and gzips to about a third.
+
 
 ## Quick start
 
@@ -124,13 +153,46 @@ The **Media** tab stores all imported media for reuse. Files are referenced by `
 | **+ Import** | Media Library | File → library only |
 | **Storage** tab | Media Library | Quota, what is using it, save/open a folder copy, Clear everything |
 | **+** on a library item | Media Library | Same asset added to timeline at playhead |
+| **ℹ** on a library item | Media Library | What is actually in the file (see below) |
 | **×** on a library item | Media Library | Remove from library (disabled while used on timeline) |
+| Right-click a library item | Media Library | Info, add, process with a preset, relink, remove |
 | **Record** tab | Media Library | The capture panel: screen, microphone, system audio (see below). A recording in progress pulls this tab forward and marks it |
 | Drag files from Finder | Onto the timeline | File → library **and** a clip at the track and time you dropped on |
 
 A video file imports as **one clip** that carries its own audio — it moves, trims, splits and deletes as a single object. Use **Detach audio** in the Inspector to move that audio onto its own audio track when you need to slide it against the picture.
 
 Status messages (import, URL load, recording, frame capture) appear briefly in the library panel.
+
+### What's in this file
+
+**ℹ** on any library item — or right-click it — opens a window describing the file the way
+`ffprobe` would, read straight from the container. No FFmpeg is involved and nothing is
+downloaded to do it.
+
+The first line is the one most people came for: **whether this browser can decode the file**.
+When an export says it is falling back to FFmpeg, this is where it says which track it could
+not read and why.
+
+Below that:
+
+- **File** — where it came from, size, container, MIME type, and the duration three ways: what
+  the library is laying the timeline out from, what the container claims, and (after Measure)
+  what the file actually contains. When those disagree, that disagreement is the point.
+- **Tracks** — per track: codec and its full parameter string (`avc1.640028`), display size and
+  aspect, coded size and pixel aspect when they differ from it, rotation, colour space, HDR,
+  possible transparency, all-key-frames, channels and sample rate for audio, and the stated
+  bitrate. A track this browser has no decoder for is marked there.
+- **Measure** — the three numbers a header cannot be trusted for: true frame rate, real average
+  bitrate, exact duration. It walks every packet header in the file — no decoding, but not
+  instant on an hour-long recording, which is why it is a button.
+- **Tags** — the descriptive tags the file itself carries, cover art included. The read side of
+  the tag form in export settings: export an MP3 with tags, then open it here and see them.
+- **Recording** — for a take made in this editor: which engine wrote it, which source, when it
+  started, its offset within the take, the format the source negotiated, and why it stopped if
+  it stopped early.
+
+Offline files still open the window; it shows what the library recorded about them and says to
+relink. Images say plainly that they are not media containers, so there are no tracks to read.
 
 ---
 
