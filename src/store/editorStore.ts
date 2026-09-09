@@ -23,6 +23,11 @@ import type {
   ProcessRequest,
   DerivedFrom,
   AssetOrigin,
+  RippleScope,
+  AudioEffect,
+  AudioEffectType,
+  AnnotationShape,
+  TextObject,
 } from '../types/editor';
 import {
   BAKE_ID,
@@ -68,7 +73,21 @@ import {
   descriptorFor,
 } from '../render/effects/registry';
 import { clearShaderFailure } from '../render/effects/shaderStats';
-import { TRANSFORM_CHANNELS, clampFade } from '../utils/clipRender';
+import {
+  TRANSFORM_CHANNELS,
+  acceptsTransform,
+  clampFade,
+  clipSpeedOf,
+} from '../utils/clipRender';
+import {
+  canRetime,
+  clampSpeed,
+  formatSpeed,
+  retimeToSpeed,
+  rippleDelta,
+  slowestSpeedThatFits,
+  speedForDuration,
+} from '../utils/retime';
 import {
   channelTimes,
   evaluateChannel,
@@ -79,6 +98,17 @@ import {
   upsertKey,
 } from '../utils/keyframes';
 import { audioTracks, videoTracks } from '../utils/compositeOrder';
+import { removeShapeKeyAt, shapePointsAt, sortedKeys, upsertShapeKey } from '../utils/annotationAnim';
+import { defaultAudioParams } from '../utils/audioChain';
+import type { TextStyle } from '../utils/textStyle';
+import { clampNormalizeGain, gainForTarget } from '../utils/loudness';
+import { measureClipLoudness } from '../utils/measureLoudness';
+import {
+  applyShifts,
+  closeGapsAcrossTracks,
+  closeGapsOnTracks,
+  rippleShift,
+} from '../utils/ripple';
 import { inferAssetKind } from '../utils/assetKind';
 import { fingerprintOf, planRelink, relinkSummary } from '../utils/offlineMedia';
 import { putMedia, dropMedia, collectGarbage } from '../project/mediaStore';
@@ -98,7 +128,7 @@ import { fetchUrlAsFile } from '../utils/urlMedia';
 import { clearVideoThumbnailCache } from '../utils/videoThumbnailCache';
 import { clearWaveformCache } from '../utils/waveformCache';
 import { DEFAULT_FULL_FRAME } from '../utils/overlayTransform';
-import { clampTrackVolume } from '../utils/trackVolume';
+import { clampClipGain, clampTrackVolume } from '../utils/trackVolume';
 import { detachedAudio, detachedAudioOutcome } from '../utils/detachedAudio';
 import { overlapIsTransition } from '../utils/transitions';
 import { clampVolume, mutedAfterVolumeChange } from '../utils/transport';
@@ -149,7 +179,7 @@ function channelKeys(clip: Clip, ref: ChannelRef): Keyframe[] | undefined {
 /** The channel's static value — what a first keyframe should capture. */
 function currentChannelValue(clip: Clip, ref: ChannelRef): number | null {
   if (ref.effectId === null) {
-    if (clip.kind !== 'video' && clip.kind !== 'image') return null;
+    if (!acceptsTransform(clip)) return null;
     const transform = clip.transform;
     if (!transform) return null;
     const [group, axis] = ref.param.split('.') as ['crop' | 'frame', 'x' | 'y' | 'w' | 'h'];
@@ -162,7 +192,7 @@ function currentChannelValue(clip: Clip, ref: ChannelRef): number | null {
 /** Writes a scalar back into the channel's static home, used when disarming. */
 function freezeChannel(clip: Clip, ref: ChannelRef, value: number): Clip {
   if (ref.effectId === null) {
-    if (clip.kind !== 'video' && clip.kind !== 'image') return clip;
+    if (!acceptsTransform(clip)) return clip;
     if (!clip.transform) return clip;
     const [group, axis] = ref.param.split('.') as ['crop' | 'frame', 'x' | 'y' | 'w' | 'h'];
     return {
@@ -278,10 +308,12 @@ const initialState: EditorState = {
   tracks: defaultTracks(),
   clips: [],
   libraryOrder: [],
+  textLibrary: [],
   mediaLibrary: {},
   past: [],
   future: [],
   selectedClipIds: [],
+  selectedShapeId: null,
   playhead: 0,
   trimPreview: null,
   isPlaying: false,
@@ -292,6 +324,10 @@ const initialState: EditorState = {
   viewportHeight: 300,
   followPlayhead: true,
   snapEnabled: true,
+  rippleEnabled: false,
+  rippleScope: 'track',
+  exportForceFfmpeg: false,
+  loudnessJob: null,
   previewVolume: storedVolume(),
   previewMuted: false,
   snapIndicator: null,
@@ -333,6 +369,8 @@ interface EditorActions {
   setExportNotice: (message: string | null) => void;
   setAudioMetadata: (metadata: AudioMetadata) => void;
   setLibraryNotice: (message: string | null) => void;
+  /** Drag order of the library, which is what the "My order" sort shows. */
+  reorderLibrary: (assetId: string, targetId: string | null) => void;
   getProjectDuration: () => number;
   /** What the timeline draws: content, plus tail, never less than the minimum span. */
   getTimelineSpan: () => number;
@@ -355,6 +393,10 @@ interface EditorActions {
   togglePreviewMute: () => void;
   toggleSnap: () => void;
   setSnapIndicator: (t: number | null) => void;
+  toggleRipple: () => void;
+  setRippleScope: (scope: RippleScope) => void;
+  closeGaps: () => void;
+  setExportForceFfmpeg: (force: boolean) => void;
 
   // Tracks
   addTrack: (kind: TrackKind) => void;
@@ -367,6 +409,7 @@ interface EditorActions {
 
   // Media
   importToLibrary: (files: FileList | File[], kind: AssetType) => Promise<void>;
+  pasteImages: (files: File[]) => Promise<number>;
   importFiles: (files: FileList | File[], kind: AssetType) => Promise<void>;
   importUrlsToLibrary: (urls: string[]) => Promise<void>;
   addAssetToTimeline: (assetId: string) => void;
@@ -395,19 +438,54 @@ interface EditorActions {
   cancelProcess: () => void;
   /**
    * Points a clip at a different asset, keeping the edit and taking the new file whole.
-   * `clearEffects` drops the chain, which a bake must do — the effects are in the file now.
+   *
+   * `baked` says the new file already contains what the clip was doing to it — the effect
+   * chain *and* the retiming — so both come off the clip. Leaving either on would apply it
+   * twice: the picture would be double-graded, and a 2× clip pointed at an already-2× file
+   * would play at 4× and be half as long. A preset's output is the opposite case: it is
+   * unretimed material of the same range, so it keeps the speed and stays the same length.
+   *
    * Returns a sentence describing what changed, or null when it could not be done.
    */
   replaceClipSource: (
     clipId: string,
     assetId: string,
-    options?: { clearEffects?: boolean; followDetachedAudio?: boolean },
+    options?: { baked?: boolean; followDetachedAudio?: boolean },
   ) => string | null;
   /** Renders one clip's effect chain to a new file on the GPU, through the export path. */
   startBake: (clipId: string, replace: boolean) => Promise<void>;
 
   // Clips
   addTextClip: (text: string, template: TextTemplate) => void;
+  /** Style overrides on a text clip, and on the object it came from when it has one. */
+  setTextStyle: (clipId: string, style: Partial<TextStyle>) => void;
+  setTextTemplate: (clipId: string, template: TextTemplate) => void;
+  /** Reusable text in the library. */
+  addTextObject: (text: string, template: TextTemplate) => string;
+  updateTextObject: (id: string, patch: Partial<Omit<TextObject, 'id'>>) => void;
+  duplicateTextObject: (id: string) => void;
+  /** Break a text clip's link to its library object, so it styles alone. */
+  unlinkTextClip: (clipId: string) => void;
+  removeTextObject: (id: string) => void;
+  addTextObjectToTimeline: (id: string) => void;
+  /** Drawn marks over the picture, for their own time range. */
+  addAnnotationClip: () => void;
+  /** Which mark inside the selected annotation clip is being edited. */
+  selectShape: (shapeId: string | null) => void;
+  addAnnotationShape: (clipId: string, shape: AnnotationShape) => void;
+  updateAnnotationShape: (clipId: string, shapeId: string, patch: Partial<AnnotationShape>) => void;
+  removeAnnotationShape: (clipId: string, shapeId: string) => void;
+  /** Key one mark's pose at the playhead, so it can follow what it points at. */
+  setAnnotationShapeKey: (
+    clipId: string,
+    shapeId: string,
+    points: { x: number; y: number }[],
+  ) => void;
+  /** Drop one pose. The last one left standing is baked back into the mark's own points. */
+  removeAnnotationShapeKey: (clipId: string, shapeId: string, t: number) => void;
+  /** Slide one pose along the clip, in clip-local seconds. */
+  moveAnnotationShapeKey: (clipId: string, shapeId: string, fromT: number, toT: number) => void;
+  clearAnnotationShapeKeys: (clipId: string, shapeId: string) => void;
   updateTextClip: (
     id: string,
     text: string,
@@ -420,6 +498,18 @@ interface EditorActions {
     flags: { audioEnabled?: boolean; hideVideo?: boolean; gain?: number },
   ) => void;
   setClipGain: (id: string, gain: number) => void;
+  /** Volume envelope: add or move a point, remove one, change how it interpolates. */
+  setGainKey: (clipId: string, t: number, value: number, interp?: Interp) => void;
+  moveGainKey: (clipId: string, from: number, t: number, value: number) => void;
+  removeGainKey: (clipId: string, t: number) => void;
+  clearGainEnvelope: (clipId: string) => void;
+  /** Audio effects on a clip: filters, EQ, pitch. */
+  addAudioEffect: (clipId: string, type: AudioEffectType) => void;
+  removeAudioEffect: (clipId: string, effectId: string) => void;
+  toggleAudioEffect: (clipId: string, effectId: string) => void;
+  setAudioEffectParam: (clipId: string, effectId: string, key: string, value: number) => void;
+  /** Measure the selected audio and set each clip's gain so it lands on `targetLufs`. */
+  normalizeSelected: (targetLufs: number) => Promise<void>;
   detachAudio: (id: string) => void;
 
   // Effects and fades. `target` is a clip id, or { kind: 'track', id } for a track grade.
@@ -454,7 +544,20 @@ interface EditorActions {
 
   /** `allowTransitions` off refuses every overlap — used by nudge and duplicate. */
   moveClipsTo: (moves: ClipMove[], commit: boolean, allowTransitions?: boolean) => boolean;
-  trimClipTo: (id: string, edge: 'left' | 'right', timelineTime: number) => void;
+  /**
+   * Drag a trim handle. `mode: 'rate'` holds the source range and solves for the speed
+   * instead — every frame is kept and the clip takes a different amount of time to play them.
+   */
+  trimClipTo: (
+    id: string,
+    edge: 'left' | 'right',
+    timelineTime: number,
+    mode?: 'trim' | 'rate',
+  ) => void;
+  /** Retime a video or audio clip. Growing it follows the ripple mode. */
+  setClipSpeed: (id: string, speed: number) => void;
+  /** Let the pitch rise and fall with the speed, tape-style, instead of being held. */
+  setClipPitchFollows: (id: string, follows: boolean) => void;
   nudgeSelected: (frames: number) => void;
   removeSelected: (ripple?: boolean) => void;
   duplicateSelected: () => void;
@@ -526,6 +629,7 @@ async function createAssetFromFile(
     blobUrl: URL.createObjectURL(file),
     type: kind,
     name: file.name,
+    addedAt: Date.now(),
     duration: probe.duration,
     width: probe.width,
     height: probe.height,
@@ -533,7 +637,9 @@ async function createAssetFromFile(
     origin,
   };
   if (origin === 'imported') return { ...asset, fingerprint: fingerprintOf(file) };
-  if (origin === 'derived') return { ...asset, opfsName: (await putMedia(id, file)) ?? undefined };
+  if (origin === 'derived' || origin === 'pasted') {
+    return { ...asset, opfsName: (await putMedia(id, file)) ?? undefined };
+  }
   return asset;
 }
 
@@ -605,7 +711,7 @@ export const useEditorStore = create<Store>((set, get) => {
     kind: AssetType,
     name: string,
     derivedFrom: DerivedFrom,
-    replace?: { clipId: string; clearEffects?: boolean; followDetachedAudio?: boolean },
+    replace?: { clipId: string; baked?: boolean; followDetachedAudio?: boolean },
   ): Promise<{ asset: MediaAsset; swapped: string | null }> {
     const created = await createAssetFromFile(
       new File([produced], name, { type: produced.type }),
@@ -638,7 +744,7 @@ export const useEditorStore = create<Store>((set, get) => {
 
     const swapped = replace
       ? get().replaceClipSource(replace.clipId, asset.id, {
-          clearEffects: replace.clearEffects,
+          baked: replace.baked,
           followDetachedAudio: replace.followDetachedAudio,
         })
       : null;
@@ -829,23 +935,45 @@ export const useEditorStore = create<Store>((set, get) => {
     setAudioMetadata: (audioMetadata) => set({ audioMetadata }),
     setLibraryNotice: (libraryNotice) => set({ libraryNotice }),
 
+    /**
+     * Move a library row to sit before `targetId`, or to the end when that is null.
+     *
+     * `libraryOrder` is document state — it is inside `docSnapshot()` — so dragging a row is
+     * an edit and undo puts it back. The *view* (grouping, sorting, the search box) is not,
+     * and lives in the component; this is only the underlying order that "My order" shows.
+     */
+    reorderLibrary: (assetId, targetId) => {
+      if (assetId === targetId) return;
+      commit('Reorder library', (s) => {
+        const without = s.libraryOrder.filter((id) => id !== assetId);
+        if (!s.libraryOrder.includes(assetId)) return {};
+        const at = targetId === null ? without.length : without.indexOf(targetId);
+        if (targetId !== null && at < 0) return {};
+        return { libraryOrder: [...without.slice(0, at), assetId, ...without.slice(at)] };
+      });
+    },
+
     // -------------------------------------------------------------- selection
 
     selectClip: (id, additive = false) => {
       if (id === null) {
-        set({ selectedClipIds: [] });
+        set({ selectedClipIds: [], selectedShapeId: null });
         return;
       }
       set((s) => {
-        if (!additive) return { selectedClipIds: [id] };
+        // A mark belongs to one clip, so changing which clip is selected always ends its
+        // edit — there is nowhere for the selection to still mean something.
+        if (!additive) return { selectedClipIds: [id], selectedShapeId: null };
         return s.selectedClipIds.includes(id)
-          ? { selectedClipIds: s.selectedClipIds.filter((x) => x !== id) }
-          : { selectedClipIds: [...s.selectedClipIds, id] };
+          ? { selectedClipIds: s.selectedClipIds.filter((x) => x !== id), selectedShapeId: null }
+          : { selectedClipIds: [...s.selectedClipIds, id], selectedShapeId: null };
       });
     },
 
-    setSelection: (ids) => set({ selectedClipIds: ids }),
-    selectAll: () => set((s) => ({ selectedClipIds: s.clips.map((c) => c.id) })),
+    setSelection: (ids) => set({ selectedClipIds: ids, selectedShapeId: null }),
+    selectAll: () =>
+      set((s) => ({ selectedClipIds: s.clips.map((c) => c.id), selectedShapeId: null })),
+    selectShape: (shapeId) => set({ selectedShapeId: shapeId }),
 
     // --------------------------------------------------------------- viewport
 
@@ -913,6 +1041,38 @@ export const useEditorStore = create<Store>((set, get) => {
 
     togglePreviewMute: () => set((s) => ({ previewMuted: !s.previewMuted })),
     toggleSnap: () => set((s) => ({ snapEnabled: !s.snapEnabled })),
+
+    toggleRipple: () => set((s) => ({ rippleEnabled: !s.rippleEnabled })),
+    setRippleScope: (rippleScope) => set({ rippleScope }),
+    setExportForceFfmpeg: (exportForceFfmpeg) => set({ exportForceFfmpeg }),
+
+    /**
+     * Scope follows the selection, because that is what the user is pointing at.
+     *
+     * With clips selected, each of their tracks is closed on its own. With nothing selected the
+     * timeline is closed as a whole — only the stretches where *nothing* is playing anywhere
+     * are removed, so every cross-track relationship survives. Closing every track
+     * independently would be the one operation guaranteed to slide detached audio out of sync
+     * with its own picture.
+     */
+    closeGaps: () => {
+      const state = get();
+      const lockedTracks = new Set(state.tracks.filter((t) => t.locked).map((t) => t.id));
+      const selected = state.clips.filter((c) => state.selectedClipIds.includes(c.id));
+
+      const shifts =
+        selected.length > 0
+          ? closeGapsOnTracks(
+              state.clips,
+              [...new Set(selected.map((c) => c.trackId))].filter((id) => !lockedTracks.has(id)),
+            )
+          : closeGapsAcrossTracks(state.clips.filter((c) => !lockedTracks.has(c.trackId)));
+
+      if (shifts.length === 0) return;
+      commit(selected.length > 0 ? 'Close gaps on track' : 'Close gaps', (s) => ({
+        clips: applyShifts(s.clips, shifts),
+      }));
+    },
     setSnapIndicator: (snapIndicator) => set({ snapIndicator }),
 
     // ----------------------------------------------------------------- tracks
@@ -1027,6 +1187,33 @@ export const useEditorStore = create<Store>((set, get) => {
             : [...state.libraryOrder, asset.id],
         }));
       }
+    },
+
+    /**
+     * An image off the clipboard.
+     *
+     * Unlike an import, this has no file on disk: it never had a path, so there is nothing to
+     * relink it to and nobody to ask for it again. It is written to OPFS like a recording, and
+     * carries the `pasted` origin so a reopened project knows to look there — an imported
+     * origin would send `rehydrate` hunting for a fingerprint that can never match, and the
+     * image would come back offline every time.
+     */
+    pasteImages: async (files) => {
+      let added = 0;
+      for (const file of files) {
+        if (!file.type.startsWith('image/')) continue;
+        const asset = await createAssetFromFile(file, 'image', 'pasted');
+        set((state) => ({
+          mediaLibrary: { ...state.mediaLibrary, [asset.id]: asset },
+          libraryOrder: [...state.libraryOrder, asset.id],
+        }));
+        added++;
+      }
+      if (added > 0) {
+        set({ libraryNotice: `Pasted ${added} image${added === 1 ? '' : 's'} into the library.` });
+        notifyProducedFile();
+      }
+      return added;
     },
 
     importFiles: async (fileInput, kind) => {
@@ -1337,7 +1524,7 @@ export const useEditorStore = create<Store>((set, get) => {
           // No `followDetachedAudio`: a bake renders the picture, and the clip whose audio
           // was detached has `audioEnabled: false`, so the file it writes carries no sound to
           // point that audio clip at.
-          replace ? { clipId, clearEffects: true } : undefined,
+          replace ? { clipId, baked: true } : undefined,
         );
 
         const speed = result.seconds > 0 ? range.duration / result.seconds : 0;
@@ -1371,7 +1558,8 @@ export const useEditorStore = create<Store>((set, get) => {
 
       const was = clipDuration(clip);
       const now = asset.duration;
-      const baked = options?.clearEffects === true && (clip.effects?.length ?? 0) > 0;
+      const wasBaked = options?.baked === true;
+      const baked = wasBaked && (clip.effects?.length ?? 0) > 0;
 
       // Detaching a clip's audio leaves a second clip playing the same file, and nothing
       // recorded that the two belong together. Swapping only the video is how a project ends
@@ -1388,7 +1576,10 @@ export const useEditorStore = create<Store>((set, get) => {
       commit(baked ? 'Bake effects' : 'Replace clip source', (s) => ({
         clips: s.clips.map((c) => {
           if (c.id === clipId) {
-            return { ...swapSource(clip, asset), ...(options?.clearEffects ? { effects: undefined } : {}) };
+            return {
+              ...swapSource(clip, asset),
+              ...(wasBaked ? { effects: undefined, speed: undefined } : {}),
+            };
           }
           // One entry covers both, because one user action caused both.
           return follow.has(c.id) && c.kind === 'audio' ? swapSource(c, asset) : c;
@@ -1623,7 +1814,9 @@ export const useEditorStore = create<Store>((set, get) => {
         (s) => ({
           clips: s.clips.map((c) => {
             if (c.id !== id) return c;
-            if (c.kind !== 'video' && c.kind !== 'image') return c;
+            // Asked rather than listed: this guard used to name video and image, so an
+            // annotation's placement checkbox wrote nothing and could not be ticked.
+            if (!acceptsTransform(c)) return c;
             // Dropping the transform drops any animation of it with it.
             return transform ? { ...c, transform } : { ...c, transform, transformKeyframes: undefined };
           }),
@@ -1644,11 +1837,199 @@ export const useEditorStore = create<Store>((set, get) => {
           clips: s.clips.map((c) => {
             if (c.id !== id) return c;
             if (c.kind !== 'video' && c.kind !== 'audio') return c;
-            return { ...c, gain: clampTrackVolume(gain) };
+            return { ...c, gain: clampClipGain(gain) };
           }),
         }),
         true,
       ),
+
+    // ------------------------------------------------- volume envelope and audio effects
+
+    /**
+     * Envelope points are stored in *clip-local* seconds, so trimming or moving the clip
+     * carries them along without arithmetic — the same convention the transform channels use.
+     */
+    setGainKey: (clipId, t, value, interp = 'linear') =>
+      commit(
+        'Volume envelope',
+        (s) => ({
+          clips: s.clips.map((c) =>
+            c.id === clipId && (c.kind === 'audio' || c.kind === 'video')
+              ? { ...c, gainKeyframes: upsertKey(c.gainKeyframes, t, Math.max(0, value), interp) }
+              : c,
+          ),
+        }),
+        // Coalesced: a drag is one entry, not one per pixel.
+        true,
+      ),
+
+    moveGainKey: (clipId, from, t, value) =>
+      commit(
+        'Move envelope point',
+        (s) => ({
+          clips: s.clips.map((c) =>
+            c.id === clipId && (c.kind === 'audio' || c.kind === 'video')
+              ? { ...c, gainKeyframes: moveKey(c.gainKeyframes, from, t, Math.max(0, value)) }
+              : c,
+          ),
+        }),
+        true,
+      ),
+
+    removeGainKey: (clipId, t) =>
+      commit('Remove envelope point', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId && (c.kind === 'audio' || c.kind === 'video')
+            ? { ...c, gainKeyframes: removeKeyAt(c.gainKeyframes, t) }
+            : c,
+        ),
+      })),
+
+    clearGainEnvelope: (clipId) =>
+      commit('Clear envelope', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId && (c.kind === 'audio' || c.kind === 'video')
+            ? { ...c, gainKeyframes: undefined }
+            : c,
+        ),
+      })),
+
+    addAudioEffect: (clipId, type) =>
+      commit('Add audio effect', (s) => ({
+        clips: s.clips.map((c) => {
+          if (c.id !== clipId || (c.kind !== 'audio' && c.kind !== 'video')) return c;
+          const effect: AudioEffect = {
+            id: uid('afx'),
+            type,
+            enabled: true,
+            params: defaultAudioParams(type),
+          };
+          return { ...c, audioEffects: [...(c.audioEffects ?? []), effect] };
+        }),
+      })),
+
+    removeAudioEffect: (clipId, effectId) =>
+      commit('Remove audio effect', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId && (c.kind === 'audio' || c.kind === 'video')
+            ? { ...c, audioEffects: (c.audioEffects ?? []).filter((e) => e.id !== effectId) }
+            : c,
+        ),
+      })),
+
+    toggleAudioEffect: (clipId, effectId) =>
+      commit('Toggle audio effect', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId && (c.kind === 'audio' || c.kind === 'video')
+            ? {
+                ...c,
+                audioEffects: (c.audioEffects ?? []).map((e) =>
+                  e.id === effectId ? { ...e, enabled: !e.enabled } : e,
+                ),
+              }
+            : c,
+        ),
+      })),
+
+    setAudioEffectParam: (clipId, effectId, key, value) =>
+      commit(
+        'Adjust audio effect',
+        (s) => ({
+          clips: s.clips.map((c) =>
+            c.id === clipId && (c.kind === 'audio' || c.kind === 'video')
+              ? {
+                  ...c,
+                  audioEffects: (c.audioEffects ?? []).map((e) =>
+                    e.id === effectId ? { ...e, params: { ...e.params, [key]: value } } : e,
+                  ),
+                }
+              : c,
+          ),
+        }),
+        true,
+      ),
+
+    /**
+     * Normalize, and match loudness, are the same operation: measure, then set a gain.
+     *
+     * A gain, never new samples. Nothing is re-encoded, the whole thing is one history entry,
+     * and the measurement is cached on the clip against the trim it was taken from — an
+     * excerpt's loudness stops being true the moment the excerpt changes.
+     */
+    normalizeSelected: async (targetLufs) => {
+      const state = get();
+      const targets = state.clips.filter(
+        (c) =>
+          state.selectedClipIds.includes(c.id) &&
+          (c.kind === 'audio' || (c.kind === 'video' && c.hasAudio && c.audioEnabled)),
+      );
+      if (targets.length === 0 || state.loudnessJob) return;
+
+      const results: { id: string; gain: number; lufs: number; peakDb: number }[] = [];
+      const silent: string[] = [];
+      /** Clips whose target needed more lift than 12 dB, which is as far as this will go. */
+      const short: string[] = [];
+
+      for (const clip of targets) {
+        if (!('assetId' in clip)) continue;
+        set({ loudnessJob: clip.id });
+        const asset = get().mediaLibrary[clip.assetId];
+        const measured = asset
+          ? await measureClipLoudness(asset, clip.sourceTrimIn, clip.sourceTrimOut)
+          : null;
+        if (!measured) {
+          silent.push(asset?.name ?? clip.id);
+          continue;
+        }
+        const wanted = gainForTarget(measured.lufs, targetLufs);
+        const gain = clampNormalizeGain(wanted);
+        // Said out loud rather than silently applied: a take 20 dB down cannot be lifted onto
+        // the target without bringing its own noise floor with it, and a clip that landed
+        // short of the number on the button looks like the button not working.
+        if (Math.abs(20 * Math.log10(wanted / gain)) > 0.1) short.push(asset?.name ?? clip.id);
+        results.push({ id: clip.id, gain, lufs: measured.lufs, peakDb: measured.peakDb });
+      }
+      set({ loudnessJob: null });
+
+      if (results.length > 0) {
+        const byId = new Map(results.map((r) => [r.id, r]));
+        commit(
+          results.length === 1 ? 'Normalize' : `Match loudness (${results.length} clips)`,
+          (s) => ({
+            clips: s.clips.map((c) => {
+              const hit = byId.get(c.id);
+              if (!hit || (c.kind !== 'audio' && c.kind !== 'video')) return c;
+              return {
+                ...c,
+                gain: hit.gain,
+                loudness: {
+                  lufs: hit.lufs,
+                  peakDb: hit.peakDb,
+                  trimIn: c.sourceTrimIn,
+                  trimOut: c.sourceTrimOut,
+                },
+              };
+            }),
+          }),
+        );
+      }
+
+      const notices: string[] = [];
+      if (results.length > 0) {
+        const moved = results.length === 1 ? 'Normalized' : `Matched ${results.length} clips`;
+        notices.push(`${moved} to ${targetLufs} LUFS.`);
+      }
+      if (short.length > 0) {
+        notices.push(
+          `${short.join(', ')} needed more than +12 dB and stopped there — lifting further ` +
+            'brings the noise floor up with the signal.',
+        );
+      }
+      if (silent.length > 0) {
+        notices.push(`Nothing measurable in ${silent.join(', ')} — silence has no loudness.`);
+      }
+      if (notices.length > 0) set({ libraryNotice: notices.join(' ') });
+    },
 
     // ------------------------------------------------------ effects and fades
 
@@ -1793,6 +2174,315 @@ export const useEditorStore = create<Store>((set, get) => {
     setTransitionType: (clipId, type) =>
       commit('Change transition', (s) => ({
         clips: s.clips.map((c) => (c.id === clipId ? { ...c, transitionIn: type } : c)),
+      })),
+
+    setTextStyle: (clipId, style) =>
+      commit(
+        'Restyle text',
+        (s) => {
+          const clip = s.clips.find((c) => c.id === clipId);
+          const objectId = clip?.kind === 'text' ? clip.textObjectId : undefined;
+          return {
+            clips: s.clips.map((c) =>
+              c.kind === 'text' && (c.id === clipId || (objectId && c.textObjectId === objectId))
+                ? { ...c, style: { ...(c.style ?? {}), ...style } }
+                : c,
+            ),
+            // A clip made from a library object edits the object, so every use of it follows.
+            textLibrary: objectId
+              ? s.textLibrary.map((o) =>
+                  o.id === objectId ? { ...o, style: { ...(o.style ?? {}), ...style } } : o,
+                )
+              : s.textLibrary,
+          } as Partial<EditorState>;
+        },
+        true,
+      ),
+
+    setTextTemplate: (clipId, template) =>
+      commit('Change template', (s) => {
+        const clip = s.clips.find((c) => c.id === clipId);
+        const objectId = clip?.kind === 'text' ? clip.textObjectId : undefined;
+        return {
+          clips: s.clips.map((c) =>
+            c.kind === 'text' && (c.id === clipId || (objectId && c.textObjectId === objectId))
+              ? // The overrides go with the old template: they were expressed against it, and
+                // carrying them onto a new one produces a look neither template describes.
+                { ...c, template, style: undefined }
+              : c,
+          ),
+          textLibrary: objectId
+            ? s.textLibrary.map((o) => (o.id === objectId ? { ...o, template, style: undefined } : o))
+            : s.textLibrary,
+        } as Partial<EditorState>;
+      }),
+
+    addTextObject: (text, template) => {
+      const id = uid('text');
+      commit('Add text to library', (s) => ({
+        textLibrary: [
+          ...s.textLibrary,
+          { id, name: text.split('\n')[0].slice(0, 40) || 'Text', text, template, addedAt: Date.now() },
+        ],
+      }));
+      return id;
+    },
+
+    updateTextObject: (id, patch) =>
+      commit(
+        'Edit text',
+        (s) => ({
+          textLibrary: s.textLibrary.map((o) => (o.id === id ? { ...o, ...patch } : o)),
+          // Every clip showing this object follows, which is what "the same object" means.
+          clips: s.clips.map((c) =>
+            c.kind === 'text' && c.textObjectId === id
+              ? {
+                  ...c,
+                  text: patch.text ?? c.text,
+                  template: patch.template ?? c.template,
+                  style: patch.style ?? c.style,
+                }
+              : c,
+          ),
+        }),
+        true,
+      ),
+
+    duplicateTextObject: (id) =>
+      commit('Duplicate text', (s) => {
+        const source = s.textLibrary.find((o) => o.id === id);
+        if (!source) return {};
+        return {
+          textLibrary: [
+            ...s.textLibrary,
+            { ...source, id: uid('text'), name: `${source.name} copy`, addedAt: Date.now() },
+          ],
+        };
+      }),
+
+    unlinkTextClip: (clipId) =>
+      commit('Unlink text', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId && c.kind === 'text' ? { ...c, textObjectId: undefined } : c,
+        ),
+      })),
+
+    removeTextObject: (id) =>
+      commit('Remove text', (s) => ({
+        textLibrary: s.textLibrary.filter((o) => o.id !== id),
+        // The clips keep their words. Removing the object breaks the link, it does not
+        // delete an edit somebody made.
+        clips: s.clips.map((c) =>
+          c.kind === 'text' && c.textObjectId === id ? { ...c, textObjectId: undefined } : c,
+        ),
+      })),
+
+    addTextObjectToTimeline: (id) => {
+      const object = get().textLibrary.find((o) => o.id === id);
+      if (!object) return;
+      commit(`Add ${object.name}`, (s) => {
+        const lane = findLaneForPlacement(
+          s.tracks, s.clips, 'video', s.playhead, TEXT_CLIP_DURATION, s.settings.fps, true,
+        );
+        const clip: Clip = {
+          id: uid('clip'),
+          trackId: lane.trackId,
+          kind: 'text',
+          text: object.text,
+          template: object.template,
+          style: object.style,
+          textObjectId: object.id,
+          timelineStart: lane.start,
+          sourceTrimIn: 0,
+          sourceTrimOut: TEXT_CLIP_DURATION,
+          textFrame: DEFAULT_FULL_FRAME,
+        };
+        return {
+          tracks: lane.tracks,
+          clips: [...s.clips, clip],
+          selectedClipIds: [clip.id],
+        } as Partial<EditorState>;
+      });
+    },
+
+    addAnnotationClip: () =>
+      commit('Add annotation', (s) => {
+        // Top-down like text and adjustments: an annotation marks what is below it.
+        const lane = findLaneForPlacement(
+          s.tracks, s.clips, 'video', s.playhead, TEXT_CLIP_DURATION, s.settings.fps, true,
+        );
+        const clip: Clip = {
+          id: uid('clip'),
+          trackId: lane.trackId,
+          kind: 'annotation',
+          shapes: [],
+          timelineStart: lane.start,
+          sourceTrimIn: 0,
+          sourceTrimOut: TEXT_CLIP_DURATION,
+        };
+        return {
+          tracks: lane.tracks,
+          clips: [...s.clips, clip],
+          selectedClipIds: [clip.id],
+        } as Partial<EditorState>;
+      }),
+
+    addAnnotationShape: (clipId, shape) =>
+      commit('Draw', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId && c.kind === 'annotation' ? { ...c, shapes: [...c.shapes, shape] } : c,
+        ),
+      })),
+
+    updateAnnotationShape: (clipId, shapeId, patch) =>
+      commit(
+        'Adjust annotation',
+        (s) => ({
+          clips: s.clips.map((c) =>
+            c.id === clipId && c.kind === 'annotation'
+              ? { ...c, shapes: c.shapes.map((sh) => (sh.id === shapeId ? { ...sh, ...patch } : sh)) }
+              : c,
+          ),
+        }),
+        true,
+      ),
+
+    /**
+     * Put this mark *here* at the playhead.
+     *
+     * The first key on a static mark captures where it already is at that moment, so arming
+     * and dragging leaves the clip looking the same before the key and moving after it,
+     * rather than snapping the whole clip to the new pose.
+     */
+    setAnnotationShapeKey: (clipId, shapeId, points) =>
+      commit(
+        'Move mark',
+        (s) => {
+          const clip = s.clips.find((c) => c.id === clipId);
+          if (!clip || clip.kind !== 'annotation') return {};
+          const at = quantizeToFrame(Math.max(0, s.playhead - clip.timelineStart), s.settings.fps);
+          return {
+            clips: s.clips.map((c) =>
+              c.id === clipId && c.kind === 'annotation'
+                ? {
+                    ...c,
+                    shapes: c.shapes.map((sh) =>
+                      sh.id === shapeId
+                        ? { ...sh, pointKeys: upsertShapeKey(sh.pointKeys, at, points) }
+                        : sh,
+                    ),
+                  }
+                : c,
+            ),
+          };
+        },
+        true,
+      ),
+
+    /**
+     * Drop one pose.
+     *
+     * Removing the last one does not just delete the list: a mark with no poses falls back to
+     * `points`, which is wherever it was first drawn, so the mark would jump somewhere else at
+     * the moment you removed its last pose. That pose is baked into `points` instead, which is
+     * the same bargain `clearAnnotationShapeKeys` makes.
+     */
+    removeAnnotationShapeKey: (clipId, shapeId, t) =>
+      commit('Remove pose', (s) => ({
+        clips: s.clips.map((c) => {
+          if (c.id !== clipId || c.kind !== 'annotation') return c;
+          return {
+            ...c,
+            shapes: c.shapes.map((sh) => {
+              if (sh.id !== shapeId) return sh;
+              const kept = removeShapeKeyAt(sh.pointKeys, t);
+              if (kept && kept.length > 1) return { ...sh, pointKeys: kept };
+              const survivor = kept?.[0] ?? sortedKeys(sh.pointKeys)[0];
+              return {
+                ...sh,
+                points: survivor ? survivor.points.map((p) => ({ ...p })) : sh.points,
+                pointKeys: undefined,
+              };
+            }),
+          };
+        }),
+      })),
+
+    moveAnnotationShapeKey: (clipId, shapeId, fromT, toT) =>
+      commit(
+        'Move pose',
+        (s) => {
+          const clip = s.clips.find((c) => c.id === clipId);
+          if (!clip || clip.kind !== 'annotation') return {};
+          const at = quantizeToFrame(
+            Math.min(clipDuration(clip), Math.max(0, toT)),
+            s.settings.fps,
+          );
+          return {
+            clips: s.clips.map((c) =>
+              c.id === clipId && c.kind === 'annotation'
+                ? {
+                    ...c,
+                    shapes: c.shapes.map((sh) => {
+                      if (sh.id !== shapeId) return sh;
+                      const moving = sortedKeys(sh.pointKeys).find(
+                        (key) => Math.abs(key.t - fromT) < 1e-4,
+                      );
+                      if (!moving) return sh;
+                      // Remove then upsert, so landing on another pose replaces it rather
+                      // than leaving two at one moment.
+                      return {
+                        ...sh,
+                        pointKeys: upsertShapeKey(
+                          removeShapeKeyAt(sh.pointKeys, fromT),
+                          at,
+                          moving.points,
+                        ),
+                      };
+                    }),
+                  }
+                : c,
+            ),
+          };
+        },
+        true,
+      ),
+
+    /** Stop a mark moving: the pose at the playhead becomes its only one. */
+    clearAnnotationShapeKeys: (clipId, shapeId) =>
+      commit('Stop the mark moving', (s) => {
+        const clip = s.clips.find((c) => c.id === clipId);
+        if (!clip || clip.kind !== 'annotation') return {};
+        return {
+          clips: s.clips.map((c) =>
+            c.id === clipId && c.kind === 'annotation'
+              ? {
+                  ...c,
+                  shapes: c.shapes.map((sh) =>
+                    sh.id === shapeId
+                      ? {
+                          ...sh,
+                          points: shapePointsAt(sh, Math.max(0, s.playhead - clip.timelineStart)),
+                          pointKeys: undefined,
+                        }
+                      : sh,
+                  ),
+                }
+              : c,
+          ),
+        };
+      }),
+
+    removeAnnotationShape: (clipId, shapeId) =>
+      commit('Remove shape', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === clipId && c.kind === 'annotation'
+            ? { ...c, shapes: c.shapes.filter((sh) => sh.id !== shapeId) }
+            : c,
+        ),
+        // Nothing may stay selected that no longer exists: the overlay would draw handles
+        // for it and the Inspector would offer to restyle it.
+        ...(s.selectedShapeId === shapeId ? { selectedShapeId: null } : {}),
       })),
 
     addAdjustmentClip: () =>
@@ -2042,6 +2732,12 @@ export const useEditorStore = create<Store>((set, get) => {
           kind: 'audio',
           assetId: clip.assetId,
           gain: clip.gain,
+          // Retiming carries across, or the two halves are different lengths the moment
+          // either is retimed — the same desync the ripple scope exists to prevent.
+          ...(clip.speed !== undefined ? { speed: clip.speed } : {}),
+          ...(clip.pitchFollowsSpeed !== undefined
+            ? { pitchFollowsSpeed: clip.pitchFollowsSpeed }
+            : {}),
         };
         return {
           tracks: lane.tracks,
@@ -2128,7 +2824,7 @@ export const useEditorStore = create<Store>((set, get) => {
     },
 
     /** Absolute trim: `timelineTime` is where the edge should land. */
-    trimClipTo: (id, edge, timelineTime) => {
+    trimClipTo: (id, edge, timelineTime, mode = 'trim') => {
       const state = get();
       const clip = state.clips.find((c) => c.id === id);
       if (!clip) return;
@@ -2136,45 +2832,169 @@ export const useEditorStore = create<Store>((set, get) => {
       if (track?.locked) return;
 
       const fps = state.settings.fps;
+      const speed = clipSpeedOf(clip);
       const maxSource = assetDurationFor(clip, state.mediaLibrary);
       const neighbours = state.clips.filter((c) => c.trackId === clip.trackId && c.id !== clip.id);
+      const ripple = state.rippleEnabled;
+      const oldEnd = clipEnd(clip);
 
       let next: Clip;
-      if (edge === 'left') {
-        const leftBound = neighbours
-          .filter((c) => clipEnd(c) <= clip.timelineStart + 1e-6)
-          .reduce((max, c) => Math.max(max, clipEnd(c)), 0);
-        // Can't pull in earlier than the source has material for.
-        const earliest = Math.max(leftBound, clip.timelineStart - clip.sourceTrimIn);
-        const latest = clipEnd(clip) - MIN_CLIP_DURATION;
-        const start = quantizeToFrame(Math.min(latest, Math.max(earliest, timelineTime)), fps);
-        const delta = start - clip.timelineStart;
+      if (mode === 'rate' && canRetime(clip)) {
+        /*
+         * A rate trim keeps every frame and changes how long they take. The source range is
+         * untouched, the edge lands where the pointer let go, and the speed is whatever makes
+         * those two true — `retimeToSpeed` then nudges the out point so the duration is a
+         * whole number of frames, exactly as the Inspector's slider does.
+         */
+        const wanted =
+          edge === 'right'
+            ? quantizeToFrame(Math.max(MIN_CLIP_DURATION, timelineTime - clip.timelineStart), fps)
+            : quantizeToFrame(Math.max(MIN_CLIP_DURATION, oldEnd - timelineTime), fps);
+        const retimed = retimeToSpeed(clip, speedForDuration(clip, wanted), fps);
+        const retimedStart =
+          edge === 'left' ? Math.max(0, oldEnd - retimed.duration) : clip.timelineStart;
         next = {
           ...clip,
-          timelineStart: start,
-          sourceTrimIn: quantizeToFrame(clip.sourceTrimIn + delta, fps),
+          speed: retimed.speed,
+          sourceTrimOut: retimed.sourceTrimOut,
+          timelineStart: retimedStart,
         };
+      } else if (edge === 'left') {
+        // A ripple trim is bounded by the source alone: the neighbour it would have run into
+        // is about to move out of the way.
+        const leftBound = ripple
+          ? 0
+          : neighbours
+              .filter((c) => clipEnd(c) <= clip.timelineStart + 1e-6)
+              .reduce((max, c) => Math.max(max, clipEnd(c)), 0);
+        // Can't pull in earlier than the source has material for. A second of timeline is
+        // `speed` seconds of source, so a retimed clip reaches back further in timeline terms
+        // than the material it has left.
+        const earliest = Math.max(leftBound, clip.timelineStart - clip.sourceTrimIn / speed);
+        const latest = oldEnd - MIN_CLIP_DURATION;
+        const start = quantizeToFrame(Math.min(latest, Math.max(earliest, timelineTime)), fps);
+        const delta = start - clip.timelineStart;
+        // The *timeline* edge is what lands on a frame; the source point is derived from it.
+        // Quantizing the derived value too would be a no-op at 1× and would knock a retimed
+        // clip's duration off the frame grid at any other speed.
+        const sourceTrimIn = clip.sourceTrimIn + delta * speed;
+        next = ripple
+          ? {
+              // The edit point stays put and the material scrolls under it — the clip's start
+              // never moves under ripple, only its length, and the rest of the track follows.
+              ...clip,
+              sourceTrimIn,
+            }
+          : {
+              ...clip,
+              timelineStart: start,
+              sourceTrimIn,
+            };
       } else {
-        const rightBound = neighbours
-          .filter((c) => c.timelineStart >= clipEnd(clip) - 1e-6)
-          .reduce((min, c) => Math.min(min, c.timelineStart), Infinity);
+        const rightBound = ripple
+          ? Infinity
+          : neighbours
+              .filter((c) => c.timelineStart >= oldEnd - 1e-6)
+              .reduce((min, c) => Math.min(min, c.timelineStart), Infinity);
         const sourceLimit =
           maxSource === Infinity
             ? Infinity
-            : clip.timelineStart + (maxSource - clip.sourceTrimIn);
+            : clip.timelineStart + (maxSource - clip.sourceTrimIn) / speed;
         const latest = Math.min(rightBound, sourceLimit);
         const earliest = clip.timelineStart + MIN_CLIP_DURATION;
         const end = quantizeToFrame(Math.min(latest, Math.max(earliest, timelineTime)), fps);
         next = {
           ...clip,
-          sourceTrimOut: quantizeToFrame(clip.sourceTrimIn + (end - clip.timelineStart), fps),
+          sourceTrimOut: clip.sourceTrimIn + (end - clip.timelineStart) * speed,
         };
       }
 
-      commit('Trim clip', (s) => ({
-        clips: s.clips.map((c) => (c.id === id ? next : c)),
+      const delta = ripple ? clipEnd(next) - oldEnd : 0;
+      const shifts = ripple
+        ? rippleShift(
+            state.clips,
+            oldEnd,
+            delta,
+            state.rippleScope === 'all' ? null : clip.trackId,
+            new Set([clip.id]),
+          )
+        : [];
+
+      commit(mode === 'rate' ? 'Rate trim' : ripple ? 'Ripple trim' : 'Trim clip', (s) => ({
+        clips: applyShifts(
+          s.clips.map((c) => (c.id === id ? next : c)),
+          shifts,
+        ),
       }));
     },
+
+    /**
+     * Retime a clip.
+     *
+     * The source range is what stays fixed: changing the speed changes how long the clip
+     * occupies the timeline, and `retimeToSpeed` moves the out point so that length lands on
+     * a frame. Growing a clip follows the ripple mode, which is the same rule trimming and
+     * deleting already follow — with ripple off it grows into the free space and stops at its
+     * neighbour rather than overlapping it, because an overlap *is* a transition here and
+     * slowing a clip down must not silently cross-dissolve it into whatever comes next.
+     */
+    setClipSpeed: (id, speed) => {
+      const state = get();
+      const clip = state.clips.find((c) => c.id === id);
+      if (!clip || !canRetime(clip)) return;
+      const track = state.tracks.find((t) => t.id === clip.trackId);
+      if (track?.locked) return;
+
+      const ripple = state.rippleEnabled;
+      let wanted = clampSpeed(speed);
+      let clamped: number | null = null;
+      if (!ripple) {
+        const slowest = slowestSpeedThatFits(state.clips, clip);
+        if (wanted < slowest) {
+          clamped = slowest;
+          wanted = slowest;
+        }
+      }
+
+      const retimed = retimeToSpeed(clip, wanted, state.settings.fps);
+      const next: Clip = { ...clip, speed: retimed.speed, sourceTrimOut: retimed.sourceTrimOut };
+      const oldEnd = clipEnd(clip);
+      const delta = rippleDelta(clip, next);
+      const shifts =
+        ripple && Math.abs(delta) > 1e-9
+          ? rippleShift(
+              state.clips,
+              oldEnd,
+              delta,
+              state.rippleScope === 'all' ? null : clip.trackId,
+              new Set([clip.id]),
+            )
+          : [];
+
+      commit(
+        'Change speed',
+        (s) => ({
+          clips: applyShifts(
+            s.clips.map((c) => (c.id === id ? next : c)),
+            shifts,
+          ),
+          ...(clamped !== null
+            ? {
+                libraryNotice: `Slowed to ${formatSpeed(clamped)} — the next clip is in the way. Turn on Ripple to make room.`,
+              }
+            : {}),
+        }),
+        // Coalesced: dragging the slider is one edit, not fifty.
+        true,
+      );
+    },
+
+    setClipPitchFollows: (id, follows) =>
+      commit('Change pitch behaviour', (s) => ({
+        clips: s.clips.map((c) =>
+          c.id === id && canRetime(c) ? { ...c, pitchFollowsSpeed: follows } : c,
+        ),
+      })),
 
     nudgeSelected: (frames) => {
       const state = get();
@@ -2221,9 +3041,13 @@ export const useEditorStore = create<Store>((set, get) => {
       );
     },
 
-    removeSelected: (ripple = false) => {
-      const ids = get().selectedClipIds;
+    removeSelected: (ripple = get().rippleEnabled) => {
+      const state = get();
+      const ids = state.selectedClipIds;
       if (ids.length === 0) return;
+      // `all` shifts every track by one amount at one time, which is the only scope under
+      // which a video clip and the audio it was detached to stay together.
+      const scopeAll = state.rippleScope === 'all';
 
       commit(ripple ? 'Ripple delete' : 'Delete clip', (s) => {
         const removed = s.clips.filter((c) => ids.includes(c.id));
@@ -2232,12 +3056,14 @@ export const useEditorStore = create<Store>((set, get) => {
         if (ripple) {
           const ordered = [...removed].sort((a, b) => a.timelineStart - b.timelineStart);
           for (const gone of ordered) {
-            const gap = clipDuration(gone);
-            const from = gone.timelineStart;
-            clips = clips.map((c) =>
-              c.trackId === gone.trackId && c.timelineStart >= from - 1e-6
-                ? { ...c, timelineStart: Math.max(0, c.timelineStart - gap) }
-                : c,
+            clips = applyShifts(
+              clips,
+              rippleShift(
+                clips,
+                gone.timelineStart,
+                -clipDuration(gone),
+                scopeAll ? null : gone.trackId,
+              ),
             );
           }
         }
@@ -2272,6 +3098,11 @@ export const useEditorStore = create<Store>((set, get) => {
             ...clip,
             id: uid('clip'),
             timelineStart: quantizeToFrame(start, s.settings.fps),
+            // A duplicate is a copy, not another use. A text clip made from a library object
+            // shares every restyle with the object's other clips, so keeping the link here
+            // meant editing "the copy" changed the original too — the library's own ⧉ is
+            // where "another independent one" comes from, and + is where another *use* does.
+            ...(clip.kind === 'text' ? { textObjectId: undefined } : {}),
           };
           copies.push(copy);
           working = [...working, copy];
@@ -2313,6 +3144,9 @@ export const useEditorStore = create<Store>((set, get) => {
           }
 
           const cut = quantizeToFrame(rel, s.settings.fps);
+          // The cut is a timeline position; the source point behind it is `speed` times as
+          // far in. Both halves keep the speed, so together they still play what the one did.
+          const sourceCut = cut * clipSpeedOf(clip);
           // Keys are clip-relative, so the split has to divide them and rebase the
           // right-hand set. Both halves get a key at the cut holding the interpolated
           // value, so the pair renders the same curve the single clip did.
@@ -2330,7 +3164,7 @@ export const useEditorStore = create<Store>((set, get) => {
 
           const left: Clip = {
             ...clip,
-            sourceTrimOut: clip.sourceTrimIn + cut,
+            sourceTrimOut: clip.sourceTrimIn + sourceCut,
             transformKeyframes: transformParts.left,
             effects: clip.effects ? effectParts.map((p) => p.left) : undefined,
             fadeIn: Math.min(fadeIn, cut),
@@ -2340,7 +3174,7 @@ export const useEditorStore = create<Store>((set, get) => {
             ...clip,
             id: uid('clip'),
             timelineStart: clip.timelineStart + cut,
-            sourceTrimIn: clip.sourceTrimIn + cut,
+            sourceTrimIn: clip.sourceTrimIn + sourceCut,
             transformKeyframes: transformParts.right,
             effects: clip.effects ? effectParts.map((p) => p.right) : undefined,
             fadeIn: 0,

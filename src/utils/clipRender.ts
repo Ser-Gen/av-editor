@@ -1,7 +1,7 @@
 import type { Clip, EffectInstance, OverlayTransform, VisualClip } from '../types/editor';
 import type { EffectClock } from '../render/effects/types';
 import { evaluateChannel } from './keyframes';
-import { clipDuration } from './time';
+import { clipDuration, speedOf } from './time';
 
 /**
  * How a clip looks and sounds at a given time: its fade envelope, its effect chain with
@@ -100,8 +100,33 @@ export function clipClock(clip: Clip, t: number, fps: number): EffectClock {
  * amounts, because one is seeking a `<video>` element and the other is decoding.
  */
 export function sourceTimeAt(clip: Clip, t: number, epsilon: number): number {
-  const raw = clip.sourceTrimIn + (t - clip.timelineStart);
+  // The second half of the retiming relationship, `clipDuration` being the first: a second of
+  // timeline consumes `speed` seconds of source. `epsilon` is a source-side clamp and stays
+  // one — it keeps a seek off the out point, which is a property of the file, not of the rate.
+  const raw = clip.sourceTrimIn + (t - clip.timelineStart) * clipSpeedOf(clip);
   return Math.min(clip.sourceTrimOut - epsilon, Math.max(clip.sourceTrimIn, raw));
+}
+
+/**
+ * The source interval a stretch of timeline maps to.
+ *
+ * `sourceTimeAt` twice would clamp each end against the whole clip, which is right for a
+ * playhead and wrong for a range: the audio mixdown asks for the source behind one window of
+ * the output, and the FFmpeg graph asks for the source behind the whole clip. Both need the
+ * multiplication stated once rather than restated in two encoders.
+ */
+export function sourceRangeFor(
+  clip: Clip,
+  fromTimeline: number,
+  toTimeline: number,
+): { from: number; to: number } {
+  const speed = clipSpeedOf(clip);
+  const from = clip.sourceTrimIn + (fromTimeline - clip.timelineStart) * speed;
+  const to = clip.sourceTrimIn + (toTimeline - clip.timelineStart) * speed;
+  return {
+    from: Math.max(clip.sourceTrimIn, Math.min(clip.sourceTrimOut, from)),
+    to: Math.max(clip.sourceTrimIn, Math.min(clip.sourceTrimOut, to)),
+  };
 }
 
 /** A track grade has no clip to belong to, so its clock is the timeline's. */
@@ -137,6 +162,31 @@ function transformField(transform: OverlayTransform, channel: string): number {
   if (channel === 'rotate') return transform.rotate ?? 0;
   const [group, axis] = channel.split('.') as ['crop' | 'frame', 'x' | 'y' | 'w' | 'h'];
   return transform[group][axis];
+}
+
+/**
+ * A clip's playback rate. Image, text and annotation clips have no `speed` field at all, and
+ * `speedOf` reads the absence as 1 — so this answers for every kind without a branch.
+ */
+export function clipSpeedOf(clip: Clip): number {
+  return speedOf('speed' in clip ? clip.speed : undefined);
+}
+
+/**
+ * Which clip kinds carry an `OverlayTransform`.
+ *
+ * The companion of `isVisualClip`, and it exists for the same reason: the kinds that *draw*
+ * and the kinds that can be *placed* are different sets, both are written out by hand in
+ * several places, and neither is checked for exhaustiveness by the compiler. A kind missing
+ * from this one is not invisible — it is worse, because the control that offers to place it
+ * appears and then silently does nothing. That is exactly how annotation shipped: the store's
+ * writer listed video and image, so the checkbox could not be ticked.
+ *
+ * Text is deliberately absent. Its box is `textFrame`, sized to the text rather than cropped
+ * from a source, which is why `transformAt` returns undefined for it below.
+ */
+export function acceptsTransform(clip: Clip): clip is Extract<VisualClip, { kind: 'video' | 'image' | 'annotation' }> {
+  return clip.kind === 'video' || clip.kind === 'image' || clip.kind === 'annotation';
 }
 
 /**

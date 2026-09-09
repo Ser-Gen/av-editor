@@ -45,6 +45,8 @@ export const INSPECTOR_WIDTH_KEY = 'editor.inspectorWidth';
 export const LIBRARY_TAB_KEY = 'editor.libraryTab';
 export const INSPECTOR_TAB_KEY = 'editor.inspectorTab';
 export const PREVIEW_VOLUME_KEY = 'editor.previewVolume';
+/** How the library list is arranged. A view, never part of the project. */
+export const LIBRARY_VIEW_KEY = 'editor.libraryView';
 const LOCAL_KEYS = [
   TIMELINE_HEIGHT_KEY,
   LIBRARY_WIDTH_KEY,
@@ -52,6 +54,7 @@ const LOCAL_KEYS = [
   LIBRARY_TAB_KEY,
   INSPECTOR_TAB_KEY,
   PREVIEW_VOLUME_KEY,
+  LIBRARY_VIEW_KEY,
 ];
 
 export async function saveProject(project: ProjectFile): Promise<void> {

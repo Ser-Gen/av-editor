@@ -13,15 +13,18 @@ import {
 import { clampRect } from '../utils/overlayTransform';
 import { useEditorStore } from '../store/editorStore';
 import { drawTextClip } from '../preview/textRenderer';
+import type { TextStyle } from '../utils/textStyle';
 
 interface Props {
   text: string;
   template: TextTemplate;
+  /** The clip's overrides, so the editor previews the real look. */
+  style?: Partial<TextStyle>;
   textFrame: NormalizedRect;
   onChange: (frame: NormalizedRect) => void;
 }
 
-export function TextPlacementEditor({ text, template, textFrame, onChange }: Props) {
+export function TextPlacementEditor({ text, template, style, textFrame, onChange }: Props) {
   const settings = useEditorStore((s) => s.settings);
   const rootRef = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(STAGE_MAX_W);
@@ -68,7 +71,7 @@ export function TextPlacementEditor({ text, template, textFrame, onChange }: Pro
       ctx.stroke();
     }
 
-    drawTextClip(ctx, template, text || 'Text', stage.w, stage.h, frame);
+    drawTextClip(ctx, { template, text: text || 'Text', style }, stage.w, stage.h, frame);
 
     ctx.strokeStyle = '#c77dff';
     ctx.lineWidth = 2;
@@ -88,7 +91,7 @@ export function TextPlacementEditor({ text, template, textFrame, onChange }: Pro
     const handle = frameRectHandlePx(frame, stage);
     ctx.fillStyle = '#c77dff';
     ctx.fillRect(handle.x - 5, handle.y - 5, 10, 10);
-  }, [frame, template, text, stage.w, stage.h]);
+  }, [frame, template, style, text, stage.w, stage.h]);
 
   const beginDrag = (
     e: React.PointerEvent<HTMLCanvasElement>,

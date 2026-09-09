@@ -1,9 +1,18 @@
 import type { AudioMetadata } from '../utils/audioMetadata';
+import type { TextStyle } from '../utils/textStyle';
 
 export type ResolutionPreset = '480p' | '720p' | '1080p' | '4K';
 /** Tracks are an ordered layer stack: video tracks composite bottom-up, audio tracks mix. */
 export type TrackKind = 'video' | 'audio';
-export type TextTemplate = 'lowerThird' | 'centerTitle' | 'subtitle';
+export type TextTemplate =
+  | 'lowerThird'
+  | 'centerTitle'
+  | 'subtitle'
+  | 'caption'
+  | 'kicker'
+  | 'quote'
+  | 'outline'
+  | 'ticker';
 export type AssetType = 'video' | 'audio' | 'image';
 
 /**
@@ -115,6 +124,22 @@ export type TransitionType = 'dissolve' | 'dipToBlack' | 'wipeL' | 'wipeR';
 export type Interp = 'linear' | 'hold' | 'smooth';
 
 /** One control point. `t` is **clip-relative** seconds, so moving a clip carries it along. */
+/**
+ * One audio effect on one clip.
+ *
+ * Deliberately a different type from `EffectInstance`: a visual effect is a shader with a
+ * uniform block, an audio effect is a Web Audio node with an `AudioParam`. They share nothing
+ * but the shape of the list.
+ */
+export type AudioEffectType = 'highpass' | 'lowpass' | 'eq' | 'pitch';
+
+export interface AudioEffect {
+  id: string;
+  type: AudioEffectType;
+  enabled: boolean;
+  params: Record<string, number>;
+}
+
 export interface Keyframe {
   t: number;
   value: number;
@@ -167,6 +192,23 @@ export interface BaseClip {
   transitionIn?: TransitionType;
 }
 
+export type RippleScope = 'track' | 'all';
+
+/**
+ * A piece of text kept in the library and used by any number of clips.
+ *
+ * Reference semantics, like an asset: editing the object changes every clip showing it, and
+ * *Duplicate* is how you get one that goes its own way.
+ */
+export interface TextObject {
+  id: string;
+  name: string;
+  text: string;
+  template: TextTemplate;
+  style?: Partial<TextStyle>;
+  addedAt: number;
+}
+
 /** 0–1 normalized rectangle. */
 export interface NormalizedRect {
   x: number;
@@ -203,6 +245,36 @@ export interface VideoClip extends BaseClip {
   /** False after detaching, or when muted from the Inspector. */
   audioEnabled: boolean;
   gain: number;
+  /**
+   * The volume envelope, in clip-local seconds. A point list, evaluated by the same keyframe
+   * engine that animates effect parameters — so it interpolates the same three ways and splits
+   * with the clip. Absent means a flat `gain`.
+   */
+  gainKeyframes?: Keyframe[];
+  /** Filters, EQ and pitch, in order. See `utils/audioChain.ts`. */
+  audioEffects?: AudioEffect[];
+  /**
+   * The last measured integrated loudness, cached so the Inspector need not re-decode to show
+   * it. Invalidated whenever the trim changes, because it describes an excerpt.
+   */
+  loudness?: { lufs: number; peakDb: number; trimIn: number; trimOut: number };
+  /**
+   * Playback rate, 0.25–4. Absent means 1.
+   *
+   * Speed is the one property that changes what a clip's *duration* means: the source range
+   * stays fixed and the time it occupies becomes `(sourceTrimOut - sourceTrimIn) / speed`.
+   * `clipDuration` and `sourceTimeAt` are the two functions that state that relationship, and
+   * everything else in the app reads it through them rather than restating it.
+   *
+   * Only video and audio have one. An image, a title or an annotation has no source clock to
+   * run faster — its duration is already whatever you trim it to.
+   */
+  speed?: number;
+  /**
+   * Let the pitch rise and fall with the speed, like a tape. Absent means the pitch is held,
+   * which is what makes speech at 1.5× still sound like speech.
+   */
+  pitchFollowsSpeed?: boolean;
   hideVideo: boolean;
   /** Undefined = full-frame fit. Set = crop + placement (PiP). */
   transform?: OverlayTransform;
@@ -212,6 +284,36 @@ export interface AudioClip extends BaseClip {
   kind: 'audio';
   assetId: string;
   gain: number;
+  /**
+   * The volume envelope, in clip-local seconds. A point list, evaluated by the same keyframe
+   * engine that animates effect parameters — so it interpolates the same three ways and splits
+   * with the clip. Absent means a flat `gain`.
+   */
+  gainKeyframes?: Keyframe[];
+  /** Filters, EQ and pitch, in order. See `utils/audioChain.ts`. */
+  audioEffects?: AudioEffect[];
+  /**
+   * The last measured integrated loudness, cached so the Inspector need not re-decode to show
+   * it. Invalidated whenever the trim changes, because it describes an excerpt.
+   */
+  loudness?: { lufs: number; peakDb: number; trimIn: number; trimOut: number };
+  /**
+   * Playback rate, 0.25–4. Absent means 1.
+   *
+   * Speed is the one property that changes what a clip's *duration* means: the source range
+   * stays fixed and the time it occupies becomes `(sourceTrimOut - sourceTrimIn) / speed`.
+   * `clipDuration` and `sourceTimeAt` are the two functions that state that relationship, and
+   * everything else in the app reads it through them rather than restating it.
+   *
+   * Only video and audio have one. An image, a title or an annotation has no source clock to
+   * run faster — its duration is already whatever you trim it to.
+   */
+  speed?: number;
+  /**
+   * Let the pitch rise and fall with the speed, like a tape. Absent means the pitch is held,
+   * which is what makes speech at 1.5× still sound like speech.
+   */
+  pitchFollowsSpeed?: boolean;
 }
 
 export interface ImageClip extends BaseClip {
@@ -225,8 +327,65 @@ export interface TextClip extends BaseClip {
   kind: 'text';
   text: string;
   template: TextTemplate;
+  /**
+   * Overrides on top of the template's style. Absent means the template as it comes — which is
+   * what every clip saved before styling existed has, and why it still looks the same.
+   */
+  style?: Partial<TextStyle>;
+  /** The text object in the library this clip shows, when it came from one. */
+  textObjectId?: string;
   /** Text box on the composition canvas. */
   textFrame?: NormalizedRect;
+}
+
+/** One drawn mark on an annotation clip. Coordinates are normalized to the composition. */
+export type AnnotationShapeType = 'arrow' | 'box' | 'ellipse' | 'freehand' | 'callout';
+
+/**
+ * A pose of one mark at one moment, in clip-local seconds.
+ *
+ * The whole point list, not a channel per coordinate: a mark is a shape, and interpolating its
+ * corners independently is the same thing as interpolating the shape. Keys with a different
+ * number of points than their neighbour cannot be blended — a freehand path redrawn mid-clip —
+ * so the earlier one is held until the later one's moment arrives.
+ */
+export interface ShapePointKey {
+  t: number;
+  points: { x: number; y: number }[];
+}
+
+export interface AnnotationShape {
+  id: string;
+  type: AnnotationShapeType;
+  /**
+   * Arrow and callout: [tail, head]. Box and ellipse: [corner, corner]. Freehand: the path.
+   * Normalized against the composition, so an aspect change refits them the way masks refit.
+   */
+  points: { x: number; y: number }[];
+  color: string;
+  width: number;
+  fill: string | null;
+  /** Callouts only. */
+  text?: string;
+  /**
+   * Where this mark is over time, in clip-local seconds. Absent means it stays at `points`,
+   * which is what every mark did before this existed and what most of them still do.
+   */
+  pointKeys?: ShapePointKey[];
+}
+
+/**
+ * Drawn marks over whatever is below, for the clip's own time range.
+ *
+ * A clip rather than a property of another clip: an arrow usually wants to appear for three
+ * seconds of a thirty-second take, and making it a clip means the timeline already knows how
+ * to say when — no second mechanism, and trimming it is trimming it.
+ */
+export interface AnnotationClip extends BaseClip {
+  kind: 'annotation';
+  shapes: AnnotationShape[];
+  /** Undefined = full-frame, like every other overlay. */
+  transform?: OverlayTransform;
 }
 
 /**
@@ -238,17 +397,25 @@ export interface AdjustmentClip extends BaseClip {
   kind: 'adjustment';
 }
 
-export type Clip = VideoClip | AudioClip | ImageClip | TextClip | AdjustmentClip;
-export type VisualClip = VideoClip | ImageClip | TextClip;
+export type Clip =
+  | VideoClip
+  | AudioClip
+  | ImageClip
+  | TextClip
+  | AnnotationClip
+  | AdjustmentClip;
+export type VisualClip = VideoClip | ImageClip | TextClip | AnnotationClip;
 
 /**
  * Where an asset's bytes come from, which decides whether they survive a reload.
  *
  * `imported` files are the user's own and are never copied — only recognised again.
- * `derived` and `recorded` files were made by this app and have nowhere else to live, so
- * they are kept in OPFS. See `docs/persistence-plan.md`.
+ * `derived`, `recorded` and `pasted` files were made or received by this app and have nowhere
+ * else to live, so they are kept in OPFS. A pasted image is the clearest case: it never had a
+ * path, so there is nothing to relink it to and nobody to ask for it again.
+ * See `docs/persistence-plan.md`.
  */
-export type AssetOrigin = 'imported' | 'derived' | 'recorded';
+export type AssetOrigin = 'imported' | 'derived' | 'recorded' | 'pasted';
 
 /**
  * Enough of a file to recognise it when the user offers it back.
@@ -271,6 +438,11 @@ export interface AssetFingerprint {
  * *offline*, and every consumer has to answer for it rather than assume media is there.
  */
 export interface MediaAsset {
+  /**
+   * When it joined the library, epoch ms. Optional: assets stored before this field existed
+   * have none, and sort last under "Added" rather than pretending to a date.
+   */
+  addedAt?: number;
   id: string;
   /** Absent while offline. */
   file?: File;
@@ -369,6 +541,14 @@ export interface EditorDoc {
   tracks: Track[];
   clips: Clip[];
   libraryOrder: string[];
+  /**
+   * Reusable text, shown in the library beside the media.
+   *
+   * Inside the document snapshot, unlike `mediaLibrary`, and the difference is the point:
+   * importing a file is not undone by pressing undo, but the words in a title very much are.
+   * So text objects are displayed in the library panel and stored where undo can reach them.
+   */
+  textLibrary: TextObject[];
 }
 
 export interface HistoryEntry {
@@ -382,6 +562,14 @@ export interface EditorState extends EditorDoc {
   past: HistoryEntry[];
   future: HistoryEntry[];
   selectedClipIds: string[];
+  /**
+   * The mark being edited inside the selected annotation clip.
+   *
+   * A cursor, not a document fact, so it is outside `docSnapshot()` for the same reason
+   * `selectedClipIds` is: undo restores what the project contains, not where you were
+   * looking. Cleared whenever the clip selection changes.
+   */
+  selectedShapeId: string | null;
   playhead: number;
   trimPreview: TrimPreview | null;
   isPlaying: boolean;
@@ -393,6 +581,24 @@ export interface EditorState extends EditorDoc {
   viewportHeight: number;
   followPlayhead: boolean;
   snapEnabled: boolean;
+  /**
+   * Ripple editing: trims and deletes drag the rest of the timeline along instead of leaving
+   * a hole. Session state, not project state — it is how you are working right now, not
+   * something a reopened project should silently impose.
+   */
+  rippleEnabled: boolean;
+  /** `all` shifts every track by one amount, which is what keeps detached audio with its picture. */
+  rippleScope: RippleScope;
+  /**
+   * Force the FFmpeg pipeline instead of WebCodecs for the next export.
+   *
+   * Session state on purpose, and deliberately not part of `exportSettings`: forcing the slow
+   * path is something you do to diagnose one export, never a property a saved project should
+   * carry silently into next week.
+   */
+  exportForceFfmpeg: boolean;
+  /** The clip currently being measured for loudness, so the button can say so. */
+  loudnessJob: string | null;
   /**
    * Monitoring loudness for the preview, 0..1, and whether it is muted. Neither is part of
    * the project: turning the speakers down while you work must not turn the export down too,

@@ -1,4 +1,6 @@
 import { useState } from 'react';
+import { loadFfmpeg } from '../export/ffmpegLoader';
+import { formatExportError, logExportError } from '../export/exportLog';
 import { useEditorStore } from '../store/editorStore';
 import type { AudioFormat, ExportQuality, ExportSettings, MediaAsset } from '../types/editor';
 import {
@@ -61,6 +63,11 @@ export function ExportSettingsDialog({ onClose }: Props) {
   const mediaLibrary = useEditorStore((s) => s.mediaLibrary);
   const libraryOrder = useEditorStore((s) => s.libraryOrder);
   const save = useEditorStore((s) => s.setExportSettings);
+  const ffmpegStatus = useEditorStore((s) => s.ffmpegStatus);
+  const ffmpegError = useEditorStore((s) => s.ffmpegError);
+  const setFfmpegStatus = useEditorStore((s) => s.setFfmpegStatus);
+  const forceFfmpeg = useEditorStore((s) => s.exportForceFfmpeg);
+  const setForceFfmpeg = useEditorStore((s) => s.setExportForceFfmpeg);
   const saveMetadata = useEditorStore((s) => s.setAudioMetadata);
 
   const [draft, setDraft] = useState<ExportSettings>(stored);
@@ -85,6 +92,17 @@ export function ExportSettingsDialog({ onClose }: Props) {
     .filter((a): a is MediaAsset => !!a && a.type === 'image');
   const cover = metadata.coverAssetId ? mediaLibrary[metadata.coverAssetId] : null;
   const tagCount = metadataFieldCount(metadata);
+
+  const preload = async () => {
+    setFfmpegStatus('loading');
+    try {
+      await loadFfmpeg();
+      setFfmpegStatus('ready');
+    } catch (e) {
+      logExportError(e, 'load');
+      setFfmpegStatus('error', formatExportError(e));
+    }
+  };
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
@@ -445,6 +463,51 @@ export function ExportSettingsDialog({ onClose }: Props) {
             </button>
           </div>
         )}
+
+        {/*
+          Both of these used to be buttons on the top bar. They belong here: preloading is a
+          decision you take while looking at what you are about to export, and forcing the slow
+          path is a diagnostic, not a habit.
+        */}
+        <div className="settings-engine">
+          <label>Engine</label>
+          <div className="settings-engine-row">
+            <select
+              value={forceFfmpeg ? 'ffmpeg' : 'auto'}
+              disabled={audioOnly}
+              title={
+                audioOnly
+                  ? 'FFmpeg has no part in an audio export — it is muxed directly'
+                  : 'WebCodecs is faster and animates effect parameters; FFmpeg is the compatibility path'
+              }
+              onChange={(e) => setForceFfmpeg(e.target.value === 'ffmpeg')}
+            >
+              <option value="auto">Automatic — WebCodecs, falling back to FFmpeg</option>
+              <option value="ffmpeg">Force FFmpeg</option>
+            </select>
+            <button
+              type="button"
+              disabled={ffmpegStatus === 'loading' || ffmpegStatus === 'ready'}
+              title="Download the 32 MB FFmpeg core now instead of at the start of the export"
+              onClick={() => void preload()}
+            >
+              {ffmpegStatus === 'ready'
+                ? 'FFmpeg ready'
+                : ffmpegStatus === 'loading'
+                  ? 'Loading…'
+                  : 'Preload FFmpeg'}
+            </button>
+          </div>
+          {ffmpegStatus === 'error' && (
+            <p className="settings-warning">FFmpeg: {ffmpegError ?? 'failed to load'}</p>
+          )}
+          {forceFfmpeg && !audioOnly && (
+            <p className="settings-note">
+              Forced for this session only — it is not saved with the project. The fallback
+              freezes animated effect parameters at each clip's midpoint.
+            </p>
+          )}
+        </div>
 
         {reshaped && (
           <p className="settings-warning settings-warning--hard">

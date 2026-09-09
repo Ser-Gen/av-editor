@@ -19,6 +19,7 @@ import {
   transformAt,
 } from '../../utils/clipRender';
 import { transitionStateAt } from '../../utils/transitions';
+import { annotationShapesAt } from '../../utils/annotationAnim';
 import { clipDuration } from '../../utils/time';
 import { GLCompositor } from '../../render/GLCompositor';
 import { MIX_SAMPLE_RATE, MIX_WINDOW_SECONDS, downmixToMono, mixdownWindows } from './audioMixdown';
@@ -195,6 +196,24 @@ export async function exportWithWebCodecs(
               effects,
               fade,
               (alpha, flip) => compositor.drawTextClip(clip, alpha, flip),
+              transition.wipe,
+              clock,
+            );
+            continue;
+          }
+
+          if (clip.kind === 'annotation') {
+            compositor.withEffects(
+              effects,
+              fade,
+              (alpha, flip) =>
+                compositor.drawAnnotationClip(
+                  clip,
+                  annotationShapesAt(clip, t),
+                  transformAt(clip, t),
+                  alpha,
+                  flip,
+                ),
               transition.wipe,
               clock,
             );

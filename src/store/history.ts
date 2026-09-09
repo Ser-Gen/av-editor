@@ -10,6 +10,7 @@ export function docSnapshot(state: EditorState): EditorDoc {
     tracks: state.tracks,
     clips: state.clips,
     libraryOrder: state.libraryOrder,
+    textLibrary: state.textLibrary,
   };
 }
 
@@ -19,7 +20,8 @@ export function docEquals(a: EditorDoc, b: EditorDoc): boolean {
     a.exportSettings === b.exportSettings &&
     a.tracks === b.tracks &&
     a.clips === b.clips &&
-    a.libraryOrder === b.libraryOrder
+    a.libraryOrder === b.libraryOrder &&
+    a.textLibrary === b.textLibrary
   );
 }
 

@@ -40,8 +40,12 @@ export interface SourceStatus {
   bytes: number;
   /** Chunks handed to the writer but not yet confirmed on disk. */
   pending: number;
-  /** 0–1 RMS, for the level meter. Video sources report 0. */
+  /** 0–1 RMS, for the level meter. Video sources report 0, and so does a muted one. */
   level: number;
+  /** True while this source's track is disabled: it is recording, but recording silence. */
+  muted: boolean;
+  /** False for a source with no audio track — there is nothing to mute. */
+  canMute: boolean;
   error: string | null;
   /** Frames let go because the encoder was behind. WebCodecs engine only. */
   droppedFrames: number;
@@ -159,7 +163,31 @@ class CaptureSource {
     return (frames - oldest.frames) / span;
   }
 
+  /**
+   * Muting is `track.enabled = false` and nothing else.
+   *
+   * The encoder keeps receiving samples; they are silent. So the file's duration is unchanged,
+   * and so is the measured start offset that makes this source line up with the others
+   * sub-frame — which means a muted stretch costs nothing to place afterwards. Ending the
+   * source and starting a second one would have saved the bytes and cost the alignment.
+   */
+  setMuted(muted: boolean): void {
+    for (const track of this.stream.getAudioTracks()) track.enabled = !muted;
+  }
+
+  get muted(): boolean {
+    const tracks = this.stream.getAudioTracks();
+    return tracks.length > 0 && tracks.every((t) => !t.enabled);
+  }
+
+  get canMute(): boolean {
+    return this.stream.getAudioTracks().length > 0;
+  }
+
   level(): number {
+    // A disabled track still feeds the analyser its last values on some platforms. Reading
+    // zero here is what keeps the meter and the button from disagreeing.
+    if (this.muted) return 0;
     if (!this.analyser || !this.levelBuffer) return 0;
     this.analyser.getFloatTimeDomainData(this.levelBuffer);
     let sum = 0;
@@ -398,6 +426,20 @@ export class CaptureSession {
    * only be opened once, and a preview that fought the recorder for the device would fail
    * exactly when it mattered.
    */
+  /** Silence one source without interrupting it. See `CaptureSource.setMuted`. */
+  setSourceMuted(kind: CaptureSourceKind, muted: boolean): void {
+    this.sources.find((s) => s.kind === kind)?.setMuted(muted);
+  }
+
+  /**
+   * Ends one source while the take continues — the same path an unplugged camera takes, so
+   * the file is finalized, stays playable, and still arrives with the rest at `stop()`.
+   */
+  async stopSource(kind: CaptureSourceKind): Promise<void> {
+    const source = this.sources.find((s) => s.kind === kind);
+    if (source) await this.endSource(source, 'stopped by hand');
+  }
+
   cameraStream(): MediaStream | null {
     return this.sources.find((s) => s.kind === 'camera')?.stream ?? null;
   }
@@ -422,6 +464,8 @@ export class CaptureSession {
         bytes: stats.bytesWritten,
         pending: stats.pending,
         level: source.level(),
+        muted: source.muted,
+        canMute: source.canMute,
         error: stats.error,
         droppedFrames: stats.framesDropped,
         framesEncoded: stats.framesEncoded,

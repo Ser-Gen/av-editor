@@ -13,16 +13,17 @@
  *     whichever edge they were nearest and keep their own proportions. A bottom-right inset
  *     stays a bottom-right inset; a full-frame placement becomes a centred band rather than
  *     a stretched picture.
- *   - **Content-anchored** rects (masked regions) are remapped through the picture they were
- *     covering. A blur over a licence plate is meaningless in canvas coordinates the moment
- *     the picture moves inside the frame, which is exactly what an aspect change does to an
- *     untransformed clip.
+ *   - **Content-anchored** geometry (masked regions, drawn marks) is remapped through the
+ *     picture it was covering or pointing at. A blur over a licence plate — or an arrow
+ *     pointing at one — is meaningless in canvas coordinates the moment the picture moves
+ *     inside the frame, which is exactly what an aspect change does to an untransformed clip.
  *
  * Keyframed channels are transformed with the *same* map as the static rect, chosen once from
  * the base geometry. Deciding per key would let the anchor flip mid-animation and tear the
  * path in half; deciding once transforms the whole path rigidly.
  */
 import type {
+  AnnotationShape,
   Clip,
   EffectInstance,
   Keyframe,
@@ -111,6 +112,67 @@ export function refitRect(
   });
 }
 
+/**
+ * Where a picture that filled the old canvas lands in the new one.
+ *
+ * A clip with no transform is fit-and-letterboxed, so a source shaped like the old canvas —
+ * which is what a project's footage usually is — occupies exactly this box after a reshape.
+ * Reframing 16:9 to 9:16 leaves it as a centred band, and everything drawn *against* the
+ * picture has to go with it.
+ */
+export function fittedContentBox(from: CanvasSize, to: CanvasSize): NormalizedRect {
+  const scale = Math.min(to.width / from.width, to.height / from.height);
+  const w = (from.width * scale) / to.width;
+  const h = (from.height * scale) / to.height;
+  return { x: (1 - w) / 2, y: (1 - h) / 2, w, h };
+}
+
+/**
+ * Re-anchor drawn marks onto a differently shaped canvas.
+ *
+ * Annotations are **content-anchored**, not canvas-anchored — the distinction at the top of
+ * this file. An arrow means "that thing there"; the thing is in the picture, and reshaping the
+ * canvas moves the picture. So every point rides the map that takes the old frame into the box
+ * that same picture now occupies, and a mark that pointed at a licence plate still points at
+ * it, sitting inside the letterboxed band with everything else.
+ *
+ * They were canvas-anchored — each shape refitted against its own bounding box, keeping its
+ * distance from whichever edge it was nearest. That is right for a lower third, which belongs
+ * to the frame, and wrong for a mark, which belongs to what is under it: it left the arrow on
+ * the black bar beside the picture it was drawn on.
+ *
+ * One map for every shape and every pose, so a mark that travels is translated rigidly rather
+ * than each moment being re-anchored somewhere slightly different.
+ */
+export function refitAnnotationShapes(
+  shapes: AnnotationShape[],
+  from: CanvasSize,
+  to: CanvasSize,
+): AnnotationShape[] {
+  const box = fittedContentBox(from, to);
+  const mapPoints = (points: { x: number; y: number }[]) =>
+    points.map((p) => ({ x: box.x + p.x * box.w, y: box.y + p.y * box.h }));
+
+  // Stroke width is a fraction of the canvas' short side, and the picture it is drawn on has
+  // just changed size by `scale`. Without this an arrow over a halved picture keeps its old
+  // thickness in pixels and reads as twice as heavy.
+  const scale = Math.min(to.width / from.width, to.height / from.height);
+  const widthScale =
+    (Math.min(from.width, from.height) * scale) / Math.min(to.width, to.height);
+
+  return shapes.map((shape) => {
+    if (shape.points.length === 0) return shape;
+    return {
+      ...shape,
+      points: mapPoints(shape.points),
+      width: shape.width * widthScale,
+      ...(shape.pointKeys
+        ? { pointKeys: shape.pointKeys.map((key) => ({ ...key, points: mapPoints(key.points) })) }
+        : {}),
+    };
+  });
+}
+
 /** Regions may legitimately be tiny — a licence plate — so `clampRect`'s 5% floor is wrong here. */
 function clampRegion(rect: NormalizedRect): NormalizedRect {
   const w = Math.min(1, Math.max(0.001, rect.w));
@@ -139,10 +201,9 @@ export function contentRect(
   const sw = asset?.width;
   const sh = asset?.height;
   if (!sw || !sh) return { x: 0, y: 0, w: 1, h: 1 };
-  const scale = Math.min(canvas.width / sw, canvas.height / sh);
-  const w = (sw * scale) / canvas.width;
-  const h = (sh * scale) / canvas.height;
-  return { x: (1 - w) / 2, y: (1 - h) / 2, w, h };
+  // The same fit the marks ride, with the source's shape in place of the old canvas' — which
+  // is the point: a mark and a mask over the same picture must land in the same place.
+  return fittedContentBox({ width: sw, height: sh }, canvas);
 }
 
 /** Per-axis `value → a * value + b`, taking a rect from one content box into another. */
@@ -266,6 +327,11 @@ export function reframeClips(
       changed = true;
     }
 
+    if (clip.kind === 'annotation' && clip.shapes.length > 0) {
+      updated = { ...updated, shapes: refitAnnotationShapes(clip.shapes, from, to) } as Clip;
+      changed = true;
+    }
+
     if (clip.effects?.length) {
       const asset = 'assetId' in clip ? mediaLibrary[clip.assetId] : undefined;
       const transform = 'transform' in clip ? clip.transform : undefined;
@@ -310,7 +376,13 @@ export function reframeClips(
 export function countAnchored(clips: Clip[]): number {
   let count = 0;
   for (const clip of clips) {
-    const placed = ('transform' in clip && clip.transform) || (clip.kind === 'text' && clip.textFrame);
+    const placed =
+      ('transform' in clip && clip.transform) ||
+      (clip.kind === 'text' && clip.textFrame) ||
+      // Marks are drawn at explicit coordinates and are refitted like masks. They were left
+      // out of this count, so a project of nothing but annotations promised that nothing
+      // would move and then moved all of it.
+      (clip.kind === 'annotation' && clip.shapes.length > 0);
     const masked = clip.effects?.some((e) => (e.params[REGION_MODE] ?? 0) >= 0.5);
     if (placed || masked) count += 1;
   }

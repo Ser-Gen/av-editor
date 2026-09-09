@@ -1,17 +1,32 @@
 import type { Clip, EditorState, MediaAsset } from '../types/editor';
-import { overlayTransformToPixels, rotatedOverlayBox, rotationOf } from '../utils/overlayTransform';
+import {
+  clampRect,
+  textFrameForClip, overlayTransformToPixels, rotatedOverlayBox, rotationOf } from '../utils/overlayTransform';
 import { audibleClips, compositeLayers } from '../utils/compositeOrder';
-import { activeEffects, enabledEffects, isAnimated, transformAt } from '../utils/clipRender';
+import {
+  activeEffects,
+  clipSpeedOf,
+  enabledEffects,
+  isAnimated,
+  transformAt,
+} from '../utils/clipRender';
+import { retimeAudioFilters } from '../utils/retime';
+import { hasShapeAnimation } from '../utils/annotationAnim';
 import { ffmpegChain } from '../render/effects/registry';
 import { clipDuration } from '../utils/time';
 import { incomingTransition, outgoingTransition } from '../utils/transitions';
-import { drawtextFilter } from './textDrawtext';
+import { ffmpegAudioFilters, unsupportedForFfmpeg } from '../utils/audioChain';
+import type { OverlayImage } from './overlayPng';
+import { evaluateChannel } from '../utils/keyframes';
 
 export interface ExportInputSpec {
   path: string;
+  /** Empty for a file this export generated rather than one from the library. */
   assetId: string;
   /** FFmpeg args placed immediately before `-i` (e.g. `-loop 1` for images). */
   inputOptions: string[];
+  /** Set for a generated input — an overlay PNG — whose bytes the caller must write. */
+  bytes?: Uint8Array;
 }
 
 export interface ExportPlan {
@@ -58,19 +73,6 @@ function fadeFilters(clip: Clip): string[] {
   return out;
 }
 
-/** The same envelope as a drawtext `alpha` expression, for text clips. */
-function fadeAlphaExpr(clip: Clip): string | undefined {
-  const fadeIn = clip.fadeIn ?? 0;
-  const fadeOut = clip.fadeOut ?? 0;
-  const terms: string[] = [];
-  if (fadeIn > 0) terms.push(`(t-${clip.timelineStart})/${fadeIn}`);
-  if (fadeOut > 0) {
-    terms.push(`(${clip.timelineStart + clipDuration(clip)}-t)/${fadeOut}`);
-  }
-  if (terms.length === 0) return undefined;
-  const inner = terms.length === 1 ? terms[0] : `min(${terms[0]}\\,${terms[1]})`;
-  return `max(0\\,min(1\\,${inner}))`;
-}
 
 /**
  * A transition is an alpha ramp on the incoming clip over the outgoing one — exactly what
@@ -117,6 +119,23 @@ function transitionAfades(clip: Clip, clips: Clip[]): string[] {
   return out;
 }
 
+/**
+ * The drawn volume envelope, as far as a static filter chain can carry it.
+ *
+ * FFmpeg's `volume` is one number for the whole stream, so the envelope is applied at its
+ * value at the clip's midpoint — exactly the compromise keyframed video parameters already
+ * make in this path, and reported the same way. The WebCodecs path, which is the default,
+ * follows the drawn curve.
+ */
+function volumeEnvelopeFilters(clip: Clip, warnings: string[]): string[] {
+  const keys = 'gainKeyframes' in clip ? clip.gainKeyframes : undefined;
+  if (!keys || keys.length === 0) return [];
+  const midpoint = clipDuration(clip) / 2;
+  const value = Math.max(0, evaluateChannel(keys, midpoint, 1));
+  warnings.push('A drawn volume envelope is frozen at the clip midpoint by FFmpeg.');
+  return value === 1 ? [] : [`volume=${value.toFixed(4)}`];
+}
+
 /** `afade` filters for a clip's own timeline, applied before the delay shift. */
 function afadeFilters(clip: Clip): string[] {
   const fadeIn = clip.fadeIn ?? 0;
@@ -129,9 +148,20 @@ function afadeFilters(clip: Clip): string[] {
   return out;
 }
 
+/** A short name for a warning about an overlay that could not be drawn. */
+function overlayName(clip: Clip): string {
+  return clip.kind === 'text' ? clip.text.slice(0, 24) : 'annotation';
+}
+
 export function buildExportPlan(
   state: Pick<EditorState, 'clips' | 'mediaLibrary' | 'settings' | 'tracks'>,
+  /**
+   * Overlay bitmaps by clip id, drawn by `rasterizeOverlays`. Passed in rather than produced
+   * here so this module stays free of the DOM, which is what lets `check:math` import it.
+   */
+  overlayImages: OverlayImage[] = [],
 ): ExportPlan {
+  const overlays = new Map(overlayImages.map((o) => [o.clipId, o]));
   const { width, height } = state.settings;
   const fps = state.settings.fps;
   const duration = Math.max(0.1, ...state.clips.map((c) => c.timelineStart + clipDuration(c)));
@@ -190,27 +220,106 @@ export function buildExportPlan(
   // clip written wins. Preview walks the same structure.
   for (const layer of compositeLayers(state.clips, state.tracks)) {
     for (const clip of layer.clips) {
-      if (clip.kind === 'text') {
-        // drawtext burns straight into the base frame, so there is no layer to filter.
-        const effects = activeEffects(clip);
-        if (effects.length > 0) {
-          warnings.push(
-            `Effects on the text clip "${clip.text.slice(0, 20)}" cannot be rendered by FFmpeg.`,
-          );
+      if (clip.kind === 'text' || clip.kind === 'annotation') {
+        // The same bitmap the preview draws, overlaid — not a look rebuilt out of filter
+        // arguments. Which is also why an effect on a text clip is no longer refused: the
+        // overlay is a layer like any other now, and the chain runs on it.
+        const image = overlays.get(clip.id);
+        if (!image) {
+          warnings.push(`The overlay "${overlayName(clip)}" could not be rendered.`);
+          continue;
         }
-        const { filter, outLabel } = drawtextFilter(
-          clip.template,
-          clip.text,
-          width,
-          height,
-          '/font.ttf',
-          between(clip),
-          videoLabel,
-          clip.textFrame,
-          fadeAlphaExpr(clip),
+
+        const idx = inputIndex++;
+        const path = `overlay_${safeId(clip.id)}.png`;
+        inputSpecs.push({ path, assetId: '', inputOptions: ['-loop', '1'], bytes: image.bytes });
+
+        const id = safeId(clip.id);
+        const midpoint = clip.timelineStart + clipDuration(clip) / 2;
+        const effects = activeEffects(clip, midpoint);
+        // Marks that move are keyframed like anything else, and freeze like anything else —
+        // `isAnimated` reads the clip's own channels and cannot see inside a shape.
+        if (isAnimated(clip) || (clip.kind === 'annotation' && hasShapeAnimation(clip))) {
+          warnings.push('Keyframed parameters are frozen at the clip midpoint by FFmpeg.');
+        }
+
+        /*
+         * Where the bitmap lands.
+         *
+         * A text clip was rasterized at its own frame's size, so it only needs an origin. An
+         * annotation is rasterized at composition size and then placed by the clip's
+         * transform, through the same `overlayTransformToPixels` the video branch below uses
+         * — the placement rule has one implementation, whatever is being placed.
+         */
+        let overlayAt = '0:0';
+        let placeSteps: string[] = [];
+        let rotateStep: string | null = null;
+        let chainSize = { width: image.width, height: image.height };
+
+        if (clip.kind === 'text') {
+          const frame = clampRect(textFrameForClip(clip.textFrame));
+          overlayAt = `${Math.round(frame.x * width)}:${Math.round(frame.y * height)}`;
+        } else {
+          const transform = transformAt(clip, midpoint);
+          if (transform) {
+            const px = overlayTransformToPixels(
+              transform,
+              image.width,
+              image.height,
+              width,
+              height,
+            );
+            placeSteps = [
+              `crop=${px.cropW}:${px.cropH}:${px.cropX}:${px.cropY}`,
+              `scale=${px.frameW}:${px.frameH}`,
+            ];
+            chainSize = { width: px.frameW, height: px.frameH };
+            overlayAt = `${px.frameX}:${px.frameY}`;
+
+            const degrees = rotationOf(transform);
+            if (degrees !== 0) {
+              const box = rotatedOverlayBox(px.frameX, px.frameY, px.frameW, px.frameH, degrees);
+              rotateStep = `rotate=${(degrees * Math.PI) / 180}:ow=${box.w}:oh=${box.h}:c=none`;
+              overlayAt = `${box.x}:${box.y}`;
+            }
+          }
+        }
+
+        const chain = ffmpegChain(effects, chainSize);
+        warnings.push(...chain.unsupported.map((label) => `FFmpeg cannot reproduce ${label}.`));
+
+        const trimmed = `x${id}`;
+        filters.push(
+          `[${idx}:v]trim=duration=${clipDuration(clip)},setpts=PTS-STARTPTS,` +
+            `setpts=PTS+${clip.timelineStart}/TB,format=rgba` +
+            `${placeSteps.length > 0 ? `,${placeSteps.join(',')}` : ''}[${trimmed}]`,
         );
-        filters.push(filter);
-        videoLabel = outLabel;
+
+        let cursor = trimmed;
+        const faded = [...fadeFilters(clip)];
+        if (faded.length > 0) {
+          const next = `x${id}f`;
+          filters.push(`[${cursor}]${faded.join(',')}[${next}]`);
+          cursor = next;
+        }
+        chain.segments.forEach((segment, index) => {
+          const next = `x${id}e${index}`;
+          filters.push(segment(cursor, next, `${id}e${index}`));
+          cursor = next;
+        });
+        // Last, for the reason the video branch gives: the chain declares the size it was
+        // built for, and turning the picture under it would invalidate that.
+        if (rotateStep) {
+          const next = `x${id}r`;
+          filters.push(`[${cursor}]${rotateStep}[${next}]`);
+          cursor = next;
+        }
+
+        const out = `o${id}`;
+        filters.push(
+          `[${videoLabel}][${cursor}]overlay=${overlayAt}:enable='${between(clip)}'[${out}]`,
+        );
+        videoLabel = out;
         continue;
       }
 
@@ -230,9 +339,11 @@ export function buildExportPlan(
       const trimFilter = isImage
         ? `trim=duration=${clipDuration(clip)}`
         : `trim=start=${clip.sourceTrimIn}:end=${clip.sourceTrimOut}`;
-      filters.push(
-        `[${idx}:v]${trimFilter},setpts=PTS-STARTPTS,setpts=PTS+${delay}/TB[${trimLabel}]`,
-      );
+      // Retiming divides the clip's own timestamps. The order matters: the timeline shift
+      // that follows is in timeline seconds and must not be divided with them.
+      const speed = clipSpeedOf(clip);
+      const retime = speed === 1 ? 'setpts=PTS-STARTPTS' : `setpts=(PTS-STARTPTS)/${speed}`;
+      filters.push(`[${idx}:v]${trimFilter},${retime},setpts=PTS+${delay}/TB[${trimLabel}]`);
 
       // An FFmpeg filter chain is static, so an animated parameter cannot be expressed.
       // Freezing it at the clip's midpoint keeps the export sensible; the warning keeps
@@ -340,12 +451,29 @@ export function buildExportPlan(
     const idx = registerAsset(asset);
     const aLabel = `a${safeId(clip.id)}`;
     const delayMs = Math.round(clip.timelineStart * 1000);
+    const effects = 'audioEffects' in clip ? clip.audioEffects : undefined;
+    const audioFilters = ffmpegAudioFilters(effects);
+    const refused = unsupportedForFfmpeg(effects);
+    // Named and refused rather than dropped. An audio effect that silently does not happen is
+    // the one failure the user cannot hear the absence of until the file is somewhere else.
+    for (const label of refused) {
+      warnings.push(`FFmpeg cannot reproduce the ${label} effect on "${asset.name}".`);
+    }
+
     const steps = [
       `atrim=start=${clip.sourceTrimIn}:end=${clip.sourceTrimOut}`,
       'asetpts=PTS-STARTPTS',
+      // Retiming first, so everything after it — the chain, the fades, the envelope, the
+      // delay — is expressed in the clip's *output* time.
+      ...retimeAudioFilters(clip),
+      // The chain runs before the fades, so a filter never hears a fade it should not.
+      ...(audioFilters ?? []),
       // afade runs before the delay, so its timings are clip-relative.
       ...afadeFilters(clip),
       ...transitionAfades(clip, state.clips),
+      // A drawn envelope is a time-varying gain, which a static filter chain cannot express —
+      // the same limit that freezes keyframed video parameters at the midpoint.
+      ...volumeEnvelopeFilters(clip, warnings),
       `adelay=${delayMs}|${delayMs}`,
       ...(gain !== 1 ? [`volume=${gain}`] : []),
     ];

@@ -23,6 +23,7 @@ const ORIGIN_LABEL: Record<string, string> = {
   imported: 'Imported from disk',
   recorded: 'Recorded in this editor',
   derived: 'Made by a library preset',
+  pasted: 'Pasted from the clipboard',
 };
 
 /** One label/value line. The whole window is these. */

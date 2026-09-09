@@ -6,7 +6,7 @@
  * row with no explanation is worse than no row at all.
  */
 
-export type LibraryMenuId = 'info' | 'add' | 'preset' | 'relink' | 'remove';
+export type LibraryMenuId = 'info' | 'add' | 'download' | 'preset' | 'relink' | 'remove';
 
 export interface LibraryMenuItem {
   id: LibraryMenuId;
@@ -41,6 +41,13 @@ export function libraryMenuItems(ctx: LibraryMenuContext): LibraryMenuItem[] {
     disabled: !ctx.online,
     reason: ctx.online ? undefined : 'This file is offline. Relink it first.',
     separatorBefore: true,
+  });
+
+  items.push({
+    id: 'download',
+    label: 'Download a copy…',
+    disabled: !ctx.online,
+    reason: ctx.online ? undefined : 'This file is offline. There are no bytes to save.',
   });
 
   // Presets run through FFmpeg over a video's picture; there is nothing for them to do to an

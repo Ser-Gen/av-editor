@@ -6,9 +6,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A multi-track audio/video editor that runs entirely in the browser — no backend. React 19 +
 zustand + TypeScript on Vite. Rendering is WebGL; export is WebCodecs with FFmpeg WASM as the
-fallback. `README.md` documents the app from the user's side; `docs/capture-effects-plan.md` and
-`docs/audio-export-plan.md` and `docs/media-info-plan.md` are the phased plans of record, each
-with a results section and a DOD checklist per phase.
+fallback. `README.md` documents the app from the user's side; `docs/backlog.md` is the list of
+what is left and what became of everything asked for; the
+`*-plan.md` files beside it (`capture-effects`, `persistence`, `ux`, `audio-export`,
+`media-info`, `workflow`, `annotation`, `speed`) are the phased plans of record, each with a
+results section and a DOD checklist per phase. New work is chosen from the backlog and gets a plan.
 
 ## Commands
 
@@ -72,6 +74,20 @@ any static host. Vite rewrites the URLs it can see; it cannot see a string passe
 so a new hand-written path to something in `public/` must go through `publicUrl()`
 (`src/utils/publicUrl.ts`) — an absolute `'/fonts/…'` works in dev and breaks everywhere else.
 See the README's Hosting section.
+
+**Audio is one Web Audio graph, described once.** `utils/audioChain.ts` builds the node chain
+for a clip's effects, and both the preview (`PlaybackEngine`, which already routes elements
+through `createMediaElementSource`) and the export mixdown (`audioMixdown.ts`, which renders
+each window through an `OfflineAudioContext`) call it. Never add a filter to one of them alone.
+The FFmpeg fallback has `ffmpegAudioFilters` as its equivalent, and refuses the export by name
+where there is none — never drop an audio effect silently.
+
+**Text and annotation are rasterized, not reconstructed.** `preview/textRenderer.ts` and
+`render/annotationRaster.ts` draw to a canvas; the compositor uploads that as a texture, and the
+FFmpeg path overlays the same bitmap as a PNG (`export/overlayPng.ts`). `drawtext` is gone and
+should not come back — it is what made the style set a function of what a filter string could
+express. A template is a preset over `TextStyle` in `utils/textStyle.ts`: adding one is a table
+entry, not a `case`.
 
 **One shared FFmpeg WASM instance** (`export/ffmpegLoader.ts`) serves both export and the library
 tool presets. Two consequences that have already caused bugs: `ffmpeg.on()` *appends* handlers, so

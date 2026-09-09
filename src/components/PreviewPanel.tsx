@@ -12,6 +12,10 @@ import {
 } from '../utils/transport';
 import { bindMediaKeys, setMediaPlaybackState } from '../preview/mediaSession';
 import { MaskOverlay } from './MaskOverlay';
+import { AnnotationLayer } from './AnnotationLayer';
+import { ANNOTATION_TOOLS } from './AnnotationOverlay';
+import type { AnnotationTool } from './AnnotationOverlay';
+import { shapePointsAt, sortedKeys } from '../utils/annotationAnim';
 
 /** Editable MM:SS:FF — type a timecode and the playhead jumps there. */
 function TimecodeField({
@@ -139,6 +143,34 @@ export function PreviewPanel() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<PlaybackEngine | null>(null);
 
+  // The drawing tool is a property of the session, not of the clip: you pick a colour once
+  // and mark up ten things with it.
+  const [annotationTool, setAnnotationTool] = useState<AnnotationTool>('arrow');
+  const [annotationColor, setAnnotationColor] = useState('#ff3b30');
+  const [annotationWidth, setAnnotationWidth] = useState(0.006);
+  const annotationClipId = useEditorStore((st) =>
+    st.clips.find((c) => c.id === st.selectedClipIds[0] && c.kind === 'annotation')?.id ?? null,
+  );
+  const selectedShapeId = useEditorStore((s) => s.selectedShapeId);
+  const setAnnotationShapeKey = useEditorStore((s) => s.setAnnotationShapeKey);
+  const clearAnnotationShapeKeys = useEditorStore((s) => s.clearAnnotationShapeKeys);
+  const updateAnnotationShape = useEditorStore((s) => s.updateAnnotationShape);
+  const annotating = annotationClipId !== null;
+
+  /*
+   * Colour and width are one value each, and they mean both things at once: they restyle the
+   * selected mark and they are what the next mark is drawn with. The alternative — a separate
+   * "default" and "selection" pair — is two controls that look identical and a question about
+   * which one a slider just moved.
+   */
+  const setAnnotationStyle = (patch: { color?: string; width?: number }) => {
+    if (patch.color !== undefined) setAnnotationColor(patch.color);
+    if (patch.width !== undefined) setAnnotationWidth(patch.width);
+    if (annotationClipId && selectedShapeId) {
+      updateAnnotationShape(annotationClipId, selectedShapeId, patch);
+    }
+  };
+
   const clips = useEditorStore((s) => s.clips);
   const mediaLibrary = useEditorStore((s) => s.mediaLibrary);
   const settings = useEditorStore((s) => s.settings);
@@ -151,6 +183,17 @@ export function PreviewPanel() {
   const setPlaying = useEditorStore((s) => s.setPlaying);
   const importToLibrary = useEditorStore((s) => s.importToLibrary);
   const setLibraryNotice = useEditorStore((s) => s.setLibraryNotice);
+
+  /*
+   * The selected mark, as it stands at the playhead. The ⏱ acts on this rather than toggling
+   * a mode: a mark either moves or it does not, and which one is visible in the button.
+   */
+  const annotationClip = clips.find(
+    (c): c is Extract<typeof c, { kind: 'annotation' }> =>
+      c.id === annotationClipId && c.kind === 'annotation',
+  );
+  const selectedShape = annotationClip?.shapes.find((sh) => sh.id === selectedShapeId) ?? null;
+  const shapeMoves = !!selectedShape && sortedKeys(selectedShape.pointKeys).length > 0;
 
   const previewVolume = useEditorStore((s) => s.previewVolume);
   const previewMuted = useEditorStore((s) => s.previewMuted);
@@ -192,6 +235,16 @@ export function PreviewPanel() {
 
   const stateSlice = { clips, mediaLibrary, settings, tracks, trimPreview };
 
+  /*
+   * The engine reads these every frame while playing rather than being handed a snapshot when
+   * playback starts. Refs rather than state: the play loop must see the newest document, and
+   * re-running the effect that starts playback would restart it.
+   */
+  const sliceRef = useRef(stateSlice);
+  sliceRef.current = stateSlice;
+  const durationRef = useRef(0);
+  durationRef.current = duration;
+
   useEffect(() => {
     const engine = engineRef.current;
     if (!engine || isPlaying) return;
@@ -202,7 +255,7 @@ export function PreviewPanel() {
     const engine = engineRef.current;
     if (!engine) return;
     if (isPlaying) {
-      engine.play(stateSlice, playhead, duration);
+      engine.play(() => sliceRef.current, playhead, () => durationRef.current);
     } else {
       engine.pause();
       engine.seek(stateSlice, playhead);
@@ -288,6 +341,78 @@ export function PreviewPanel() {
           They also anchor to the canvas box, which is a different box in this mode.
         */}
         {!theater && <MaskOverlay canvasRef={canvasRef} />}
+        {!theater && (
+          <AnnotationLayer
+            canvasRef={canvasRef}
+            tool={annotationTool}
+            color={annotationColor}
+            width={annotationWidth}
+          />
+        )}
+        {/* The tool strip only appears with an annotation clip selected. */}
+        {!theater && annotating && (
+          <div className="annotation-tools">
+            {ANNOTATION_TOOLS.map((t) => (
+              <button
+                key={t.id}
+                type="button"
+                className={annotationTool === t.id ? 'is-active' : ''}
+                title={t.hint}
+                onClick={() => setAnnotationTool(t.id)}
+              >
+                {t.label}
+              </button>
+            ))}
+            <input
+              type="color"
+              value={annotationColor}
+              title="Colour of the selected mark, and of the next one"
+              onChange={(e) => setAnnotationStyle({ color: e.target.value })}
+            />
+            <input
+              type="range"
+              min={2}
+              max={20}
+              value={Math.round(annotationWidth * 1000)}
+              title="Width of the selected mark, and of the next one"
+              onChange={(e) => setAnnotationStyle({ width: Number(e.target.value) / 1000 })}
+            />
+            <button
+              type="button"
+              className={`stopwatch${shapeMoves ? ' is-armed' : ''}`}
+              disabled={!selectedShape}
+              title={
+                !selectedShape
+                  ? 'Select a mark first'
+                  : shapeMoves
+                    ? 'Stop this mark moving — it keeps the pose at the playhead'
+                    : 'Make this mark move: records where it is now, then drag it at another moment'
+              }
+              onClick={() => {
+                if (!annotationClip || !selectedShape) return;
+                if (shapeMoves) clearAnnotationShapeKeys(annotationClip.id, selectedShape.id);
+                // Recording where it already is, so the first drag elsewhere has something to
+                // travel *from*. Without it one pose holds for the whole clip and the mark
+                // looks as though it simply jumped.
+                else
+                  setAnnotationShapeKey(
+                    annotationClip.id,
+                    selectedShape.id,
+                    shapePointsAt(selectedShape, playhead - annotationClip.timelineStart),
+                  );
+              }}
+            >
+              ⏱
+            </button>
+            <span className="annotation-hint">
+              {shapeMoves
+                ? 'this mark moves · drag it at another moment to add a pose'
+                : selectedShapeId
+                  ? 'colour and width restyle this mark · ⏱ makes it move · Delete removes it'
+                  : 'Select picks a mark to move or restyle · right-click removes one'}
+            </span>
+          </div>
+        )}
       </div>
 
       {/*

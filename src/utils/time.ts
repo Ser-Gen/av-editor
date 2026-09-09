@@ -73,14 +73,49 @@ export function parseTimecode(input: string, fps: number = DEFAULT_FPS): number 
   return secs + frames / rate;
 }
 
-export function clipDuration(clip: { sourceTrimIn: number; sourceTrimOut: number }): number {
-  return Math.max(MIN_CLIP_DURATION, clip.sourceTrimOut - clip.sourceTrimIn);
+export const SPEED_MIN = 0.25;
+export const SPEED_MAX = 4;
+
+/**
+ * A stored playback rate, clamped and defaulted.
+ *
+ * The one place `?? 1` is written. A speed of 0 or NaN — from a hand-edited project file, or
+ * from a bug — would make a clip infinitely long rather than fail, so it is clamped here,
+ * where every reader passes through, instead of at the edges where one path could miss it.
+ *
+ * Takes the number rather than the clip so `time.ts` stays free of the type graph, which is
+ * what lets `check:math` and half the utils import it.
+ */
+export function speedOf(speed: number | undefined): number {
+  const value = speed ?? 1;
+  if (!Number.isFinite(value) || value <= 0) return 1;
+  return Math.min(SPEED_MAX, Math.max(SPEED_MIN, value));
+}
+
+/**
+ * How long a clip occupies the timeline.
+ *
+ * The source range divided by the speed. This is the single edit that carries retiming into
+ * the ruler, snapping, collision, the minimap, the project duration, the export length and
+ * the audio mixdown's window loop — none of which knows what speed is, because they all ask
+ * this function how long a clip is.
+ */
+export function clipDuration(clip: {
+  sourceTrimIn: number;
+  sourceTrimOut: number;
+  speed?: number;
+}): number {
+  return Math.max(
+    MIN_CLIP_DURATION,
+    (clip.sourceTrimOut - clip.sourceTrimIn) / speedOf(clip.speed),
+  );
 }
 
 export function clipEnd(clip: {
   timelineStart: number;
   sourceTrimIn: number;
   sourceTrimOut: number;
+  speed?: number;
 }): number {
   return clip.timelineStart + clipDuration(clip);
 }

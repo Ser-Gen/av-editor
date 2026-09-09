@@ -12,7 +12,7 @@
  * reported after the fact that the user would not rather have known first.
  */
 import type { Clip, Keyframe } from '../types/editor';
-import { quantizeToFrame } from './time';
+import { clipDuration, quantizeToFrame, speedOf } from './time';
 
 export interface RequantizeSummary {
   /** How many clips have at least one edge off the new grid. */
@@ -21,8 +21,23 @@ export interface RequantizeSummary {
   maxShift: number;
 }
 
+function speedOfClip(clip: Clip): number {
+  return speedOf('speed' in clip ? clip.speed : undefined);
+}
+
+/*
+ * What has to be on the grid.
+ *
+ * For a clip at its recorded rate the source out-point and the timeline end are the same
+ * number offset, so snapping the out-point snaps both. A retimed clip breaks that: its
+ * duration is `(out - in) / speed`, and it is the *duration* that has to land on a frame —
+ * snapping its source out-point would put the clip itself between frames, which is the exact
+ * failure this module exists to repair.
+ */
 function edgesOf(clip: Clip): number[] {
-  return [clip.timelineStart, clip.sourceTrimIn, clip.sourceTrimOut];
+  return speedOfClip(clip) === 1
+    ? [clip.timelineStart, clip.sourceTrimIn, clip.sourceTrimOut]
+    : [clip.timelineStart, clip.sourceTrimIn, clip.timelineStart + clipDuration(clip)];
 }
 
 export function summarize(clips: Clip[], fps: number): RequantizeSummary {
@@ -72,10 +87,13 @@ export function requantizeClips(clips: Clip[], fps: number): Clip[] {
     const sourceTrimIn = Math.max(0, quantizeToFrame(clip.sourceTrimIn, fps));
     // A clip shorter than one frame of the new grid would quantize to nothing and vanish,
     // so it keeps a single frame instead of being silently deleted.
-    const sourceTrimOut = Math.max(
-      sourceTrimIn + frame,
-      quantizeToFrame(clip.sourceTrimOut, fps),
-    );
+    const speed = speedOfClip(clip);
+    const sourceTrimOut =
+      speed === 1
+        ? Math.max(sourceTrimIn + frame, quantizeToFrame(clip.sourceTrimOut, fps))
+        : // Retimed: quantize the duration and let the source range absorb the remainder,
+          // which is what `retimeToSpeed` does when the speed is set in the first place.
+          sourceTrimIn + Math.max(frame, quantizeToFrame(clipDuration(clip), fps)) * speed;
     const next: Clip = {
       ...clip,
       timelineStart,

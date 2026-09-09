@@ -1,8 +1,11 @@
 import { memo } from 'react';
 import type { Clip, MediaAsset } from '../../types/editor';
 import { clipDuration } from '../../utils/time';
+import { formatSpeed, isRetimed } from '../../utils/retime';
+import { clipSpeedOf } from '../../utils/clipRender';
 import { ClipFilmstrip } from './ClipFilmstrip';
 import { ClipWaveform } from './ClipWaveform';
+import { GainEnvelope } from './GainEnvelope';
 
 interface Props {
   clip: Clip;
@@ -24,6 +27,10 @@ interface Props {
 function clipLabel(clip: Clip, asset: MediaAsset | undefined): string {
   if (clip.kind === 'text') return clip.text.slice(0, 40) || 'Text';
   if (clip.kind === 'adjustment') return 'Adjustment';
+  if (clip.kind === 'annotation') {
+    const n = clip.shapes.length;
+    return n === 0 ? 'Annotation (empty)' : `Annotation · ${n} mark${n === 1 ? '' : 's'}`;
+  }
   return asset?.name ?? clip.kind;
 }
 
@@ -121,6 +128,20 @@ export const ClipBlock = memo(function ClipBlock({
             width={width}
             height={audioStripHeight}
           />
+          {/*
+            Over the waveform, and only for the selected clip: an envelope line on every audio
+            clip in a busy project is noise, and the points would fight clip dragging for the
+            pointer.
+          */}
+          {selected && (clip.kind === 'audio' || clip.kind === 'video') && (
+            <GainEnvelope
+              clipId={clip.id}
+              keys={clip.gainKeyframes}
+              duration={clip.sourceTrimOut - clip.sourceTrimIn}
+              width={width}
+              height={audioStripHeight}
+            />
+          )}
         </div>
       )}
 
@@ -149,6 +170,10 @@ export const ClipBlock = memo(function ClipBlock({
         {clip.kind === 'video' && clip.transform ? '◱ ' : ''}
         {clip.kind === 'video' && clip.hasAudio && !clip.audioEnabled ? '🔇 ' : ''}
         {effectCount > 0 ? <span className="clip-fx-badge">fx{effectCount}</span> : null}
+        {/* A retimed clip looks exactly like an untrimmed one, so it has to say so. */}
+        {isRetimed(clip) ? (
+          <span className="clip-speed-badge">{formatSpeed(clipSpeedOf(clip))}</span>
+        ) : null}
         {label}
       </span>
 

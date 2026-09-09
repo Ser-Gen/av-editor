@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { useEditorStore } from '../../store/editorStore';
 import { clampMenuPosition, clipMenuItems } from '../../utils/clipMenu';
+import { clipSpeedOf } from '../../utils/clipRender';
 import type { ClipMenuId } from '../../utils/clipMenu';
 import { clipEnd } from '../../utils/time';
 
@@ -90,6 +91,7 @@ export function ClipContextMenu({ request, onClose, onBake, onPreset }: Props) {
     hasAudio: clip.kind === 'video' ? clip.hasAudio : clip.kind === 'audio',
     audioEnabled: clip.kind === 'video' ? clip.audioEnabled : true,
     hideVideo: clip.kind === 'video' ? clip.hideVideo : false,
+    speed: clipSpeedOf(clip),
     trackLocked: !!track?.locked,
     producerBusy,
     selectionCount,
@@ -115,6 +117,15 @@ export function ClipContextMenu({ request, onClose, onBake, onPreset }: Props) {
         break;
       case 'preset':
         onPreset(clip.id);
+        break;
+      case 'speedHalf':
+        store.setClipSpeed(clip.id, 0.5);
+        break;
+      case 'speedNormal':
+        store.setClipSpeed(clip.id, 1);
+        break;
+      case 'speedDouble':
+        store.setClipSpeed(clip.id, 2);
         break;
       case 'detach':
         store.detachAudio(clip.id);

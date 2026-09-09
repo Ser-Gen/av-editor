@@ -22,7 +22,7 @@ type Interaction =
       primaryId: string;
       origins: Map<string, { start: number; trackId: string }>;
     }
-  | { kind: 'trim'; clipId: string; edge: 'left' | 'right' }
+  | { kind: 'trim'; clipId: string; edge: 'left' | 'right'; mode: 'trim' | 'rate' }
   | { kind: 'fade'; clipId: string; edge: 'in' | 'out' }
   | { kind: 'marquee'; startX: number; startY: number; additive: boolean; moved: boolean }
   | {
@@ -117,8 +117,20 @@ export function useTimelineInteractions(
       }
 
       if (mode !== 'move') {
-        store.beginInteraction('Trim clip');
-        interactionRef.current = { kind: 'trim', clipId: clip.id, edge: mode };
+        /*
+         * ⌥ turns a trim into a *rate* trim: every frame is kept and the clip takes a
+         * different amount of time to play them. The modifier is read once, at the start of
+         * the drag, so letting go of the key half way through does not change what the
+         * gesture means underneath the pointer.
+         */
+        const rate = e.altKey && (clip.kind === 'video' || clip.kind === 'audio');
+        store.beginInteraction(rate ? 'Rate trim' : 'Trim clip');
+        interactionRef.current = {
+          kind: 'trim',
+          clipId: clip.id,
+          edge: mode,
+          mode: rate ? 'rate' : 'trim',
+        };
         return;
       }
 
@@ -257,7 +269,7 @@ export function useTimelineInteractions(
         const targets = buildSnapTargets(store.clips, [clip.id], store.playhead);
         const snapped = snapValue(contentToTime(x), targets, snapOpts());
         store.setSnapIndicator(snapped.target);
-        store.trimClipTo(clip.id, interaction.edge, snapped.value);
+        store.trimClipTo(clip.id, interaction.edge, snapped.value, interaction.mode);
 
         const updated = useEditorStore.getState().clips.find((c) => c.id === clip.id);
         if (updated && (updated.kind === 'video' || updated.kind === 'audio')) {

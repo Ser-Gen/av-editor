@@ -1,4 +1,4 @@
-# Browser AV Editor
+# AWw Editor
 
 Minimalist multi-track audio/video editor in the browser. English UI, dark theme. Export uses FFmpeg WASM.
 
@@ -136,6 +136,10 @@ the preview and the FFmpeg export in agreement.
 ---
 
 ## Media Library
+
+Rows show the file's duration and size. **Sort: My order** is the order you put things in —
+drag a row onto another to move it there. Every other sort has a direction, so a drag under one
+of those would spring back and is not offered.
 
 The left sidebar has three tabs — **Media**, **Record** and **Storage** — and the inspector on
 the right has up to three of **Clip**, **Placement** and **Effects**, listing only the ones the
@@ -323,6 +327,53 @@ Two stages, multiplied together:
 Both affect preview (Web Audio `GainNode`) and export (FFmpeg `volume` filter).
 Preview and export mix all audible clips (`amix` in FFmpeg).
 
+A clip's gain reaches **400%** (+12 dB) because that is what levelling a quiet take needs; a
+track fader stops at 150%, being a balance control over material that has already been levelled.
+
+### Loudness
+
+**Normalize** (Inspector → Loudness) measures the clip to EBU R128 and sets its gain so it lands
+on −16 LUFS. Select several clips and the same button becomes **Match N clips**: every one is
+measured and moved onto the same target, so a quiet take and a loud one sit at the same level
+across the cut. Only the gain changes — nothing is re-encoded, and undo puts it back.
+
+The lift stops at +12 dB. Past that the noise floor arrives with the signal, so a take that
+needed more is moved as far as it goes and said so in the status line rather than quietly
+landing short.
+
+### Speed
+
+A video or audio clip can play at **0.25×–4×**. Set it in the Inspector's **Speed** section
+(preset buttons, or the slider for anything between), from the clip's right-click menu for the
+three common rates, or by **⌥-dragging a trim handle** — that keeps every frame and changes how
+long the clip takes to play them, where an ordinary drag keeps the rate and throws frames away.
+A retimed clip carries a `2×` badge on the timeline.
+
+Changing the speed keeps the clip's **source range** and changes how long it occupies the
+timeline. Growing a clip follows the ripple mode: with **Ripple** on, the rest of the track
+makes room; with it off, the clip grows into the free space and stops at its neighbour, because
+an overlap *is* a cross-dissolve here and slowing a clip down must not silently dissolve it
+into whatever comes next.
+
+**Pitch is held by default** — speech at 1.5× still sounds like speech. Tick *Pitch follows the
+speed* for the tape behaviour, where faster is higher.
+
+| Where | Pitch held | Pitch follows |
+|---|---|---|
+| Preview | The browser's own time-stretcher (`preservesPitch`) | Resampled |
+| WebCodecs export | WSOLA overlap-add (`utils/timeStretch.ts`) | Resampled |
+| FFmpeg export | `atempo` | `asetrate` |
+
+All three hold the pitch properly. They are three different implementations because each
+engine offers something different — the browser will not lend its stretcher to an
+`OfflineAudioContext`, and FFmpeg has its own — so a heavily retimed clip can sound slightly
+different between them, most audibly on sustained music. `atempo` is the best of the three if
+you are choosing.
+
+Everything else follows the clip: trimming lands where you drop it, a split gives two halves
+that together play what the one did, detached audio carries the same speed, and keyframes and
+volume envelopes stretch with the clip.
+
 ### Dropping files onto the timeline
 
 Files dragged in from Finder land on the track and at the time you drop them, rather than
@@ -347,7 +398,7 @@ Dropped files are imported like any other — **referenced, not copied**, so the
 offline after a reload exactly like files chosen through the picker. See
 [Saving, and what survives a refresh](#saving-and-what-survives-a-refresh).
 
-### Placement (video, image, text)
+### Placement (video, image, text, annotation)
 
 Every visual clip fills the frame by default (fit and letterbox). Tick
 **Custom placement (crop / picture-in-picture)** in the Inspector to crop the source
@@ -361,7 +412,7 @@ All editors share the same interaction model:
 - **Position on screen** — drag the frame or set X/Y/W/H (% of canvas)
 - **Crop source** (video & image only) — drag the crop region on the source or set X/Y/W/H (% of source)
 
-Custom placement defaults to the top-right. New text uses the full canvas until you resize the box. Preview and export use the same transforms (canvas + FFmpeg `crop` / `scale` / `overlay` for media; framed `drawtext` for text).
+Custom placement defaults to the top-right. New text uses the full canvas until you resize the box. Preview and export use the same transforms — the compositor's crop/frame placement, and FFmpeg's `crop` / `scale` / `overlay` — for media, text and annotation alike. Text and annotation are drawn on a canvas and overlaid as a bitmap, not rebuilt out of filter arguments.
 
 **An overlay may hang off the edge of the frame.** Drag it past any side and the part that
 leaves the canvas is simply not drawn — that is how a picture-in-picture slides in from
@@ -389,6 +440,100 @@ and the overlay spins between the keys. The value is not wrapped to one turn, so
 
 The crop stage follows the playhead while playback is paused, so you are cropping against
 the frame the clip is actually showing rather than the one it opened on.
+
+### Text
+
+**+ Text** in the library header makes a text object. Adding it to the timeline makes a clip
+that shows it; adding it three times makes three clips showing the same object, and editing any
+of them changes all three — that is what "the same object" means, and the Inspector says so,
+with **Style this one alone** to break the link. The library row's **⧉** makes an independent
+object; **+** makes another use of the one you have; **Duplicate** on a timeline clip makes a
+copy, not another use.
+
+A **template** — lower third, centre title, subtitle, caption box, kicker, quote, outlined,
+ticker — is a named preset over one style record, and every control below it writes an
+*override* on top. A clip with no overrides is exactly its template, which is why a project
+saved before styling existed opens looking as it did. Changing the template drops the
+overrides: they were expressed against the old one.
+
+Everything is a proportion of the frame, never a pixel, so one clip looks like one thing in a
+480p proxy, a 1080p preview and a 4K export:
+
+| Control | Unit |
+|---|---|
+| Size, margin | Fraction of the text frame |
+| Line height, tracking, stroke, shadow | Fraction of the font size |
+
+**Stroke** is the outline you can see — the renderer draws twice it, so the fill does not cover
+half of what you asked for. **Shadow** and **Box** are toggles; the shadow is cast by the
+outermost thing drawn, so a boxed style shadows the box rather than the type inside it.
+
+### Annotation
+
+**+ Annotation** above the timeline adds a clip that holds drawn marks over whatever is below
+it, for its own stretch of time. Trimming the clip is how you say when the marks appear;
+dragging it is how you move them in time.
+
+With the clip selected, a tool strip appears under the preview:
+
+| Tool | What a drag does |
+|---|---|
+| **Select** | Picks a mark to move, reshape, restyle or delete |
+| **Arrow** | Tail to point |
+| **Box** / **Ellipse** | Corner to corner |
+| **Draw** | Freehand line |
+| **Label** | A caption box, placed with a click — no arrow, and dragging does not stretch it. Use the Arrow tool for the half that points |
+
+The colour and width controls mean two things at once, on purpose: they restyle the selected
+mark *and* they are what the next mark is drawn with.
+
+**Editing a mark.** With the Select tool, click one — drag its body to move it, drag either
+end handle to reshape it. A drag is one undo entry, however far it went. Each mark carries a
+dashed outline tracing it while the annotation clip is selected: that is the selection and the
+grab region, never part of the drawing, and it goes solid on the mark you have picked. `Delete`
+removes the selected mark, `Escape` deselects it, and right-clicking a mark's outline removes
+it outright under any tool, with no menu. The
+Inspector lists every mark in the clip: click a row to select it, and the selected row opens
+its own colour, width, shading and — for a callout — its text. **Double-clicking a callout on
+the preview** edits its label in place; Enter commits, Escape cancels.
+
+**Making a mark follow something.** Select a mark and press **⏱** in the tool strip. That
+records where it is at the playhead — nothing moves yet. Now move the playhead, drag the mark,
+and it travels between the two poses: an arrow that stays on a moving subject. Keep going to add
+more.
+
+The poses appear on the clip in the timeline, on their own row of the keyframe strip, because a
+mark that follows its subject is animation like everything else there. Drag a marker to change
+when that pose happens, right-click it to delete it, click it to select its mark; the Inspector
+lists the same poses by time, jumps the playhead to one, and has a **×** on each. Delete until
+one pose is left and the mark simply sits there for the whole clip — a single pose is a
+placement, not the start of a move.
+
+There is no arming *mode*: a mark either moves or it does not, and the ⏱ is lit when it does.
+Dragging a moving mark records a pose at the playhead; dragging a still one just moves it. The
+Inspector's Selected mark panel lists the poses by time — click one to jump to it — and has
+**Stop it moving**, which keeps the pose at the playhead and drops the rest.
+
+The FFmpeg fallback cannot express a moving overlay and freezes it at the clip's midpoint,
+warning as it does for every other keyframed value; the WebCodecs export follows the movement.
+
+**Placing and animating the whole set.** Under **Placement**, *Place the marks in a frame* turns the whole
+set of marks into a placed picture: dragging with the Select tool on empty space moves it, and
+the frame sliders size it. Strokes scale with the frame, so the marks keep their proportions.
+Arm **Animate placement** and the marks travel between keyframes exactly as a
+picture-in-picture does. The FFmpeg fallback cannot express an animated filter chain, so it
+freezes the placement at the clip's midpoint and says so in the export warnings — the
+WebCodecs path follows the animation.
+
+Marks are anchored to the **picture**, not to the frame. Reshaping the project moves the
+picture — 16:9 footage in a 9:16 project becomes a centred band — so the marks move with it and
+keep pointing at what they were drawn on, rather than staying put and ending up on the black
+bar beside it. Placed overlays and text boxes take the opposite rule, keeping their distance
+from the edge they sit against; the settings dialog says which clips each one will move.
+
+What you see is what is exported: the preview, the WebCodecs export and the FFmpeg fallback
+all draw the marks from `render/annotationRaster.ts`, and the fallback overlays that same
+bitmap as a PNG.
 
 ### Video thumbnails
 

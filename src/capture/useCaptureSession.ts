@@ -5,7 +5,7 @@ import type { CaptureStatus } from './CaptureSession';
 import { chooseEngine } from './engine';
 import type { EngineChoice, EnginePreference } from './engine';
 import { SOURCE_LABELS } from './recordingStore';
-import type { RecordedSource } from './recordingStore';
+import type { CaptureSourceKind, RecordedSource } from './recordingStore';
 import { discardRecording, findOrphans, finalizeRecording, recoverRecording } from './recovery';
 import type { OrphanRecording } from './recovery';
 import { CaptureAborted, cameraConstraints, stalledNote, systemAudioSupport } from './sources';
@@ -47,6 +47,13 @@ export interface CaptureController {
   orphans: OrphanRecording[];
   start: () => Promise<void>;
   stop: () => Promise<void>;
+  /**
+   * Silence one source mid-take. The file keeps running and keeps its length, so nothing has
+   * to be re-aligned afterwards — see `CaptureSource.setMuted`.
+   */
+  setSourceMuted: (kind: CaptureSourceKind, muted: boolean) => void;
+  /** End one source while the rest of the take carries on. */
+  stopSource: (kind: CaptureSourceKind) => Promise<void>;
   cancel: () => Promise<void>;
   /** Abandons a start that is waiting on a picker or a permission prompt. */
   cancelStart: () => void;
@@ -411,6 +418,18 @@ export function useCaptureSession(
     stopRef.current = stop;
   }, [stop]);
 
+  const setSourceMuted = useCallback((kind: CaptureSourceKind, muted: boolean) => {
+    sessionRef.current?.setSourceMuted(kind, muted);
+    // The next poll would pick it up anyway; doing it here keeps the button from lagging a
+    // beat behind the click.
+    setStatus(sessionRef.current?.status() ?? null);
+  }, []);
+
+  const stopSource = useCallback(async (kind: CaptureSourceKind) => {
+    await sessionRef.current?.stopSource(kind);
+    setStatus(sessionRef.current?.status() ?? null);
+  }, []);
+
   const cancel = useCallback(async () => {
     await sessionRef.current?.cancel();
     sessionRef.current = null;
@@ -472,6 +491,8 @@ export function useCaptureSession(
     orphans,
     start,
     stop,
+    setSourceMuted,
+    stopSource,
     cancel,
     cancelStart,
     restore,

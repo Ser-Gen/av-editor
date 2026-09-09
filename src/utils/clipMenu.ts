@@ -14,6 +14,9 @@ export type ClipMenuId =
   | 'duplicate'
   | 'bake'
   | 'preset'
+  | 'speedHalf'
+  | 'speedNormal'
+  | 'speedDouble'
   | 'detach'
   | 'toggleAudio'
   | 'toggleVideo'
@@ -35,7 +38,7 @@ export interface ClipMenuItem {
 }
 
 export interface ClipMenuContext {
-  kind: 'video' | 'audio' | 'image' | 'text' | 'adjustment';
+  kind: 'video' | 'audio' | 'image' | 'text' | 'annotation' | 'adjustment';
   /** True when the playhead is strictly inside the clip, so there is something to cut. */
   playheadInside: boolean;
   hasAsset: boolean;
@@ -43,6 +46,8 @@ export interface ClipMenuContext {
   offline: boolean;
   hasAudio: boolean;
   audioEnabled: boolean;
+  /** The clip's playback rate. 1 for kinds that cannot be retimed. */
+  speed: number;
   hideVideo: boolean;
   trackLocked: boolean;
   /** A producer is already running; only one may at a time. */
@@ -112,6 +117,26 @@ export function clipMenuItems(ctx: ClipMenuContext): ClipMenuItem[] {
         reason: cannotRender,
       });
     }
+  }
+
+  // The three rates worth a menu entry. Everything between them is the Inspector's slider,
+  // and ⌥-dragging a trim handle is the third way in.
+  if (ctx.kind === 'video' || ctx.kind === 'audio') {
+    const rates: { id: ClipMenuId; label: string; value: number }[] = [
+      { id: 'speedHalf', label: 'Half speed', value: 0.5 },
+      { id: 'speedNormal', label: 'Normal speed', value: 1 },
+      { id: 'speedDouble', label: 'Double speed', value: 2 },
+    ];
+    rates.forEach((rate, index) => {
+      const already = Math.abs(ctx.speed - rate.value) < 1e-6;
+      items.push({
+        id: rate.id,
+        label: rate.label,
+        disabled: !!locked || already,
+        reason: locked ?? (already ? 'Already playing at this rate.' : undefined),
+        separatorBefore: index === 0,
+      });
+    });
   }
 
   if (ctx.kind === 'video') {

@@ -1,7 +1,7 @@
 /**
  * Turning a saved asset table back into a live library.
  *
- * Three origins, three different answers to "where are the bytes?":
+ * Four origins, three different answers to "where are the bytes?":
  *
  *   - **derived** — in OPFS `media/`, put there when the app produced them.
  *   - **recorded** — already in OPFS `recordings/`, bound by sidecar id rather than copied.
@@ -28,7 +28,9 @@ async function bytesFor(
   asset: StoredAsset,
   folder: ReadonlyMap<string, File>,
 ): Promise<File | null> {
-  if (asset.origin === 'derived' && asset.opfsName) return getMedia(asset.opfsName);
+  if ((asset.origin === 'derived' || asset.origin === 'pasted') && asset.opfsName) {
+    return getMedia(asset.opfsName);
+  }
   if (asset.origin === 'recorded' && asset.opfsName) return fileOf(asset.opfsName);
   if (asset.origin === 'imported') {
     // A folder the project was saved to covers every file inside it with one grant, so this
@@ -72,7 +74,7 @@ export async function rehydrate(
 export function reachableMedia(assets: readonly StoredAsset[]): Set<string> {
   return new Set(
     assets
-      .filter((a) => a.origin === 'derived' && !!a.opfsName)
+      .filter((a) => (a.origin === 'derived' || a.origin === 'pasted') && !!a.opfsName)
       .map((a) => a.opfsName as string),
   );
 }

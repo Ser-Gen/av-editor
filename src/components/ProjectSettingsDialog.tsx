@@ -169,7 +169,7 @@ export function ProjectSettingsDialog({ onClose }: Props) {
           <p className="settings-warning">
             {anchored === 0
               ? 'Changing the shape moves nothing: every clip is fit to the frame and will re-fit itself.'
-              : `${anchored} clip${anchored === 1 ? '' : 's'} with placed overlays, text boxes or masks will be re-anchored to the new shape. Undo restores the shape and the framing together.`}
+              : `${anchored} clip${anchored === 1 ? '' : 's'} with placed overlays, text boxes, marks or masks will be re-anchored to the new shape. Overlays and text keep their distance from the edge they sit against; marks and masks follow the picture, which itself moves when the frame changes shape. Undo restores the shape and the framing together.`}
           </p>
         )}
 

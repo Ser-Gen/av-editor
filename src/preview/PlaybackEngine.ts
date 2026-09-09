@@ -1,21 +1,39 @@
-import type { Clip, EditorState, MediaAsset, VisualClip } from '../types/editor';
+import type {
+  AnnotationClip,
+  AudioEffect,
+  Clip,
+  EditorState,
+  MediaAsset,
+  VisualClip,
+} from '../types/editor';
 import { drawOverlaySource, normalizeOverlayTransform } from '../utils/overlayTransform';
 import { textFrameForClip } from '../utils/overlayTransform';
 import { audibleClips, compositeLayers, compositeOrderedClips } from '../utils/compositeOrder';
 import {
   activeEffects,
   clipClock,
+  clipSpeedOf,
   enabledEffects,
   fadeGainAt,
   sourceTimeAt,
   timelineClock,
   transformAt,
 } from '../utils/clipRender';
+import {
+  buildAudioChain,
+  chainIsIdentity,
+  chainStructureKey,
+  envelopeGainAt,
+  pitchSemitones,
+} from '../utils/audioChain';
+import { createPitchNode, ensurePitchWorklet } from '../utils/pitchNode';
 import { transitionStateAt } from '../utils/transitions';
 import { clipDuration } from '../utils/time';
 import { GLCompositor } from '../render/GLCompositor';
 import { MediaElementPool } from './mediaElements';
 import { drawTextClip } from './textRenderer';
+import { drawAnnotationClip } from '../render/annotationRaster';
+import { annotationShapesAt } from '../utils/annotationAnim';
 import { offlineCard } from '../utils/offlineCard';
 
 type StoreSlice = Pick<EditorState, 'clips' | 'mediaLibrary' | 'settings' | 'tracks' | 'trimPreview'>;
@@ -26,6 +44,15 @@ interface ClipAudioRoute {
   element: HTMLMediaElement;
   gain: GainNode;
   connectedToDest: boolean;
+  /**
+   * The head of the effect chain, and a fingerprint of the effects it was built from. A Web
+   * Audio graph cannot be edited in place — changing a filter means rebuilding the nodes — so
+   * the fingerprint is what tells a frame whether anything has to be torn down.
+   */
+  chainInput: AudioNode;
+  chainKey: string;
+  /** Moves the existing nodes onto new settings — see `BuiltChain.tune`. */
+  tune?: (effects: AudioEffect[] | undefined) => void;
 }
 
 export class PlaybackEngine {
@@ -43,6 +70,11 @@ export class PlaybackEngine {
   private anchorTime = 0;
   private playing = false;
   private renderGeneration = 0;
+  /** Read every frame while playing, so an edit mid-playback is heard and seen at once. */
+  private source: (() => StoreSlice) | null = null;
+  private duration: (() => number) | null = null;
+  /** Scratch raster for a *placed* annotation on the 2D fallback; made on first need. */
+  private overlayCanvas: HTMLCanvasElement | null = null;
   private warnedNoEffects2D = false;
   private onTime?: (t: number) => void;
   private onEnded?: () => void;
@@ -77,6 +109,8 @@ export class PlaybackEngine {
    * project anyway — it must never reach an export.
    */
   private masterGain: GainNode | null = null;
+  /** Set once the pitch worklet module has been added to this engine's context. */
+  private pitchReady = false;
   private monitorGain = 1;
 
   private ensureAudioCtx(): AudioContext {
@@ -180,6 +214,25 @@ export class PlaybackEngine {
     });
   }
 
+  /**
+   * Hand an element to a clip.
+   *
+   * `playbackRate` and `preservesPitch` belong to the *element*, and `mediaElements.buildKeys`
+   * gives two clips of the same asset a shared element unless they overlap in time — so a 2×
+   * clip and the 1× clip after it are the same `<video>`. The rate is therefore set every time
+   * an element is claimed for a clip, never once when it is created, or the second clip would
+   * inherit the first one's speed.
+   */
+  private claim<T extends HTMLMediaElement>(el: T | null, clip: Clip): T | null {
+    if (!el) return null;
+    const speed = clipSpeedOf(clip);
+    if (el.playbackRate !== speed) el.playbackRate = speed;
+    // Held pitch is the default, and the browser's own time-stretcher is what holds it.
+    const preserve = !('pitchFollowsSpeed' in clip && clip.pitchFollowsSpeed);
+    if (el.preservesPitch !== preserve) el.preservesPitch = preserve;
+    return el;
+  }
+
   /** Lightweight sync while playing — no await, avoids RAF pile-up. */
   private nudgeElement(el: HTMLMediaElement, time: number): void {
     const clamped = Math.max(0, time);
@@ -267,13 +320,25 @@ export class PlaybackEngine {
         continue;
       }
 
+      if (clip.kind === 'annotation') {
+        gl.withEffects(
+          effects,
+          fade,
+          (alpha, flip) =>
+            gl.drawAnnotationClip(clip, annotationShapesAt(clip, t), transformAt(clip, t), alpha, flip),
+          transition.wipe,
+          clock,
+        );
+        continue;
+      }
+
       const asset = state.mediaLibrary[clip.assetId];
       if (!asset) continue;
 
       if (clip.kind === 'video') {
         if (clip.hideVideo) continue;
         const key = this.elementKey(clip, state);
-        const video = this.getVideo(asset, key);
+        const video = this.claim(this.getVideo(asset, key), clip);
         if (!video) {
           this.drawOfflineGL(gl, clip, asset, t, effects, fade, transition, clock, key);
           continue;
@@ -346,7 +411,7 @@ export class PlaybackEngine {
         if (clip.hideVideo) continue;
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
-        const video = this.getVideo(asset, this.elementKey(clip, state));
+        const video = this.claim(this.getVideo(asset, this.elementKey(clip, state)), clip);
         if (!video) {
           const card = offlineCard(asset.name, asset.width ?? width, asset.height ?? height);
           this.drawVisual(ctx, card, card.width, card.height, clip, t, width, height);
@@ -371,9 +436,51 @@ export class PlaybackEngine {
         continue;
       }
 
-      drawTextClip(ctx, clip.template, clip.text, width, height, textFrameForClip(clip.textFrame));
+      // Canvas2D fallback: the same two renderers, minus the effect chain — which this path
+      // has never had, and says so once.
+      if (clip.kind === 'annotation') this.drawAnnotation2D(ctx, clip, t, width, height);
+      else drawTextClip(ctx, clip, width, height, textFrameForClip(clip.textFrame));
     }
     ctx.globalAlpha = 1;
+  }
+
+  /**
+   * The 2D fallback's annotation. Without a transform the marks go straight onto the frame;
+   * with one they are rasterized at composition size first and then placed through
+   * `drawOverlaySource`, which is the same function the video and image branches above use.
+   * The extra canvas is why this is not the default path: it costs a full-frame raster per
+   * frame, and only a placed annotation needs it.
+   */
+  private drawAnnotation2D(
+    ctx: CanvasRenderingContext2D,
+    clip: AnnotationClip,
+    t: number,
+    width: number,
+    height: number,
+  ): void {
+    const shapes = annotationShapesAt(clip, t);
+    const transform = transformAt(clip, t);
+    if (!transform) {
+      drawAnnotationClip(ctx, { shapes }, width, height);
+      return;
+    }
+
+    const canvas = this.overlayCanvas ?? (this.overlayCanvas = document.createElement('canvas'));
+    canvas.width = width;
+    canvas.height = height;
+    const raster = canvas.getContext('2d');
+    if (!raster) return;
+    raster.clearRect(0, 0, width, height);
+    drawAnnotationClip(raster, { shapes }, width, height);
+    drawOverlaySource(
+      ctx,
+      canvas,
+      width,
+      height,
+      normalizeOverlayTransform(transform),
+      width,
+      height,
+    );
   }
 
   /** No transform = fit the whole frame; a transform means crop + placement (PiP). */
@@ -403,7 +510,7 @@ export class PlaybackEngine {
       if (clip.kind === 'video' && !clip.hideVideo) {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
-        const video = this.getVideo(asset, this.elementKey(clip, state));
+        const video = this.claim(this.getVideo(asset, this.elementKey(clip, state)), clip);
         if (!video) continue;
         out.push({ video, at: this.sourceTime(clip, t, state) });
       }
@@ -452,7 +559,7 @@ export class PlaybackEngine {
       if (clip.kind === 'video' && !clip.hideVideo) {
         const asset = state.mediaLibrary[clip.assetId];
         if (!asset) continue;
-        const video = this.getVideo(asset, this.elementKey(clip, state));
+        const video = this.claim(this.getVideo(asset, this.elementKey(clip, state)), clip);
         if (!video) continue;
         const st = this.sourceTime(clip, t, state);
         this.nudgeElement(video, st);
@@ -468,7 +575,10 @@ export class PlaybackEngine {
       const asset = state.mediaLibrary[clip.assetId];
       if (!asset) return null;
       const key = this.elementKey(clip, state);
-      const el = clip.kind === 'video' ? this.getVideo(asset, key) : this.getAudio(asset, key);
+      const el = this.claim(
+        clip.kind === 'video' ? this.getVideo(asset, key) : this.getAudio(asset, key),
+        clip,
+      );
       // Offline: there is no element, so there is no route and nothing to hear. The picture
       // still draws its placeholder; silence is the honest counterpart of that.
       return el ? { el, key } : null;
@@ -516,7 +626,21 @@ export class PlaybackEngine {
         void this.seekElement(el, st);
       }
 
+      const effects = 'audioEffects' in clip ? clip.audioEffects : undefined;
+      // Structure, not settings. Adding, removing, reordering or bypassing a filter needs new
+      // nodes; moving a cutoff needs a new number. Rebuilding for the second case is heard as
+      // a gap in the sound rather than as a filter sweeping, which is what dragging a slider
+      // during playback used to do on every step.
+      const chainKey = `${chainStructureKey(effects)}|${pitchSemitones(effects)}`;
+
       let route = this.clipRoutes.get(clip.id);
+      if (route && route.chainKey !== chainKey) {
+        route.gain.disconnect();
+        this.clipRoutes.delete(clip.id);
+        route = undefined;
+      } else if (route) {
+        route.tune?.(effects);
+      }
       if (route && route.element !== el) {
         // The clip's element key changed under us — dragging a clip into or out of an
         // overlap with another clip of the same asset does exactly that. The old route
@@ -530,7 +654,45 @@ export class PlaybackEngine {
       if (!route) {
         const source = this.getOrCreateMediaSource(routed.key, el);
         const gain = ctx.createGain();
-        source.connect(gain);
+
+        let head: AudioNode = gain;
+        let tune: ClipAudioRoute['tune'];
+        if (!chainIsIdentity(effects)) {
+          const chain = buildAudioChain(ctx, effects);
+          chain.output.connect(gain);
+          head = chain.input;
+          tune = chain.tune;
+
+          /*
+           * Pitch comes *first*, before the filters — so a cutoff is set against the sound you
+           * are hearing rather than against the sound before it was shifted. It also has to
+           * come first for the two engines to agree: the export shifts the samples themselves
+           * (`utils/timeStretch.ts`, exact and with no latency), and samples can only be
+           * shifted before they enter a graph.
+           */
+          const shift = pitchSemitones(effects);
+          if (shift !== 0) {
+            // The module may not be loaded yet. Rather than wait — this runs inside a frame —
+            // the node is spliced in on a later frame, once `ensurePitchWorklet` has resolved
+            // and the fingerprint check above rebuilds the route.
+            const pitch = this.pitchReady ? createPitchNode(ctx, shift) : null;
+            if (pitch) {
+              pitch.connect(head);
+              head = pitch;
+            } else {
+              void ensurePitchWorklet(ctx).then((ok) => {
+                if (ok && !this.pitchReady) {
+                  this.pitchReady = true;
+                  // Force a rebuild on the next frame by dropping the route's fingerprint.
+                  const current = this.clipRoutes.get(clip.id);
+                  if (current) current.chainKey = '';
+                }
+              });
+            }
+          }
+        }
+
+        source.connect(head);
         gain.connect(this.ensureMaster());
         route = {
           clipId: clip.id,
@@ -538,6 +700,9 @@ export class PlaybackEngine {
           element: el,
           gain,
           connectedToDest: true,
+          chainInput: head,
+          chainKey,
+          tune,
         };
         this.clipRoutes.set(clip.id, route);
       } else if (!route.connectedToDest) {
@@ -548,7 +713,12 @@ export class PlaybackEngine {
       // syncAudio runs every frame while playing, so sampling the envelope here gives a
       // smooth fade without scheduling ramps that would fight with scrubbing.
       route.gain.gain.value =
-        clipGain * fadeGainAt(clip, t) * transitionStateAt(clip, state.clips, t).gain;
+        clipGain *
+        fadeGainAt(clip, t) *
+        transitionStateAt(clip, state.clips, t).gain *
+        // Sampled per frame like the fade above, and for the same reason: scrubbing must hear
+        // the envelope at the playhead, not a ramp scheduled from where playback started.
+        envelopeGainAt('gainKeyframes' in clip ? clip.gainKeyframes : undefined, t - clip.timelineStart);
 
       if (this.playing && el.paused) {
         void el.play().catch(() => undefined);
@@ -571,7 +741,19 @@ export class PlaybackEngine {
     this.pool.settle(listening, drawing);
   }
 
-  private tick = (state: StoreSlice, duration: number): void => {
+  /**
+   * Each frame reads the document again.
+   *
+   * The loop used to recurse with the `StoreSlice` it was handed when playback started, so
+   * every edit made *while playing* was invisible until you stopped and started again — a
+   * volume envelope drawn under a voice did nothing until the next play, and so did a gain
+   * change, a new clip, or a trim. The transport should not be the thing that decides whether
+   * you can hear what you just did.
+   */
+  private tick = (): void => {
+    const state = this.source?.();
+    if (!state) return;
+    const duration = this.duration?.() ?? 0;
     const t = this.anchorTime + (performance.now() - this.anchor) / 1000;
     if (t >= duration) {
       this.pause();
@@ -582,16 +764,23 @@ export class PlaybackEngine {
     }
     this.onTime?.(t);
     this.renderPlayFrame(state, t);
-    this.raf = requestAnimationFrame(() => this.tick(state, duration));
+    this.raf = requestAnimationFrame(this.tick);
   };
 
-  play(state: StoreSlice, startTime: number, duration: number): void {
+  /**
+   * `getState` and `getDuration` are read every frame rather than captured, so the project can
+   * be edited while it plays. Both are cheap — the caller reads a ref it already keeps.
+   */
+  play(getState: () => StoreSlice, startTime: number, getDuration: () => number): void {
     this.pause();
     this.playing = true;
+    this.source = getState;
+    this.duration = getDuration;
     this.anchor = performance.now();
     this.anchorTime = startTime;
     void this.ensureAudioCtx().resume();
     void (async () => {
+      const state = getState();
       await Promise.all(this.primeVideoElements(state, startTime));
       this.syncAudio(state, startTime, false);
       for (const clip of this.sortedClips(state)) {
@@ -599,12 +788,12 @@ export class PlaybackEngine {
         if (clip.kind === 'video' && !clip.hideVideo) {
           const asset = state.mediaLibrary[clip.assetId];
           if (!asset) continue;
-          const video = this.getVideo(asset, this.elementKey(clip, state));
+          const video = this.claim(this.getVideo(asset, this.elementKey(clip, state)), clip);
           void video?.play().catch(() => undefined);
         }
       }
       this.renderPlayFrame(state, startTime);
-      this.raf = requestAnimationFrame(() => this.tick(state, duration));
+      this.raf = requestAnimationFrame(this.tick);
     })();
   }
 
@@ -642,6 +831,13 @@ export class PlaybackEngine {
       }
       this.clipRoutes.delete(clipId);
     }
+    // Overlay clips hold a composition-sized texture each and no audio route, so this is the
+    // only place that would ever notice one had gone.
+    this.compositor.retainOverlays(
+      new Set(
+        state.clips.filter((c) => c.kind === 'text' || c.kind === 'annotation').map((c) => c.id),
+      ),
+    );
     const drawing = new Set<HTMLMediaElement>(this.activeVideos(state, t).map((v) => v.video));
     this.pool.settle(new Set(), drawing);
   }

@@ -162,7 +162,8 @@ export default function App() {
       case 'Delete':
       case 'Backspace':
         e.preventDefault();
-        store.removeSelected(e.shiftKey);
+        // ⇧ still forces a ripple; without it the mode decides.
+        store.removeSelected(e.shiftKey || store.rippleEnabled);
         break;
       case 'ArrowLeft':
       case 'ArrowRight': {
@@ -213,9 +214,9 @@ export default function App() {
 
   return (
     <div className="app">
-      <Toolbar onAddText={() => setTextModalOpen(true)} />
+      <Toolbar />
       <div className="main-row">
-        <MediaLibrary width={libraryWidth} />
+        <MediaLibrary width={libraryWidth} onAddText={() => setTextModalOpen(true)} />
         <PanelSplitter
           axis="x"
           size={libraryWidth}
@@ -253,7 +254,15 @@ export default function App() {
       {textModalOpen && (
         <TextAddModal
           onClose={() => setTextModalOpen(false)}
-          onSubmit={(text, template) => addTextClip(text, template)}
+          onSubmit={(text, template, keepInLibrary) => {
+            if (keepInLibrary) {
+              const editor = useEditorStore.getState();
+              const id = editor.addTextObject(text, template);
+              editor.addTextObjectToTimeline(id);
+            } else {
+              addTextClip(text, template);
+            }
+          }}
         />
       )}
     </div>

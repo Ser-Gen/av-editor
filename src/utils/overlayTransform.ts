@@ -136,6 +136,45 @@ export function normalizeOverlayTransform(transform?: OverlayTransform): Overlay
   };
 }
 
+/**
+ * Where a point of the *source* lands on the composition, both normalized.
+ *
+ * The placement rule stated for a single point rather than a whole picture: the crop
+ * rectangle maps onto the frame rectangle, so this is the affine every renderer applies to
+ * the pixels, evaluated at one coordinate. It is what lets an editing overlay draw handles
+ * on top of a placed layer without a second opinion about where that layer went.
+ *
+ * Rotation is deliberately not applied. It is about the frame's centre in *pixel* space, and
+ * this function knows nothing of the aspect it would need; callers that can be rotated say so
+ * and refuse rather than guess. `rotationOf` is how to ask.
+ */
+export function projectNormalizedPoint(
+  point: { x: number; y: number },
+  transform?: OverlayTransform,
+): { x: number; y: number } {
+  if (!transform) return point;
+  const crop = clampRect(transform.crop);
+  const frame = clampFrame(transform.frame);
+  return {
+    x: frame.x + ((point.x - crop.x) / (crop.w || 1)) * frame.w,
+    y: frame.y + ((point.y - crop.y) / (crop.h || 1)) * frame.h,
+  };
+}
+
+/** The inverse: a point on the composition, back to the source coordinate that drew it. */
+export function unprojectNormalizedPoint(
+  point: { x: number; y: number },
+  transform?: OverlayTransform,
+): { x: number; y: number } {
+  if (!transform) return point;
+  const crop = clampRect(transform.crop);
+  const frame = clampFrame(transform.frame);
+  return {
+    x: crop.x + ((point.x - frame.x) / (frame.w || 1)) * crop.w,
+    y: crop.y + ((point.y - frame.y) / (frame.h || 1)) * crop.h,
+  };
+}
+
 export function drawOverlaySource(
   ctx: CanvasRenderingContext2D,
   source: CanvasImageSource,

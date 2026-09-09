@@ -107,6 +107,23 @@ button:disabled {
   cursor: not-allowed;
 }
 
+/*
+ * A button that is switched on. This was written three times against three different
+ * ancestors — `.timeline-toolbar`, `.track-header-controls`, `.panel-tab` — so every toggle
+ * outside those (the annotation tools, the speed presets, italic, shadow, box) had a class
+ * that styled nothing and no visible state at all. It belongs on the element, not on where
+ * the element happens to sit.
+ */
+button.is-active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 28%, var(--surface2));
+  color: #fff;
+}
+
+button.is-active:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 40%, var(--surface2));
+}
+
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
@@ -260,6 +277,12 @@ body.is-dragging * {
      `.media-library-list` does for the media tab, rather than the column scrolling around
      it. */
   min-height: 0;
+  /* Take the column's remaining height rather than the content's, so the panel is a fixed
+     box that scrolls inside. Relying on flex-shrink alone worked until the camera preview
+     appeared: a replaced element with an aspect ratio contributes a height that does not
+     shrink with the box, and the panel grew past the bottom of the column instead of
+     scrolling — taking the Record button with it. */
+  flex: 1 1 auto;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
@@ -337,6 +360,10 @@ body.is-dragging * {
   transform: scaleX(-1);
   aspect-ratio: 16 / 9;
   object-fit: cover;
+  /* A monitor, not the point of the panel. On a short window an unbounded 16:9 preview is
+     most of the scrollable height, and everything that actually starts a recording is below
+     it. */
+  max-height: 26vh;
 }
 
 .record-formats {
@@ -367,6 +394,15 @@ body.is-dragging * {
   display: flex;
   align-items: center;
   gap: 8px;
+  /* Whatever is scrolled to, the button that starts and stops a take is reachable. It is the
+     one control in this panel that is needed *now*, and hunting for it is how a take gets
+     missed. */
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  margin-top: auto;
+  padding: 6px 0 2px;
+  background: linear-gradient(to top, var(--surface) 70%, transparent);
 }
 
 .record-readout {
@@ -1466,15 +1502,55 @@ body.is-resizing-col * {
   gap: 4px;
 }
 
+/*
+  The groups are told apart by a rule between them rather than by spacing alone: at this
+  density, gap alone reads as one row with uneven kerning.
+*/
+.timeline-toolbar .toolbar-group + .toolbar-group,
+.toolbar .toolbar-group + .toolbar-group {
+  border-left: 1px solid var(--border);
+  padding-left: 10px;
+  margin-left: 2px;
+}
+
+.toolbar-group-label {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  opacity: 0.6;
+  margin-right: 2px;
+  user-select: none;
+}
+
+.ripple-scope {
+  font-size: 11px;
+  padding: 3px 4px;
+}
+
+.ripple-scope:disabled {
+  opacity: 0.45;
+}
+
+/* Engine choice and the preload button, moved in from the top bar. */
+.settings-engine {
+  margin: 12px 0 4px;
+}
+
+.settings-engine-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.settings-engine-row select {
+  flex: 1;
+  min-width: 0;
+}
+
 .timeline-toolbar button {
   padding: 4px 10px;
   font-size: 12px;
-}
-
-.timeline-toolbar button.is-active {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 26%, var(--surface2));
-  color: #fff;
 }
 
 .zoom-readout {
@@ -1635,12 +1711,6 @@ body.is-resizing-col * {
   font-size: 10px;
   line-height: 1.5;
   border-radius: 3px;
-}
-
-.track-header-controls button.is-active {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 30%, var(--surface2));
-  color: #fff;
 }
 
 .track-header.is-compact .track-header-controls {
@@ -2019,6 +2089,25 @@ body.is-resizing-col * {
   margin-left: -3px;
   width: 6px;
   background: #9fd0ff;
+}
+
+/*
+  A pose is not a value on a curve — it is a whole set of points — so it is drawn as a round
+  marker rather than a diamond, and its row lights up when its mark is the selected one.
+*/
+.kf-key--pose {
+  transform: none;
+  border-radius: 50%;
+  margin-left: -3.5px;
+  background: #9be7a1;
+}
+
+.kf-row.is-selected {
+  background: rgba(24, 46, 30, 0.85);
+}
+
+.kf-row.is-selected .kf-row-label {
+  color: rgba(190, 245, 200, 0.9);
 }
 
 .clip-fx-badge {
@@ -2710,4 +2799,598 @@ body.is-resizing-col * {
 
 .record-headroom.is-blocked {
   color: #ffcdd2;
+}
+
+/* ------------------------------------------------- library: view controls */
+
+.library-view {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+  padding: 4px 8px 6px;
+  flex-shrink: 0;
+}
+
+.library-search {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+.library-view select {
+  font-size: 11px;
+  padding: 3px 2px;
+  max-width: 84px;
+}
+
+.library-sort-dir {
+  padding: 3px 7px;
+  font-size: 12px;
+}
+
+.library-sort-dir:disabled {
+  opacity: 0.4;
+}
+
+.library-section > ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/*
+  Sticky, because a grouped library is scrolled through: losing the heading is losing the
+  only thing that says what you are looking at.
+*/
+.library-section-head {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin: 0;
+  padding: 5px 10px 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+
+.library-section-head span {
+  font-weight: 400;
+  opacity: 0.7;
+}
+
+/* The thumbnail is a control now, so it must not look like a button. */
+.media-library-thumb-button {
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  display: flex;
+  flex-shrink: 0;
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.media-library-thumb-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.media-library-thumb--audio {
+  width: 44px;
+  height: 30px;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface2);
+  color: var(--text-muted);
+  font-size: 15px;
+}
+
+.video-poster.is-scrubbable {
+  cursor: ew-resize;
+}
+
+/* ------------------------------------------------------- library: preview */
+
+.modal-preview {
+  min-width: min(560px, 90vw);
+}
+
+.preview-media {
+  display: block;
+  width: 100%;
+  max-height: min(60vh, 480px);
+  object-fit: contain;
+  background: #000;
+  border-radius: 4px;
+}
+
+.preview-media--audio {
+  background: none;
+  height: 44px;
+}
+
+/* --------------------------------------------------- the take in progress */
+
+.recording-control {
+  margin: 8px 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface2);
+  overflow: hidden;
+}
+
+.recording-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 9px;
+  border-bottom: 1px solid var(--border);
+}
+
+.recording-head .spacer {
+  flex: 1;
+}
+
+.recording-elapsed {
+  font-variant-numeric: tabular-nums;
+  font-size: 14px;
+}
+
+.recording-bytes {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.recording-sources {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.recording-source {
+  display: grid;
+  grid-template-columns: 58px 1fr 52px 46px auto;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 9px;
+  font-size: 11px;
+  border-top: 1px solid var(--border);
+}
+
+.recording-source:first-child {
+  border-top: none;
+}
+
+.recording-source.is-ended {
+  opacity: 0.5;
+}
+
+.recording-source.is-muted .recording-source-name {
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.recording-source-name {
+  font-weight: 600;
+}
+
+.recording-source-format,
+.recording-source-rate {
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recording-source-rate.is-starved {
+  color: var(--warning, #e0a33e);
+}
+
+.recording-source-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.recording-source-actions button {
+  padding: 2px 7px;
+  font-size: 11px;
+}
+
+/* The note wraps onto its own line under the row it belongs to. */
+.recording-source-note {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.recording-source-note.is-error {
+  color: var(--danger, #e06c5c);
+}
+
+/* ------------------------------------------------------- volume envelope */
+
+.gain-envelope {
+  position: absolute;
+  inset: 0;
+  /* The line and its points take the pointer; the strip underneath still drags the clip. */
+  pointer-events: none;
+}
+
+.gain-envelope .gain-hit,
+.gain-envelope .gain-point {
+  pointer-events: all;
+}
+
+.gain-hit {
+  fill: transparent;
+  cursor: crosshair;
+}
+
+.gain-unity {
+  stroke: rgba(255, 255, 255, 0.18);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.gain-line {
+  fill: none;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  stroke-linejoin: round;
+  filter: drop-shadow(0 0 2px rgba(0, 0, 0, 0.6));
+}
+
+.gain-point {
+  fill: #fff;
+  stroke: var(--accent);
+  stroke-width: 1.5;
+  cursor: grab;
+}
+
+.gain-point:hover {
+  r: 5;
+}
+
+/* ------------------------------------------------------------ audio effects */
+
+.audio-effect-list {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+}
+
+.audio-effect {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 7px;
+  margin-bottom: 6px;
+  background: var(--surface2);
+}
+
+.audio-effect.is-off {
+  opacity: 0.55;
+}
+
+.audio-effect-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.audio-effect-head .spacer {
+  flex: 1;
+}
+
+.audio-effect-head button {
+  padding: 1px 7px;
+}
+
+.audio-param-label {
+  min-width: 56px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.audio-param-value {
+  min-width: 52px;
+  text-align: right;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+/* Reordering the library by hand — only offered under "My order", where it means something. */
+.media-library-item[draggable='true'] {
+  cursor: grab;
+}
+
+.media-library-item.is-dragging {
+  opacity: 0.45;
+}
+
+.media-library-item.is-drop-target {
+  box-shadow: inset 0 2px 0 var(--accent);
+}
+
+.media-library-lede {
+  margin: 0 0 6px;
+}
+
+/* A retimed clip is otherwise indistinguishable from one playing at its own rate. */
+.clip-speed-badge {
+  margin-right: 4px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 9px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--accent) 30%, transparent);
+  color: var(--text);
+}
+
+.speed-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.speed-presets button {
+  flex: 1;
+  min-width: 40px;
+  padding: 3px 6px;
+  font-size: 11px;
+}
+
+/* ---------------------------------------------------------- annotations */
+
+.annotation-overlay {
+  position: absolute;
+  z-index: 3;
+  cursor: crosshair;
+  touch-action: none;
+}
+
+/*
+  A thin ghost of what is drawn, only for picking. The real rendering is the compositor's, so
+  the two must never be mistaken for each other — hence the dash.
+*/
+.annotation-outline {
+  stroke-dasharray: 4 3;
+  opacity: 0.7;
+  pointer-events: stroke;
+  /* A fat invisible stroke under the visible one, so a hairline is still clickable. */
+  stroke-linecap: round;
+}
+
+.annotation-outline:hover {
+  opacity: 1;
+  stroke-dasharray: none;
+  stroke-width: 3;
+}
+
+/* Selection is what the outline is *for*, so it stops being a ghost and becomes a solid. */
+.annotation-outline.is-selected {
+  stroke-dasharray: none;
+  opacity: 1;
+}
+
+/*
+  The Select tool picks rather than draws, and the cursor is the only place that difference is
+  visible before the first drag.
+*/
+.annotation-overlay.is-picking {
+  cursor: default;
+}
+
+.annotation-overlay.is-picking .annotation-outline {
+  cursor: move;
+}
+
+.annotation-handle {
+  fill: var(--surface);
+  stroke: var(--accent);
+  stroke-width: 2;
+  vector-effect: non-scaling-stroke;
+  cursor: grab;
+}
+
+/* Sits over the callout's own label, at the tail of its arrow. */
+.annotation-callout-input {
+  position: absolute;
+  z-index: 5;
+  width: 150px;
+  transform: translate(-50%, -50%);
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+/*
+  The surface follows the selection and the renderer follows the playhead. When they disagree
+  this is the only thing on screen that can say so.
+*/
+.annotation-offscreen {
+  position: absolute;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 8px;
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  border: 1px solid var(--border);
+}
+
+.annotation-rotated-note {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  top: 8px;
+  transform: translateX(-50%);
+  max-width: 320px;
+  margin: 0;
+  padding: 5px 9px;
+  border-radius: 6px;
+  font-size: 10px;
+  text-align: center;
+  color: var(--text-muted);
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  border: 1px solid var(--border);
+}
+
+.annotation-tools {
+  position: absolute;
+  left: 50%;
+  bottom: 10px;
+  transform: translateX(-50%);
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border: 1px solid var(--border);
+  backdrop-filter: blur(6px);
+}
+
+.annotation-tools button {
+  padding: 3px 9px;
+  font-size: 11px;
+}
+
+.annotation-tools input[type='color'] {
+  width: 26px;
+  height: 22px;
+  padding: 0;
+}
+
+.annotation-tools input[type='range'] {
+  width: 70px;
+}
+
+.annotation-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+.annotation-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.annotation-list li {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  padding: 3px 4px;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.annotation-list li:hover {
+  background: var(--surface2);
+}
+
+.annotation-list li.is-selected {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.annotation-shape-editor {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.annotation-shape-editor .field-label {
+  display: block;
+  font-size: 10px;
+  color: var(--text-muted);
+  margin: 4px 0 2px;
+}
+
+.annotation-shape-editor input[type='text'] {
+  width: 100%;
+}
+
+/* Where a moving mark's poses are — the thing you need in order to add another one. */
+.shape-poses {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 6px;
+}
+
+.shape-pose {
+  display: inline-flex;
+}
+
+.shape-poses button {
+  padding: 2px 6px;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Joined to the time it belongs to, so it reads as "this pose, gone" and not as a stray ×. */
+.shape-pose button:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.shape-pose-remove {
+  margin-left: -1px;
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  color: var(--text-muted);
+}
+
+.shape-pose-remove:hover:not(:disabled) {
+  color: #ff9a9a;
+  border-color: #ff9a9a;
+}
+
+.annotation-list .spacer {
+  flex: 1;
+}
+
+.annotation-swatch {
+  width: 11px;
+  height: 11px;
+  border-radius: 2px;
+  border: 1px solid var(--border);
+}
+
+/* A text object has no thumbnail to show, so it gets a letter. */
+.media-library-thumb--text {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 44px;
+  height: 30px;
+  background: var(--surface2);
+  color: var(--text-muted);
+  font-weight: 700;
+  border-radius: 3px;
+}
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 10px 0 4px;
+  font-size: 12px;
 }

@@ -74,7 +74,11 @@ function readAsset(raw: unknown): StoredAsset | null {
     hasAudio: typeof raw.hasAudio === 'boolean' ? raw.hasAudio : undefined,
     derivedFrom: isObject(raw.derivedFrom) ? (raw.derivedFrom as unknown as StoredAsset['derivedFrom']) : undefined,
     // An asset written before this field existed can only have been one the user picked.
-    origin: origin === 'derived' || origin === 'recorded' ? origin : 'imported',
+    origin:
+      origin === 'derived' || origin === 'recorded' || origin === 'pasted'
+        ? origin
+        : 'imported',
+    addedAt: typeof raw.addedAt === 'number' ? raw.addedAt : undefined,
     fingerprint: isObject(raw.fingerprint)
       ? {
           name: String(raw.fingerprint.name ?? ''),
@@ -153,6 +157,11 @@ export function fromProjectFile(raw: unknown): LoadedProject | null {
       tracks: doc.tracks as EditorDoc['tracks'],
       clips,
       libraryOrder: order,
+      // Absent in every project saved before text objects existed, which is the normal
+      // case and not a repair worth reporting.
+      textLibrary: Array.isArray(doc.textLibrary)
+        ? (doc.textLibrary as EditorDoc['textLibrary'])
+        : [],
     },
     assets,
     savedAt: num(raw.savedAt, 0),

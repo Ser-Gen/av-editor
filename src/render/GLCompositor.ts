@@ -1,4 +1,6 @@
 import type {
+  AnnotationClip,
+  AnnotationShape,
   EffectInstance,
   EffectType,
   NormalizedRect,
@@ -13,6 +15,7 @@ import {
   textFrameForClip,
 } from '../utils/overlayTransform';
 import { drawTextClip as paintTextClip } from '../preview/textRenderer';
+import { drawAnnotationClip } from './annotationRaster';
 import type { ResolvedRegion } from './effects/registry';
 import {
   EFFECTS,
@@ -982,6 +985,25 @@ export class GLCompositor {
     const entry = this.uploadTexture(key, source, sourceWidth, sourceHeight);
     if (!entry) return;
 
+    this.placeTexture(entry.texture, sourceWidth, sourceHeight, transform, alpha, flip);
+  }
+
+  /**
+   * Put an already-uploaded texture on the frame: letterboxed when there is no transform,
+   * cropped and placed when there is.
+   *
+   * Video, images and annotations all come through here, which is the point — CLAUDE.md's
+   * rule is that a placement rule implemented twice stops being true, and an annotation that
+   * placed itself would be a second answer to where a frame goes.
+   */
+  private placeTexture(
+    texture: WebGLTexture,
+    sourceWidth: number,
+    sourceHeight: number,
+    transform: OverlayTransform | undefined,
+    alpha: number,
+    flip: SourceFlip | undefined,
+  ): void {
     let dest: NormalizedRect;
     let src: NormalizedRect;
     let rotate = 0;
@@ -1008,7 +1030,7 @@ export class GLCompositor {
       };
     }
 
-    this.drawPlaced(entry.texture, dest, mirrorRect(src, flip), alpha, rotate);
+    this.drawPlaced(texture, dest, mirrorRect(src, flip), alpha, rotate);
   }
 
   /**
@@ -1026,9 +1048,56 @@ export class GLCompositor {
   }
 
   /**
+   * Annotations take the same route as text: rasterized into a texture, cached against their
+   * own content, then placed through the ordinary source path so they inherit crop, frame,
+   * rotation, fade and the effect chain without a line of new placement code.
+   *
+   * The raster is always composition-sized, whatever the transform does with it afterwards.
+   * `strokePx` in the rasterizer is a fraction of the raster's smaller edge, so a shrunk
+   * frame shrinks the strokes with it and the marks scale as one picture — which is what
+   * makes an annotation behave like a placed picture rather than a set of loose lines.
+   */
+  drawAnnotationClip(
+    clip: AnnotationClip,
+    shapes: AnnotationShape[],
+    transform: OverlayTransform | undefined,
+    alpha = 1,
+    flip?: SourceFlip,
+  ): void {
+    const gl = this.gl;
+    if (!gl || this.contextLost) return;
+
+    const fw = Math.max(2, this.width);
+    const fh = Math.max(2, this.height);
+    // The *resolved* marks, so an animated one re-rasterizes as it moves and a static one
+    // hashes to the same key every frame and is uploaded once.
+    const contentKey = `${JSON.stringify(shapes)}|${fw}x${fh}`;
+
+    const entry = this.textures.get(`anno:${clip.id}`);
+    if (!entry || entry.contentKey !== contentKey) {
+      const canvas = this.textCanvas ?? (this.textCanvas = document.createElement('canvas'));
+      canvas.width = fw;
+      canvas.height = fh;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.clearRect(0, 0, fw, fh);
+      drawAnnotationClip(ctx, { shapes }, fw, fh);
+      const uploaded = this.uploadTexture(`anno:${clip.id}`, canvas, fw, fh);
+      if (!uploaded) return;
+      uploaded.contentKey = contentKey;
+    }
+
+    const tex = this.textures.get(`anno:${clip.id}`);
+    if (!tex) return;
+
+    this.placeTexture(tex.texture, fw, fh, transform, alpha, flip);
+  }
+
+  /**
    * Text keeps its Canvas2D layout — reimplementing text metrics in GLSL would buy
    * nothing. The rendered box is cached per clip and only redrawn when it changes.
    */
+
   drawTextClip(clip: TextClip, alpha = 1, flip?: SourceFlip): void {
     const gl = this.gl;
     if (!gl || this.contextLost) return;
@@ -1036,7 +1105,7 @@ export class GLCompositor {
     const frame = clampRect(textFrameForClip(clip.textFrame));
     const fw = Math.max(2, Math.round(frame.w * this.width));
     const fh = Math.max(2, Math.round(frame.h * this.height));
-    const contentKey = `${clip.text}|${clip.template}|${fw}x${fh}`;
+    const contentKey = `${clip.text}|${clip.template}|${JSON.stringify(clip.style ?? null)}|${fw}x${fh}`;
 
     const entry = this.textures.get(`text:${clip.id}`);
     if (!entry || entry.contentKey !== contentKey) {
@@ -1048,8 +1117,8 @@ export class GLCompositor {
       ctx.clearRect(0, 0, fw, fh);
       // Draw into a frame-sized canvas at the origin: identical pixels to drawing the
       // same box inside the full canvas, because the style is derived from the box size.
-      paintTextClip(ctx, clip.template, clip.text, fw, fh);
-      const uploaded = this.uploadTexture(`text:${clip.id}`, canvas, fw, fh, true);
+      paintTextClip(ctx, clip, fw, fh);
+      const uploaded = this.uploadTexture(`text:${clip.id}`, canvas, fw, fh);
       if (!uploaded) return;
       uploaded.contentKey = contentKey;
     }
@@ -1132,12 +1201,22 @@ export class GLCompositor {
     gl.bindVertexArray(null);
   }
 
+  /**
+   * Upload `source` into the texture named `key`, always.
+   *
+   * There used to be a `skipIfCached` flag here that returned an existing entry without
+   * uploading. Both callers that passed it — text and annotation — had *already* decided the
+   * content changed, because they only call this when their own `contentKey` misses, so the
+   * flag meant the first upload won forever: a text clip's words and an annotation's marks
+   * were frozen at whatever they were the first time the clip was drawn, until a reload
+   * built a new compositor. The cache is the caller's `contentKey`; reaching this function
+   * means the pixels are wanted.
+   */
   private uploadTexture(
     key: string,
     source: TexImageSource,
     width: number,
     height: number,
-    skipIfCached = false,
   ): TexEntry | null {
     const gl = this.gl;
     if (!gl) return null;
@@ -1150,7 +1229,6 @@ export class GLCompositor {
       entry = { texture, width: 0, height: 0 };
       this.textures.set(key, entry);
     } else {
-      if (skipIfCached) return entry;
       gl.bindTexture(gl.TEXTURE_2D, entry.texture);
     }
 
@@ -1168,6 +1246,24 @@ export class GLCompositor {
       return null;
     }
     return entry;
+  }
+
+  /**
+   * Forget the overlay textures whose clip is no longer in the project.
+   *
+   * Stated as "keep these" rather than "drop that one" because the caller knows the whole
+   * document and a deleted clip does not announce itself. They are composition-sized RGBA —
+   * about 8 MB at 1080p — so a session spent adding and removing titles used to leave the
+   * cache holding textures nothing could ever draw again.
+   */
+  retainOverlays(clipIds: Set<string>): void {
+    for (const key of [...this.textures.keys()]) {
+      const cut = key.indexOf(':');
+      const kind = key.slice(0, cut);
+      if (kind !== 'text' && kind !== 'anno') continue;
+      if (clipIds.has(key.slice(cut + 1))) continue;
+      this.releaseTexture(key);
+    }
   }
 
   /** Drop a cached texture — call when an asset or text clip goes away. */

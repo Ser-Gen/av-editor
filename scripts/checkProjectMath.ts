@@ -8,7 +8,32 @@
  *
  *   npm run check:math
  */
-import { refitRect, reframeClips, contentRect, countAnchored } from '../src/utils/reframe';
+import {
+  fittedContentBox,
+  refitAnnotationShapes,
+  refitRect,
+  reframeClips,
+  contentRect,
+  countAnchored,
+} from '../src/utils/reframe';
+import { compositeOrderedClips, isVisualClip } from '../src/utils/compositeOrder';
+import {
+  HIT_TOLERANCE,
+  SHAPE_LABELS,
+  annotationBounds,
+  hitShape,
+  labelRect,
+  placementForShapes,
+  moveShape,
+  pickShape,
+  setShapePoint,
+  shapeHandles,
+} from '../src/utils/annotationEdit';
+import {
+  projectNormalizedPoint,
+  unprojectNormalizedPoint,
+} from '../src/utils/overlayTransform';
+import type { AnnotationClip, AnnotationShape } from '../src/types/editor';
 import {
   MIN_ON_SCREEN,
   clampFrame,
@@ -44,7 +69,34 @@ import {
   clampTimelineHeight,
   resolveTab,
 } from '../src/utils/panelLayout';
-import { TRANSFORM_CHANNELS, transformAt } from '../src/utils/clipRender';
+import {
+  TRANSFORM_CHANNELS,
+  acceptsTransform,
+  sourceRangeFor,
+  sourceTimeAt,
+  transformAt,
+} from '../src/utils/clipRender';
+import {
+  SPEED_PRESETS,
+  atempoChain,
+  canRetime,
+  clampSpeed,
+  formatSpeed,
+  retimeAudioFilters,
+  retimeToSpeed,
+  roomAfter,
+  slowestSpeedThatFits,
+  speedForDuration,
+} from '../src/utils/retime';
+import { clipDuration as durationOfClip, speedOf } from '../src/utils/time';
+import { pitchShift, resampleByRate, semitonesToRatio, timeStretch } from '../src/utils/timeStretch';
+import {
+  annotationShapesAt,
+  hasShapeAnimation,
+  removeShapeKeyAt,
+  shapePointsAt,
+  upsertShapeKey,
+} from '../src/utils/annotationAnim';
 import { requantizeClips, summarize } from '../src/utils/requantize';
 import { sameAspect, clampDimension, normalizeSettings } from '../src/utils/resolution';
 import {
@@ -158,6 +210,49 @@ import {
 } from '../src/utils/mediaInfoFormat';
 import type { TrackInfo } from '../src/utils/mediaInfoFormat';
 import { libraryMenuItems } from '../src/utils/libraryMenu';
+import {
+  DEFAULT_LIBRARY_VIEW,
+  arrangeLibrary,
+  dateGroupLabel,
+  filterAssets,
+  groupAssets,
+  sortAssets,
+} from '../src/utils/libraryView';
+import { safeFileName } from '../src/utils/downloadFile';
+import {
+  clampNormalizeGain,
+  gainForTarget,
+  integratedLoudness,
+  truePeakDb,
+} from '../src/utils/loudness';
+import {
+  activeAudioEffects,
+  audioParam,
+  chainIsIdentity,
+  defaultAudioParams,
+  envelopeGainAt,
+  ffmpegAudioFilters,
+  pitchSemitones,
+  unsupportedForFfmpeg,
+} from '../src/utils/audioChain';
+import { semitonesToRatio } from '../src/utils/pitchNode';
+import {
+  DEFAULT_TEXT_STYLE,
+  TEXT_TEMPLATES,
+  fontStack,
+  fontString,
+  layoutText,
+  resolveTextStyle,
+  shadowPixels,
+  templateStyle,
+  wrapLines,
+} from '../src/utils/textStyle';
+import {
+  applyShifts,
+  closeGapsAcrossTracks,
+  closeGapsOnTracks,
+  rippleShift,
+} from '../src/utils/ripple';
 import { PROJECT_FILE_VERSION } from '../src/types/editor';
 import {
   detachedAudio,
@@ -981,6 +1076,7 @@ check('the offline clip is the one identified, not the whole timeline',
 const fixtureState = {
   settings: { width: 1920, height: 1080, fps: 30 },
   exportSettings: DEFAULT_EXPORT_SETTINGS,
+  textLibrary: [],
   tracks: [{ id: 't1', kind: 'video', label: 'V1', height: 64, muted: false, hidden: false, locked: false }],
   clips: [
     { id: 'c1', kind: 'video', assetId: 'a1', trackId: 't1', timelineStart: 0,
@@ -1003,7 +1099,7 @@ check('the live handles are not written to disk',
   JSON.stringify(written).includes('blob:'), false);
 check('the saved document is exactly the undoable one',
   Object.keys(written.doc).sort(),
-  ['clips', 'exportSettings', 'libraryOrder', 'settings', 'tracks']);
+  ['clips', 'exportSettings', 'libraryOrder', 'settings', 'textLibrary', 'tracks']);
 
 const readBack = fromProjectFile(JSON.parse(JSON.stringify(written)))!;
 check('the document survives the round trip', readBack.doc, written.doc);
@@ -1374,7 +1470,7 @@ check('a frame short of a second has not got there yet', formatClock(0.98), '0:0
 
 const menuBase: ClipMenuContext = {
   kind: 'video', playheadInside: true, hasAsset: true, offline: false,
-  hasAudio: true, audioEnabled: true, hideVideo: false,
+  hasAudio: true, audioEnabled: true, hideVideo: false, speed: 1,
   trackLocked: false, producerBusy: false, selectionCount: 1,
 };
 const ids = (ctx: ClipMenuContext) => clipMenuItems(ctx).map((i) => i.id);
@@ -1383,14 +1479,25 @@ const enabled = (ctx: ClipMenuContext, id: string) => item(ctx, id)?.disabled !=
 
 check('a video clip offers the lot',
   ids(menuBase),
-  ['split', 'trimStart', 'trimEnd', 'duplicate', 'bake', 'preset', 'detach', 'toggleAudio',
+  ['split', 'trimStart', 'trimEnd', 'duplicate', 'bake', 'preset',
+   'speedHalf', 'speedNormal', 'speedDouble', 'detach', 'toggleAudio',
    'toggleVideo', 'zoom', 'delete', 'rippleDelete']);
+// The rate a clip is already playing at is offered and disabled, not hidden: a menu that
+// changes shape is harder to use than one that says why an entry does nothing.
+check('the current rate says so instead of vanishing',
+  [item(menuBase, 'speedNormal')?.disabled, item(menuBase, 'speedNormal')?.reason],
+  [true, 'Already playing at this rate.']);
+check('and a retimed clip can go back to normal',
+  enabled({ ...menuBase, speed: 2 }, 'speedNormal'), true);
 
 // An audio clip has no picture to bake, no preset to run over it and no audio to detach from
 // itself — and no mute, because a gain of zero cannot say what it used to be.
 check('an audio clip offers only what an audio clip has',
   ids({ ...menuBase, kind: 'audio', hideVideo: false }),
-  ['split', 'trimStart', 'trimEnd', 'duplicate', 'zoom', 'delete', 'rippleDelete']);
+  ['split', 'trimStart', 'trimEnd', 'duplicate',
+   'speedHalf', 'speedNormal', 'speedDouble', 'zoom', 'delete', 'rippleDelete']);
+check('a title cannot be retimed — there is no source clock to run faster',
+  ids({ ...menuBase, kind: 'text' }).some((id) => id.startsWith('speed')), false);
 check('a text clip has no source to render from',
   ids({ ...menuBase, kind: 'text' }).includes('bake'), false);
 check('an image can be baked but has no preset',
@@ -1937,6 +2044,1058 @@ check('nothing is greyed out without a reason',
     .flat()
     .every((i) => !i.disabled || (i.reason ?? '').length > 0),
   true);
+
+// --- 39. closing gaps, and the ripple shift --------------------------------------
+
+/** `start`/`len` in seconds; trims stand in for duration the way the real clips do. */
+const gapClip = (id: string, trackId: string, start: number, len: number) =>
+  ({ id, trackId, timelineStart: start, sourceTrimIn: 0, sourceTrimOut: len }) as unknown as Clip;
+
+const startsOf = (clips: Clip[]) =>
+  clips.map((c) => Number(c.timelineStart.toFixed(4)));
+
+// Three clips with holes between them.
+const gappy = [
+  gapClip('g1', 'v1', 2, 3),   // 2 → 5
+  gapClip('g2', 'v1', 8, 2),   // 8 → 10
+  gapClip('g3', 'v1', 14, 4),  // 14 → 18
+];
+check('closing a track pulls each clip onto the previous one',
+  startsOf(applyShifts(gappy, closeGapsOnTracks(gappy, ['v1']))), [2, 5, 7]);
+check('and the first clip does not move — a deliberate head is content, not a gap',
+  applyShifts(gappy, closeGapsOnTracks(gappy, ['v1']))[0].timelineStart, 2);
+
+// The trap: a transition IS the overlap, so closing must never shorten one.
+const withDissolve = [
+  gapClip('d1', 'v1', 0, 5),   // 0 → 5
+  gapClip('d2', 'v1', 4, 5),   // 4 → 9, overlapping d1 by 1s
+  gapClip('d3', 'v1', 20, 2),  // 20 → 22, after a big hole
+];
+const dissolveClosed = applyShifts(withDissolve, closeGapsOnTracks(withDissolve, ['v1']));
+check('an overlap survives closing with its length intact',
+  startsOf(dissolveClosed), [0, 4, 9]);
+check('which is to say the dissolve is still one second long',
+  Number((dissolveClosed[0].timelineStart + 5 - dissolveClosed[1].timelineStart).toFixed(4)), 1);
+
+check('a track with one clip is a no-op',
+  closeGapsOnTracks([gapClip('s1', 'v1', 7, 2)], ['v1']).length, 0);
+check('a track already tight is a no-op',
+  closeGapsOnTracks([gapClip('t1', 'v1', 0, 2), gapClip('t2', 'v1', 2, 2)], ['v1']).length, 0);
+check('only the named tracks are touched',
+  closeGapsOnTracks(
+    [gapClip('x1', 'v1', 0, 1), gapClip('x2', 'v1', 5, 1), gapClip('y1', 'a1', 0, 1), gapClip('y2', 'a1', 5, 1)],
+    ['v1'],
+  ).map((sft) => sft.id),
+  ['x2']);
+
+// Across tracks: only stretches where nothing plays anywhere are removed, and everything
+// after one moves by the same amount — which is what keeps detached audio with its picture.
+const twoTracks = [
+  gapClip('p1', 'v1', 0, 4),   // 0 → 4
+  gapClip('m1', 'a1', 1, 5),   // 1 → 6   (overlaps p1: the block runs 0 → 6)
+  gapClip('p2', 'v1', 10, 2),  // 10 → 12
+  gapClip('m2', 'a1', 10, 2),  // 10 → 12, detached audio for p2
+];
+const globalClosed = applyShifts(twoTracks, closeGapsAcrossTracks(twoTracks));
+check('a timeline-wide gap closes by its own length',
+  startsOf(globalClosed), [0, 1, 6, 6]);
+check('and the picture and its detached audio still start together',
+  globalClosed[2].timelineStart === globalClosed[3].timelineStart, true);
+check('a hole covered on another track is not a gap at all',
+  closeGapsAcrossTracks([
+    gapClip('c1', 'v1', 0, 2),
+    gapClip('c2', 'a1', 2, 2),
+    gapClip('c3', 'v1', 4, 2),
+  ]).length,
+  0);
+check('leading space before the first clip is left alone',
+  startsOf(applyShifts(
+    [gapClip('l1', 'v1', 5, 1), gapClip('l2', 'v1', 9, 1)],
+    closeGapsAcrossTracks([gapClip('l1', 'v1', 5, 1), gapClip('l2', 'v1', 9, 1)]),
+  )),
+  [5, 6]);
+
+// The ripple shift itself.
+const rippleBed = [
+  gapClip('r1', 'v1', 0, 4),
+  gapClip('r2', 'v1', 4, 4),
+  gapClip('r3', 'v1', 8, 4),
+  gapClip('r4', 'a1', 8, 4),
+];
+check('a track-scoped ripple moves only that track',
+  rippleShift(rippleBed, 8, -2, 'v1').map((sft) => sft.id), ['r3']);
+check('an all-tracks ripple moves both, by one amount',
+  rippleShift(rippleBed, 8, -2, null).map((sft) => [sft.id, sft.timelineStart]),
+  [['r3', 6], ['r4', 6]]);
+check('a clip already running when the edit happened does not move',
+  rippleShift(rippleBed, 6, -2, 'v1').map((sft) => sft.id), ['r3']);
+check('the edited clip itself is excluded',
+  rippleShift(rippleBed, 4, 2, 'v1', new Set(['r2'])).map((sft) => sft.id), ['r3']);
+check('a zero shift changes nothing', rippleShift(rippleBed, 0, 0, null).length, 0);
+check('a ripple never pushes a clip before zero',
+  rippleShift(rippleBed, 0, -99, 'v1').every((sft) => sft.timelineStart === 0), true);
+check('applyShifts leaves untouched clips identical by reference',
+  applyShifts(rippleBed, rippleShift(rippleBed, 8, -2, 'v1'))[0] === rippleBed[0], true);
+
+// --- 40. arranging the library ---------------------------------------------------
+
+const DAY = 86_400_000;
+const NOW = new Date(2026, 0, 15, 12, 0, 0).getTime();
+
+const libAsset = (
+  id: string,
+  name: string,
+  over: Partial<MediaAsset> = {},
+): MediaAsset =>
+  ({
+    id,
+    name,
+    type: 'video',
+    duration: 10,
+    origin: 'imported',
+    ...over,
+  }) as unknown as MediaAsset;
+
+const shelf: MediaAsset[] = [
+  libAsset('a', 'zebra.mp4', { duration: 30, addedAt: NOW - 2 * DAY, file: { size: 300 } as File }),
+  libAsset('b', 'apple.mp4', { duration: 5, addedAt: NOW - 1 * DAY, file: { size: 900 } as File }),
+  libAsset('c', 'mango.wav', { type: 'audio', duration: 12, addedAt: NOW, file: { size: 100 } as File,
+    origin: 'recorded' }),
+  // No `addedAt`: written before the field existed.
+  libAsset('d', 'old.png', { type: 'image', duration: 5, origin: 'pasted' }),
+];
+const libIds = (list: MediaAsset[]) => list.map((a) => a.id);
+
+check('the custom sort is the order it was given — libraryOrder itself',
+  libIds(sortAssets(shelf, 'custom')), ['a', 'b', 'c', 'd']);
+check('by name, naturally', libIds(sortAssets(shelf, 'name')), ['b', 'c', 'd', 'a']);
+check('by name, reversed', libIds(sortAssets(shelf, 'name', 'desc')), ['a', 'd', 'c', 'b']);
+check('by duration', libIds(sortAssets(shelf, 'duration')), ['b', 'd', 'c', 'a']);
+check('by size, and an offline file counts as nothing it can account for',
+  libIds(sortAssets(shelf, 'size')), ['d', 'c', 'a', 'b']);
+check('by date added, oldest first', libIds(sortAssets(shelf, 'added')), ['a', 'b', 'c', 'd']);
+// The one that is easy to get wrong: an undated asset must not claim to be the newest.
+check('an asset with no date sorts last in both directions',
+  [libIds(sortAssets(shelf, 'added')).at(-1), libIds(sortAssets(shelf, 'added', 'desc')).at(-1)],
+  ['d', 'd']);
+check('sorting does not mutate the list it was handed', libIds(shelf), ['a', 'b', 'c', 'd']);
+
+check('search matches the name', libIds(filterAssets(shelf, 'MAN')), ['c']);
+check('and the preset that made it',
+  libIds(filterAssets([...shelf, libAsset('e', 'out.mp4', {
+    derivedFrom: { assetId: 'a', presetId: 'p', presetLabel: 'Denoise' },
+  })], 'denoi')),
+  ['e']);
+check('an empty query is not a filter', libIds(filterAssets(shelf, '   ')), ['a', 'b', 'c', 'd']);
+
+check('grouping by type keeps a fixed section order',
+  groupAssets(shelf, 'type', NOW).map((g) => [g.label, g.assets.length]),
+  [['Video', 2], ['Audio', 1], ['Images', 1]]);
+check('grouping by origin separates what takes up the quota',
+  groupAssets(shelf, 'origin', NOW).map((g) => g.label),
+  ['Recorded here', 'Pasted in', 'Imported']);
+check('an empty section is not shown at all',
+  groupAssets([shelf[3]], 'type', NOW).map((g) => g.label), ['Images']);
+check('flat is one unlabelled section',
+  groupAssets(shelf, 'none', NOW).map((g) => [g.label, g.assets.length]), [['', 4]]);
+
+check('date buckets read from midnight, not from 24 hours ago',
+  [
+    dateGroupLabel(NOW - 60_000, NOW),
+    dateGroupLabel(NOW - 20 * 3600_000, NOW),
+    dateGroupLabel(NOW - 4 * DAY, NOW),
+    dateGroupLabel(NOW - 20 * DAY, NOW),
+    dateGroupLabel(NOW - 200 * DAY, NOW),
+    dateGroupLabel(undefined, NOW),
+  ],
+  ['Today', 'Yesterday', 'This week', 'This month', 'Earlier', 'Earlier']);
+
+check('arrange filters, then sorts, then groups',
+  arrangeLibrary(shelf, { ...DEFAULT_LIBRARY_VIEW, group: 'type', sort: 'name', query: 'a' }, NOW)
+    .map((g) => [g.label, libIds(g.assets)]),
+  [['Video', ['b', 'a']], ['Audio', ['c']]]);
+
+check('the library menu offers a download', 
+  libraryMenuItems({ type: 'audio', online: true, inUse: false, producerBusy: false })
+    .some((i) => i.id === 'download'), true);
+check('but not for an offline file, and it says why',
+  (libraryMenuItems({ type: 'audio', online: false, inUse: false, producerBusy: false })
+    .find((i) => i.id === 'download')?.reason ?? '').includes('offline'), true);
+
+check('a download name loses what a file system refuses',
+  safeFileName('screen 2026-01-15 10:04:22.mp4'), 'screen 2026-01-15 10-04-22.mp4');
+check('and never comes back empty', safeFileName('///'), 'file');
+check('a leading dot is not a hidden file', safeFileName('...boot.mp4'), 'boot.mp4');
+
+// --- 41. loudness, the envelope and the audio chain -------------------------------
+
+const SR = 48000;
+/** A 1 kHz sine at a given peak dBFS, on two identical channels. */
+const sineAt = (db: number, seconds = 3, rate = SR): Float32Array[] => {
+  const amp = Math.pow(10, db / 20);
+  const n = Math.round(rate * seconds);
+  const a = new Float32Array(n);
+  for (let i = 0; i < n; i++) a[i] = amp * Math.sin((2 * Math.PI * 1000 * i) / rate);
+  return [a, a.slice()];
+};
+
+/*
+  EBU Tech 3341 case 1: a stereo 1 kHz sine at −23 dBFS must read −23.0 LUFS ± 0.1. That one
+  number exercises the whole chain — both K-weighting stages, the block size, the channel
+  weights and the −0.691 offset — because getting any of them wrong moves it.
+*/
+check('a −23 dBFS sine reads −23 LUFS, to the EBU tolerance',
+  integratedLoudness(sineAt(-23), SR), -23, 0.1);
+check('and −20 reads −20', integratedLoudness(sineAt(-20), SR), -20, 0.1);
+check('the scale is linear in dB: 10 dB down is 10 LU down',
+  (integratedLoudness(sineAt(-30), SR) ?? 0) - (integratedLoudness(sineAt(-20), SR) ?? 0), -10, 0.05);
+// The filter is rebuilt at the file's own rate rather than carrying 48 kHz coefficients.
+check('44.1 kHz measures the same as 48 kHz',
+  integratedLoudness(sineAt(-20, 3, 44100), 44100), -20, 0.1);
+
+// Silence has no loudness. Returning −70 for it would let normalize lift nothing by 54 dB.
+check('digital silence measures nothing at all',
+  integratedLoudness([new Float32Array(SR), new Float32Array(SR)], SR), null);
+check('and so does an excerpt too short to hold one block',
+  integratedLoudness([new Float32Array(100)], SR), null);
+check('no channels, no measurement', integratedLoudness([], SR), null);
+
+// The relative gate is what makes this better than an average: a voice with pauses in it
+// must measure as the voice, not as the mean of voice and room tone.
+const gated = (() => {
+  const loud = sineAt(-20, 2)[0];
+  const quiet = new Float32Array(SR * 2);
+  const both = new Float32Array(loud.length + quiet.length);
+  both.set(loud, 0);
+  both.set(quiet, loud.length);
+  return [both, both.slice()];
+})();
+check('half silence does not drag the measurement down',
+  integratedLoudness(gated, SR), -20, 0.5);
+
+check('peak is measured, not inferred', truePeakDb(sineAt(-6)), -6, 0.01);
+// −Infinity, not a number: silence has no peak, and the readout must not print one.
+check('and silence has no peak', Number.isFinite(truePeakDb([new Float32Array(64)])), false);
+
+check('the gain for a target is the difference in dB',
+  gainForTarget(-26, -16), Math.pow(10, 10 / 20), 1e-6);
+check('a clip already on target is left exactly alone', gainForTarget(-16, -16), 1, 1e-9);
+// Clamped so normalizing never turns a whisper into its own noise floor.
+check('lift is capped at 12 dB', clampNormalizeGain(gainForTarget(-60, -16)), Math.pow(10, 12 / 20), 1e-6);
+check('and cut at 24 dB', clampNormalizeGain(gainForTarget(0, -60)), Math.pow(10, -24 / 20), 1e-6);
+check('a sensible gain passes through untouched', clampNormalizeGain(1.7), 1.7, 1e-9);
+
+// --- the envelope ---------------------------------------------------------------
+
+check('no envelope is a gain of one, not the clip gain',
+  [envelopeGainAt(undefined, 3), envelopeGainAt([], 3)], [1, 1]);
+const ramp = [
+  { t: 0, value: 1, interp: 'linear' as const },
+  { t: 4, value: 0.25, interp: 'linear' as const },
+];
+check('a linear ramp is read at the halfway point', envelopeGainAt(ramp, 2), 0.625, 1e-6);
+check('before the first point it holds the first value', envelopeGainAt(ramp, -1), 1);
+check('after the last it holds the last', envelopeGainAt(ramp, 99), 0.25);
+check('a hold point steps rather than ramps',
+  envelopeGainAt([
+    { t: 0, value: 1, interp: 'hold' },
+    { t: 4, value: 0, interp: 'hold' },
+  ], 3.9), 1);
+check('and the envelope never goes negative',
+  envelopeGainAt([{ t: 0, value: -5, interp: 'linear' }], 0), 0);
+
+// --- the chain ------------------------------------------------------------------
+
+check('an empty chain is the identity, and costs no nodes',
+  [chainIsIdentity(undefined), chainIsIdentity([])], [true, true]);
+const hp = { id: 'e1', type: 'highpass' as const, enabled: true, params: defaultAudioParams('highpass') };
+check('a high-pass defaults to 80 Hz', audioParam(hp, 'frequency'), 80);
+check('a missing param falls back to its default rather than to zero',
+  audioParam({ ...hp, params: {} }, 'frequency'), 80);
+check('a disabled effect is not in the chain',
+  activeAudioEffects([{ ...hp, enabled: false }]).length, 0);
+check('an enabled one is', chainIsIdentity([hp]), false);
+
+check('a high-pass becomes one FFmpeg filter', ffmpegAudioFilters([hp]), ['highpass=f=80']);
+const eq = {
+  id: 'e2', type: 'eq' as const, enabled: true,
+  params: { ...defaultAudioParams('eq'), midGain: -6 },
+};
+// Only the bands that do something are emitted; a flat band is not a filter.
+check('a flat EQ band emits nothing', ffmpegAudioFilters([{ ...eq, params: defaultAudioParams('eq') }]), []);
+check('a cut band emits one equalizer',
+  ffmpegAudioFilters([eq]), ['equalizer=f=1000:t=q:w=1:g=-6']);
+
+const pitch = {
+  id: 'e3', type: 'pitch' as const, enabled: true,
+  params: { semitones: 2 },
+};
+check('pitch is read in semitones', pitchSemitones([pitch]), 2);
+check('and none asked for is zero', pitchSemitones([hp]), 0);
+// The fallback refuses rather than resampling into something that sounds different.
+check('FFmpeg has no equivalent for pitch, and says so instead of guessing',
+  ffmpegAudioFilters([hp, pitch]), null);
+check('and the effect is named for the message', unsupportedForFfmpeg([hp, pitch]), ['Pitch']);
+check('nothing is unsupported when there is no pitch', unsupportedForFfmpeg([hp, eq]), []);
+
+check('an octave up is twice the rate', semitonesToRatio(12), 2, 1e-9);
+check('an octave down is half', semitonesToRatio(-12), 0.5, 1e-9);
+check('and no shift is exactly one', semitonesToRatio(0), 1, 1e-12);
+
+// --- 42. text styling and layout -------------------------------------------------
+
+/** A stand-in for canvas metrics: every character is 10 units wide. */
+const fakeMeasure = (text: string) => text.length * 10;
+
+check('a line that fits is one line', wrapLines('one two', 200, fakeMeasure), ['one two']);
+check('and one that does not is broken at a space',
+  wrapLines('one two three', 90, fakeMeasure), ['one two', 'three']);
+check('explicit newlines are kept, never joined back up',
+  wrapLines('a\nb', 1000, fakeMeasure), ['a', 'b']);
+check('and an empty line survives as one', wrapLines('a\n\nb', 1000, fakeMeasure), ['a', '', 'b']);
+// A URL in a title would otherwise run straight off the side of the frame.
+check('a single word too long for the line is broken by character',
+  wrapLines('abcdefgh', 30, fakeMeasure), ['abc', 'def', 'gh']);
+check('runs of whitespace collapse', wrapLines('a    b', 1000, fakeMeasure), ['a b']);
+
+const styleFor = (over: Partial<typeof DEFAULT_TEXT_STYLE>) => ({ ...DEFAULT_TEXT_STYLE, ...over });
+const layoutWith = (over: Partial<typeof DEFAULT_TEXT_STYLE>, text = 'ab', w = 1000, h = 100) =>
+  layoutText(styleFor(over), text, w, h, (line, size) => line.length * size * 0.5);
+
+// fontSize is a fraction of the frame height, which is what makes one clip look the same in a
+// 1080p preview and a 4K export.
+check('the pixel size is a fraction of the frame height',
+  layoutWith({ fontSize: 0.2 }).fontSize, 20);
+check('and it scales with the frame, not with the text',
+  layoutWith({ fontSize: 0.2 }, 'ab', 2000, 200).fontSize, 40);
+
+const centred = layoutWith({ align: 'center', vAlign: 'middle', margin: 0 });
+check('a centred line is anchored at the middle of the frame', centred.anchors[0], 500);
+const left = layoutWith({ align: 'left', margin: 0.05 });
+check('a left-aligned one starts at the margin', left.anchors[0], 5);
+const right = layoutWith({ align: 'right', margin: 0.05 });
+check('and a right-aligned one ends at it', right.anchors[0], 995);
+
+// The vertical anchor applies to the block, not to each line — which is what keeps a two-line
+// subtitle above the bottom margin instead of half off the frame.
+const twoLines = layoutText(
+  styleFor({ vAlign: 'bottom', margin: 0, fontSize: 0.2, lineHeight: 1 }),
+  'aa\nbb', 1000, 100, (line, size) => line.length * size * 0.5,
+);
+check('a two-line block sits above the bottom edge, not through it',
+  twoLines.lines.length, 2);
+check('and its last baseline is inside the frame',
+  twoLines.baselines[1] <= 100, true);
+check('the block grows upward as lines are added',
+  twoLines.baselines[0] < twoLines.baselines[1], true);
+
+const boxed = layoutWith({ box: { color: '#000', paddingX: 0.5, paddingY: 0.5, radius: 0.1 }, margin: 0 });
+check('a box grows with its padding, in font-size units',
+  boxed.box !== null && boxed.box.h > boxed.lineHeight, true);
+check('and a style with no box has none', layoutWith({}).box, null);
+
+// Every template must resolve to a complete style, or a control in the Inspector reads
+// `undefined` and writes it back.
+check('every template is a complete style',
+  TEXT_TEMPLATES.every((t) => Object.keys(DEFAULT_TEXT_STYLE).every((k) => k in t.style)), true);
+check('there are more than the original three', TEXT_TEMPLATES.length > 3, true);
+check('and the original three kept their ids',
+  ['lowerThird', 'centerTitle', 'subtitle'].every((id) => TEXT_TEMPLATES.some((t) => t.id === id)),
+  true);
+// A clip saved before styling existed has no overrides, so it must render as its template.
+check('no overrides means the template exactly',
+  resolveTextStyle('centerTitle', undefined), templateStyle('centerTitle'));
+check('an override replaces only what it names',
+  resolveTextStyle('centerTitle', { color: '#f00' }).fontSize,
+  templateStyle('centerTitle').fontSize);
+check('and does replace that', resolveTextStyle('centerTitle', { color: '#f00' }).color, '#f00');
+check('an unknown template falls back rather than throwing',
+  templateStyle('nonesuch' as never), TEXT_TEMPLATES[0].style);
+
+/*
+  A shadow is sized in fractions of the font, for the same reason the font is a fraction of the
+  frame: 8 canvas pixels is a soft halo in a 480p proxy and a hairline in a 4K export, and the
+  whole point of this file is that one clip looks like one thing everywhere.
+*/
+check('a shadow scales with the type',
+  shadowPixels({ color: '#000', blur: 0.1, offsetX: 0.05, offsetY: -0.05 }, 200),
+  { blur: 20, offsetX: 10, offsetY: -10 });
+check('and twice the size is twice the shadow',
+  shadowPixels({ color: '#000', blur: 0.1, offsetX: 0.05, offsetY: 0 }, 400).blur, 40);
+/*
+  Projects saved before that carried raw canvas pixels. A fraction of the font size is never
+  ≥ 1 — that would be a blur as tall as the type — so anything that big is one of those, and is
+  read against the size it was authored at rather than multiplied into a black rectangle.
+*/
+check('an old pixel shadow is read as pixels, not as a multiple of the type',
+  shadowPixels({ color: '#000', blur: 8, offsetX: 2, offsetY: 2 }, 240),
+  { blur: 8, offsetX: 2, offsetY: 2 });
+check('and it scales from there, which it never used to do',
+  shadowPixels({ color: '#000', blur: 8, offsetX: 2, offsetY: 2 }, 480),
+  { blur: 16, offsetX: 4, offsetY: 4 });
+check('a negative offset is not mistaken for a fraction',
+  shadowPixels({ color: '#000', blur: 0, offsetX: -4, offsetY: 0 }, 240).offsetX, -4);
+check('no shadow at all resolves to nothing',
+  shadowPixels({ color: '#000', blur: 0, offsetX: 0, offsetY: 0 }, 240),
+  { blur: 0, offsetX: 0, offsetY: 0 });
+
+// The template that is nothing but a stroke has to look exactly as it did now that the number
+// means the visible outline rather than the canvas line width, half of which the fill covers.
+check('the outlined template draws the same stroke it always did',
+  templateStyle('outline').strokeWidth * 2, 0.09);
+
+check('the font shorthand carries weight, size and stack',
+  fontString(styleFor({ weight: 700, fontFamily: 'serif' }), 32),
+  `700 32px ${fontStack('serif')}`);
+check('and italic when asked',
+  fontString(styleFor({ italic: true, weight: 400 }), 20).startsWith('italic 400 20px'), true);
+check('an unknown font falls back to the one bootstrap actually downloads',
+  fontStack('nope'), fontStack('dejavu'));
+
+// A project written before text objects existed has no `textLibrary` at all. It must open with
+// an empty one rather than `undefined`, which every consumer would then have to guard.
+const legacyDoc = JSON.parse(JSON.stringify(written)) as Record<string, unknown>;
+delete (legacyDoc.doc as Record<string, unknown>).textLibrary;
+check('a project saved before text objects opens with an empty one',
+  fromProjectFile(legacyDoc)!.doc.textLibrary, []);
+
+// --- 43. what counts as a drawing clip ------------------------------------------
+
+/*
+  `isVisualClip` is the list the preview, the WebCodecs export and the FFmpeg fallback all
+  iterate over. A drawing clip kind missing from it is invisible in all three at once, and
+  nothing catches it: a type predicate is not checked for exhaustiveness, so the compiler is
+  happy either way. Annotation clips shipped broken for exactly this reason, so the list is
+  now asserted against the clip union rather than trusted.
+*/
+const DRAWING_KINDS = ['video', 'image', 'text', 'annotation'] as const;
+const NON_DRAWING_KINDS = ['audio', 'adjustment'] as const;
+
+check('every drawing clip kind composites',
+  DRAWING_KINDS.map((kind) => isVisualClip({ kind } as unknown as Clip)),
+  DRAWING_KINDS.map(() => true));
+check('and nothing else does',
+  NON_DRAWING_KINDS.map((kind) => isVisualClip({ kind } as unknown as Clip)),
+  NON_DRAWING_KINDS.map(() => false));
+
+/*
+  `acceptsTransform` is the same kind of list for *placement*, and it failed the same way:
+  the store's writer named video and image, so an annotation's placement checkbox wrote
+  nothing and could not be ticked. A predicate that is wrong here does not produce an error
+  anywhere — it produces a control that appears and does nothing.
+
+  Text is absent on purpose: its box is `textFrame`, and `transformAt` returns undefined for
+  it, so offering it a crop would be offering something no renderer would read.
+*/
+const PLACEABLE_KINDS = ['video', 'image', 'annotation'] as const;
+const UNPLACEABLE_KINDS = ['text', 'audio', 'adjustment'] as const;
+
+check('every placeable clip kind accepts a transform',
+  PLACEABLE_KINDS.map((kind) => acceptsTransform({ kind } as unknown as Clip)),
+  PLACEABLE_KINDS.map(() => true));
+check('and nothing else does',
+  UNPLACEABLE_KINDS.map((kind) => acceptsTransform({ kind } as unknown as Clip)),
+  UNPLACEABLE_KINDS.map(() => false));
+// The two lists must agree with each other: something placed has to be something drawn.
+check('everything placeable also composites',
+  PLACEABLE_KINDS.map((kind) => isVisualClip({ kind } as unknown as Clip)),
+  PLACEABLE_KINDS.map(() => true));
+
+const paintTracks = [
+  { id: 'v1', kind: 'video', hidden: false },
+  { id: 'v2', kind: 'video', hidden: false },
+] as unknown as Track[];
+const paintClips = [
+  { id: 'p1', kind: 'video', trackId: 'v1', timelineStart: 0, sourceTrimIn: 0, sourceTrimOut: 2 },
+  { id: 'p2', kind: 'annotation', trackId: 'v2', timelineStart: 0, sourceTrimIn: 0, sourceTrimOut: 2, shapes: [] },
+  { id: 'p3', kind: 'audio', trackId: 'v1', timelineStart: 0, sourceTrimIn: 0, sourceTrimOut: 2 },
+] as unknown as Clip[];
+check('an annotation reaches the paint order, above the picture it marks',
+  compositeOrderedClips(paintClips, paintTracks).map((c) => c.id), ['p2', 'p1']);
+
+// --- annotations under a change of aspect ---------------------------------------
+
+const annoWide = { width: 1920, height: 1080 };
+const annoTall = { width: 1080, height: 1920 };
+const annoArrow = [{
+  id: 's1', type: 'annoArrow' as const, color: '#f00', width: 0.006, fill: null,
+  points: [{ x: 0.2, y: 0.2 }, { x: 0.4, y: 0.5 }],
+}];
+const refitted = refitAnnotationShapes(annoArrow, annoWide, annoTall);
+check('a refitted shape keeps its point count', refitted[0].points.length, 2);
+// The mark must keep its proportions, or a square box becomes a phone-shaped one.
+const beforeRatio = (0.4 - 0.2) * annoWide.width / ((0.5 - 0.2) * annoWide.height);
+const afterRatio =
+  (refitted[0].points[1].x - refitted[0].points[0].x) * annoTall.width /
+  ((refitted[0].points[1].y - refitted[0].points[0].y) * annoTall.height);
+check('and its proportions on the new canvas', afterRatio, beforeRatio, 1e-6);
+check('the shape survives with everything but its geometry untouched',
+  [refitted[0].color, refitted[0].type], ['#f00', 'annoArrow']);
+
+/*
+  Marks are content-anchored: an arrow means "that thing there", and the thing is in the
+  picture. 16:9 into 9:16 leaves a picture that filled the frame as a centred band 607.5 of the
+  new 1920 lines tall, so a point at the old frame's centre is still at the picture's centre, and a
+  point at the old top-left corner is at the band's top-left corner rather than the canvas'.
+*/
+const annoBand = fittedContentBox(annoWide, annoTall);
+check('a picture that filled 16:9 becomes a centred band in 9:16',
+  [annoBand.x, annoBand.w, +annoBand.h.toFixed(6), +annoBand.y.toFixed(6)],
+  [0, 1, 0.316406, 0.341797]);
+check('reframing to the same shape is the identity',
+  fittedContentBox(annoWide, { width: 3840, height: 2160 }), { x: 0, y: 0, w: 1, h: 1 });
+
+const annoCorners = refitAnnotationShapes([{
+  ...annoArrow[0], points: [{ x: 0.5, y: 0.5 }, { x: 0, y: 0 }],
+}], annoWide, annoTall);
+check('the centre of the old frame is the centre of the picture in the new one',
+  [annoCorners[0].points[0].x, +annoCorners[0].points[0].y.toFixed(6)], [0.5, 0.5]);
+check('and a corner mark is on the corner of the picture, not of the canvas',
+  [annoCorners[0].points[1].x, +annoCorners[0].points[1].y.toFixed(6)],
+  [annoBand.x, +annoBand.y.toFixed(6)]);
+
+/*
+  The stroke is a fraction of the canvas' short side, and the picture just changed size. Held
+  against the *picture* it has to come out the same thickness, or an arrow over a halved frame
+  reads as twice as heavy.
+*/
+const strokeBefore = annoArrow[0].width * Math.min(annoWide.width, annoWide.height);
+const strokeAfter = refitted[0].width * Math.min(annoTall.width, annoTall.height);
+check('and the stroke stays the same thickness relative to the picture',
+  strokeAfter / strokeBefore, annoBand.w * annoTall.width / annoWide.width, 1e-9);
+
+// A perfectly horizontal annoArrow has zero height, which used to be a division by it.
+const annoFlat = refitAnnotationShapes([{
+  ...annoArrow[0], points: [{ x: 0.1, y: 0.5 }, { x: 0.6, y: 0.5 }],
+}], annoWide, annoTall);
+check('a degenerate axis needs no special case under an affine map',
+  annoFlat[0].points.every((pt) => Number.isFinite(pt.x) && Number.isFinite(pt.y)), true);
+check('and stays flat', annoFlat[0].points[0].y, annoFlat[0].points[1].y, 1e-9);
+check('an empty shape list is left alone', refitAnnotationShapes([], annoWide, annoTall), []);
+check('a shape with no points is returned as it was',
+  refitAnnotationShapes([{ ...annoArrow[0], points: [] }], annoWide, annoTall)[0].points, []);
+check('a shape with no points keeps its stroke too, having no geometry to scale',
+  refitAnnotationShapes([{ ...annoArrow[0], points: [] }], annoWide, annoTall)[0].width, 0.006);
+
+
+// --- 44. editing a mark: hit-testing, handles, moving, reshaping ----------------
+/*
+  The geometry the user experiences as "the thing I clicked is the thing that moved". None of
+  it can be seen to be wrong except by clicking, which is why it is all pure and all here.
+
+  Distances are taken with x scaled by the stage's aspect, because shape coordinates are
+  normalized against the composition: on 16:9, one unit of x is 1.78 units of y, and a grab
+  radius that ignored that would be an oval on screen — easy to hit sideways, impossible from
+  above.
+*/
+const ASPECT = 16 / 9;
+const editArrow: AnnotationShape = {
+  id: 'a1', type: 'arrow', color: '#f00', width: 0.006, fill: null,
+  points: [{ x: 0.2, y: 0.2 }, { x: 0.6, y: 0.2 }],
+};
+const editBox: AnnotationShape = {
+  id: 'b1', type: 'box', color: '#0f0', width: 0.006, fill: null,
+  points: [{ x: 0.1, y: 0.1 }, { x: 0.5, y: 0.5 }],
+};
+
+check('a point on the shaft hits the arrow',
+  hitShape(editArrow, { x: 0.4, y: 0.2 }, HIT_TOLERANCE, ASPECT), true);
+check('a point well off it does not',
+  hitShape(editArrow, { x: 0.4, y: 0.4 }, HIT_TOLERANCE, ASPECT), false);
+// The grab radius is in units of normalized *height*, so a vertical miss of exactly the
+// tolerance is still a hit and one of twice it is not — in either axis.
+check('the grab radius reaches one tolerance below the line',
+  hitShape(editArrow, { x: 0.4, y: 0.2 + HIT_TOLERANCE * 0.9 }, HIT_TOLERANCE, ASPECT), true);
+check('and stops short of two',
+  hitShape(editArrow, { x: 0.4, y: 0.2 + HIT_TOLERANCE * 2 }, HIT_TOLERANCE, ASPECT), false);
+// Sideways past the tail: 0.01 of x is 0.0178 on screen at 16:9, just over the tolerance.
+check('a sideways miss is measured on screen, not in normalized x',
+  hitShape(editArrow, { x: 0.2 - 0.011, y: 0.2 }, HIT_TOLERANCE, ASPECT), false);
+
+check('a box is grabbed by its edge', hitShape(editBox, { x: 0.3, y: 0.1 }, HIT_TOLERANCE, ASPECT), true);
+check('an unfilled box is not grabbed through the middle',
+  hitShape(editBox, { x: 0.3, y: 0.3 }, HIT_TOLERANCE, ASPECT), false);
+check('a shaded one is',
+  hitShape({ ...editBox, fill: 'rgba(0,0,0,0.35)' }, { x: 0.3, y: 0.3 }, HIT_TOLERANCE, ASPECT), true);
+
+const editEllipse: AnnotationShape = { ...editBox, id: 'e1', type: 'ellipse' };
+check('an ellipse is grabbed on its rim',
+  hitShape(editEllipse, { x: 0.3, y: 0.1 }, HIT_TOLERANCE, ASPECT), true);
+check('and not at its centre', hitShape(editEllipse, { x: 0.3, y: 0.3 }, HIT_TOLERANCE, ASPECT), false);
+
+const editFree: AnnotationShape = {
+  id: 'f1', type: 'freehand', color: '#00f', width: 0.006, fill: null,
+  points: [{ x: 0.1, y: 0.8 }, { x: 0.2, y: 0.8 }, { x: 0.3, y: 0.9 }],
+};
+check('a freehand path is grabbed anywhere along it',
+  [hitShape(editFree, { x: 0.15, y: 0.8 }, HIT_TOLERANCE, ASPECT),
+   hitShape(editFree, { x: 0.25, y: 0.85 }, HIT_TOLERANCE, ASPECT),
+   hitShape(editFree, { x: 0.15, y: 0.5 }, HIT_TOLERANCE, ASPECT)],
+  [true, true, false]);
+
+// Last drawn is on top, so it is what a click on the overlap means.
+const stack = [editBox, { ...editArrow, id: 'a2', points: [{ x: 0.1, y: 0.1 }, { x: 0.5, y: 0.1 }] }];
+check('picking takes the topmost mark', pickShape(stack, { x: 0.3, y: 0.1 }, HIT_TOLERANCE, ASPECT), 'a2');
+check('and none when nothing is near',
+  pickShape(stack, { x: 0.9, y: 0.9 }, HIT_TOLERANCE, ASPECT), null);
+
+/*
+  A label is a box at a point, and the point is the box's *centre*. Grabbing it used to be a
+  disc around that centre, so the near end of a long label was outside its own grab region —
+  and the outline drawn for it was a ring floating in the middle of the text, attached to
+  nothing visible. Both now use `labelRect`, which is the property that matters: what can be
+  clicked is what is outlined.
+*/
+const editLabel: AnnotationShape = {
+  id: 'l1', type: 'callout', color: '#fff', width: 0.006, fill: null,
+  text: 'a long enough label', points: [{ x: 0.5, y: 0.5 }],
+};
+const labelBox = labelRect(editLabel, ASPECT);
+check('a label box is centred on its anchor',
+  [+(labelBox.x + labelBox.w / 2).toFixed(6), +(labelBox.y + labelBox.h / 2).toFixed(6)],
+  [0.5, 0.5]);
+check('a longer label is a wider box, and no taller',
+  [labelRect({ ...editLabel, text: 'aa' }, ASPECT).w < labelBox.w,
+   labelRect({ ...editLabel, text: 'aa' }, ASPECT).h === labelBox.h],
+  [true, true]);
+check('and a thicker stroke is a bigger label, both ways',
+  [labelRect({ ...editLabel, width: 0.012 }, ASPECT).w > labelBox.w,
+   labelRect({ ...editLabel, width: 0.012 }, ASPECT).h > labelBox.h],
+  [true, true]);
+// On screen the box has to keep its proportions, or the outline is a different shape from the
+// label it is drawn around.
+check('the box is measured on screen, not in normalized units',
+  labelBox.w * ASPECT > labelBox.h, true);
+check('a label is grabbed anywhere on its box, near end included',
+  [hitShape(editLabel, { x: labelBox.x + 0.005, y: 0.5 }, HIT_TOLERANCE, ASPECT),
+   hitShape(editLabel, { x: 0.5, y: 0.5 }, HIT_TOLERANCE, ASPECT),
+   hitShape(editLabel, { x: labelBox.x + labelBox.w - 0.005, y: 0.5 }, HIT_TOLERANCE, ASPECT)],
+  [true, true, true]);
+check('and not somewhere the label is not',
+  hitShape(editLabel, { x: 0.5, y: 0.5 + labelBox.h }, HIT_TOLERANCE, ASPECT), false);
+// The rasterizer keeps the box inside the frame; an outline that did not would be drawn
+// somewhere the label is not.
+const cornerLabel = labelRect({ ...editLabel, points: [{ x: 0, y: 0 }] }, ASPECT);
+check('a label against the edge is held inside the frame',
+  [cornerLabel.x >= 0, cornerLabel.y >= 0], [true, true]);
+check('an empty label is still a grabbable box',
+  labelRect({ ...editLabel, text: '' }, ASPECT).w > 0, true);
+check('every kind of mark has a name for the tool strip and the timeline',
+  (['arrow', 'box', 'ellipse', 'freehand', 'callout'] as AnnotationShape['type'][])
+    .every((type) => (SHAPE_LABELS[type] ?? '').length > 0), true);
+
+check('a two-point shape has a handle at each end',
+  shapeHandles(editArrow).map((h) => h.index), [0, 1]);
+check('freehand has none — it is redrawn, not reshaped', shapeHandles(editFree).length, 0);
+
+const movedArrow = moveShape(editArrow, 0.1, 0.05);
+check('moving shifts every point by the same amount',
+  movedArrow.points.map((pt) => [Number(pt.x.toFixed(4)), Number(pt.y.toFixed(4))]),
+  [[0.3, 0.25], [0.7, 0.25]]);
+// Clamping the delta, not the points: clamping each point would flatten a shape against the
+// edge instead of stopping it there.
+const shoved = moveShape(editArrow, 10, 0);
+check('a shove past the edge stops with the shape intact',
+  shoved.points[1].x - shoved.points[0].x, 0.4, 1e-9);
+check('and sits flush against it', shoved.points[1].x, 1, 1e-9);
+check('a shape with no points cannot be moved',
+  moveShape({ ...editArrow, points: [] }, 0.1, 0).points, []);
+
+const reshaped = setShapePoint(editArrow, 1, { x: 0.9, y: 0.7 });
+check('dragging one end moves it', reshaped.points[1], { x: 0.9, y: 0.7 });
+check('and leaves the other exactly where it was', reshaped.points[0], editArrow.points[0]);
+check('a handle dragged off the frame is clamped to it',
+  setShapePoint(editArrow, 1, { x: 1.4, y: -0.2 }).points[1], { x: 1, y: 0 });
+check('an index that is not a handle changes nothing',
+  setShapePoint(editArrow, 5, { x: 0.9, y: 0.7 }).points, editArrow.points);
+
+check('bounds span every mark in the clip',
+  annotationBounds([editArrow, editFree]), { x: 0.1, y: 0.2, w: 0.5, h: 0.7 });
+check('an empty clip has no bounds', annotationBounds([]), null);
+
+/*
+  Ticking "place the marks" must move nothing. Crop and frame come out equal, which is an
+  identity mapping — the checkbox changes what the frame means, not where the marks are.
+*/
+const seeded = placementForShapes([editArrow], 0.02);
+check('placement seeds the marks\u2019 box, padded',
+  [seeded?.crop.x, seeded?.crop.y, seeded?.crop.w, seeded?.crop.h].map((v) => Number(v?.toFixed(4))),
+  [0.18, 0.18, 0.44, 0.04]);
+check('and the frame is the same rectangle', seeded?.frame, seeded?.crop);
+check('and projecting through it leaves a mark exactly where it was',
+  projectNormalizedPoint({ x: 0.2, y: 0.2 }, seeded ?? undefined), { x: 0.2, y: 0.2 });
+const atEdge = placementForShapes(
+  [{ ...editArrow, points: [{ x: 0, y: 0 }, { x: 0.5, y: 0.5 }] }], 0.02)?.crop;
+check('a mark against the edge is padded only as far as the frame allows',
+  [atEdge?.x, atEdge?.y, atEdge?.w, atEdge?.h].map((v) => Number(v?.toFixed(4))),
+  [0, 0, 0.54, 0.54]);
+check('nothing drawn means no placement to seed', placementForShapes([]), null);
+
+// --- 45. placing an overlay: one affine, and its inverse ------------------------
+/*
+  `projectNormalizedPoint` is the placement rule stated for a single point — the same crop →
+  frame mapping the compositor applies to pixels. The editing overlay draws its handles
+  through it, which is what keeps a picking outline on top of the mark it belongs to instead
+  of at the coordinate the mark would have had unplaced.
+*/
+const centredHalf = {
+  crop: { x: 0, y: 0, w: 1, h: 1 },
+  frame: { x: 0.25, y: 0.25, w: 0.5, h: 0.5 },
+};
+check('the centre of the source lands at the centre of the frame',
+  projectNormalizedPoint({ x: 0.5, y: 0.5 }, centredHalf), { x: 0.5, y: 0.5 });
+check('a corner lands on the frame corner',
+  projectNormalizedPoint({ x: 0, y: 0 }, centredHalf), { x: 0.25, y: 0.25 });
+check('no transform is the identity',
+  projectNormalizedPoint({ x: 0.3, y: 0.7 }, undefined), { x: 0.3, y: 0.7 });
+
+const cropped = {
+  crop: { x: 0.25, y: 0.25, w: 0.5, h: 0.5 },
+  frame: { x: 0, y: 0, w: 1, h: 1 },
+};
+check('a crop maps its own top-left to the frame origin',
+  projectNormalizedPoint({ x: 0.25, y: 0.25 }, cropped), { x: 0, y: 0 });
+// The overlay unprojects the pointer and projects the outline; a round trip that drifted
+// would put the handles somewhere the click cannot reach.
+const roundTrip = unprojectNormalizedPoint(projectNormalizedPoint({ x: 0.4, y: 0.8 }, cropped), cropped);
+check('project and unproject are inverses', roundTrip, { x: 0.4, y: 0.8 });
+check('a zero-width crop does not divide by zero',
+  Number.isFinite(projectNormalizedPoint({ x: 0.5, y: 0.5 },
+    { crop: { x: 0, y: 0, w: 0, h: 0 }, frame: { x: 0, y: 0, w: 1, h: 1 } }).x), true);
+
+
+
+// --- 46. speed: the two relationships, and everything that solves them ---------
+/*
+  Retiming is the first edit that changes what a clip's *duration* means, and the whole of it
+  is two lines:
+
+      duration   = (out - in) / speed
+      sourceTime = in + elapsed × speed
+
+  Everything below either states one of those or solves it. They are asserted together
+  because the failure mode is not a wrong number, it is the two disagreeing: a clip whose
+  picture and sound are sampled by different rules drifts apart over its length, and the drift
+  is smallest exactly where somebody would check.
+*/
+const speedClip = (over: Record<string, unknown> = {}) =>
+  ({
+    id: 'sp', kind: 'video', trackId: 'v1', assetId: 'a1',
+    timelineStart: 10, sourceTrimIn: 4, sourceTrimOut: 12,
+    hasAudio: true, audioEnabled: true, gain: 1, hideVideo: false,
+    ...over,
+  }) as unknown as Clip;
+
+check('at its recorded rate a clip is as long as its source range',
+  durationOfClip(speedClip()), 8);
+check('twice as fast is half as long', durationOfClip(speedClip({ speed: 2 })), 4);
+check('half speed is twice as long', durationOfClip(speedClip({ speed: 0.5 })), 16);
+
+// A missing, zero or nonsense speed must read as 1 rather than as an infinitely long clip.
+check('an absent speed is 1', speedOf(undefined), 1);
+check('and so is a broken one', [speedOf(0), speedOf(NaN), speedOf(-2)], [1, 1, 1]);
+check('a stored speed outside the range is clamped',
+  [speedOf(99), speedOf(0.01)], [4, 0.25]);
+
+// The second relationship, checked at both ends of the clip: whatever the speed, the start of
+// the clip shows the in-point and the end of it arrives at the out-point.
+for (const speed of [0.5, 1, 2]) {
+  const clip = speedClip({ speed });
+  check(`at ${speed}× the clip opens on its in-point`, sourceTimeAt(clip, 10, 0), 4);
+  check(`and reaches its out-point at the end`,
+    sourceTimeAt(clip, 10 + durationOfClip(clip), 0), 12);
+}
+
+check('a range maps to the source behind it',
+  sourceRangeFor(speedClip({ speed: 2 }), 11, 12), { from: 6, to: 8 });
+check('and is clamped to the clip at both ends',
+  sourceRangeFor(speedClip({ speed: 2 }), 0, 100), { from: 4, to: 12 });
+
+/*
+  Quantization is preserved by moving the out point, not by rounding the speed. A duration of
+  8/3 seconds at 29.97 fps is not a whole number of frames, and a clip that is not a whole
+  number of frames long is what puts the preview and the export on different sides of a cut.
+*/
+for (const fps of [29.97, 25, 30]) {
+  const r = retimeToSpeed(speedClip(), 3, fps);
+  const frames = r.duration * fps;
+  check(`retiming to 3× lands on a frame at ${fps} fps`, Math.abs(frames - Math.round(frames)), 0, 1e-9);
+  check(`and the out point is derived from that duration at ${fps} fps`,
+    r.sourceTrimOut, 4 + r.duration * 3, 1e-12);
+  check(`the speed asked for is the speed kept at ${fps} fps`, r.speed, 3);
+}
+check('retiming clamps to the range', retimeToSpeed(speedClip(), 99, 30).speed, 4);
+check('and a clip never quantizes away to nothing',
+  retimeToSpeed({ sourceTrimIn: 0, sourceTrimOut: 0.001 }, 4, 30).duration >= 0.1, true);
+
+// The inverse, which is what a rate trim solves: drop the edge here, find the speed.
+check('the speed that makes a clip last 4s', speedForDuration(speedClip(), 4), 2);
+check('and 16s', speedForDuration(speedClip(), 16), 0.5);
+check('a round trip through both is the identity',
+  speedForDuration(speedClip(), durationOfClip(speedClip({ speed: 2.5 }))), 2.5, 1e-9);
+check('an impossible duration clamps rather than throwing',
+  speedForDuration(speedClip(), 0.001), 4);
+
+// Growing a clip with ripple off must stop at its neighbour: an overlap *is* a transition
+// here, so a slowed clip would otherwise silently cross-dissolve into what follows it.
+const neighbourAt = (start: number) =>
+  ({ id: 'n', kind: 'video', trackId: 'v1', assetId: 'a1',
+     timelineStart: start, sourceTrimIn: 0, sourceTrimOut: 5,
+     hasAudio: false, audioEnabled: false, gain: 1, hideVideo: false }) as unknown as Clip;
+check('room is measured to the next clip on the same track',
+  roomAfter([speedClip(), neighbourAt(22)], speedClip()), 12);
+// `Infinity` cannot be compared by tolerance — `Math.abs(Inf - Inf)` is NaN — so the claim is
+// that the room is unbounded, which is what the caller actually branches on.
+check('a clip on another track is not in the way',
+  Number.isFinite(roomAfter([speedClip(), { ...neighbourAt(22), trackId: 'v2' } as Clip], speedClip())),
+  false);
+check('nothing after it means all the room there is',
+  Number.isFinite(roomAfter([speedClip()], speedClip())), false);
+check('the slowest speed that fits that room',
+  slowestSpeedThatFits([speedClip(), neighbourAt(22)], speedClip()), 8 / 12, 1e-9);
+check('with nothing in the way it is the slowest the app allows',
+  slowestSpeedThatFits([speedClip()], speedClip()), 0.25);
+
+check('only video and audio can be retimed',
+  [canRetime(speedClip()), canRetime({ kind: 'audio' } as Clip),
+   canRetime({ kind: 'image' } as Clip), canRetime({ kind: 'text' } as Clip),
+   canRetime({ kind: 'annotation' } as Clip)],
+  [true, true, false, false, false]);
+
+/*
+  `atempo` accepts 0.5–2.0 per instance, so the ends of the range need two of them. The
+  product is what matters, and it is asserted as a product rather than as a string, because
+  the string is a detail and the arithmetic is the contract.
+*/
+const atempoProduct = (speed: number) =>
+  atempoChain(speed).reduce((acc, f) => acc * Number(f.split('=')[1]), 1);
+for (const speed of SPEED_PRESETS) {
+  if (speed === 1) continue;
+  check(`atempo reproduces ${speed}×`, atempoProduct(speed), speed, 1e-9);
+}
+check('every atempo instance is inside FFmpeg\u2019s own range',
+  SPEED_PRESETS.flatMap((s) => atempoChain(s)).every((f) => {
+    const value = Number(f.split('=')[1]);
+    return value >= 0.5 - 1e-9 && value <= 2 + 1e-9;
+  }), true);
+check('1× needs no filter at all', atempoChain(1), []);
+check('the extremes take two instances each',
+  [atempoChain(0.25).length, atempoChain(4).length], [2, 2]);
+
+// Two different operations, not two settings of one: holding the pitch is a time-stretch,
+// letting it follow is a resample.
+check('holding the pitch is atempo',
+  retimeAudioFilters(speedClip({ speed: 2 })), ['atempo=2']);
+check('letting it follow is a resample',
+  retimeAudioFilters(speedClip({ speed: 2, pitchFollowsSpeed: true })),
+  ['aresample=48000', 'asetrate=96000', 'aresample=48000', 'asetpts=N/SR/TB']);
+check('and at 1× neither happens', retimeAudioFilters(speedClip()), []);
+
+check('speeds read as speeds', [formatSpeed(2), formatSpeed(0.5), formatSpeed(1), formatSpeed(0.25)],
+  ['2×', '0.5×', '1×', '0.25×']);
+check('clamping is the same everywhere', [clampSpeed(0), clampSpeed(10)], [1, 4]);
+
+
+
+// --- 47. time-stretching: a different length, the same pitch -------------------
+/*
+  This is the assertion the shipped bug walked straight past.
+
+  Retiming the WebCodecs mixdown was a resample (which moves the pitch) plus a shift back with
+  `pitch-processor.js`. Every *length* was right, so every length-based check passed — and the
+  audio was mangled, because 2× asks that delay-line shifter for a whole octave and it is
+  built for a couple of semitones. What was never asserted was the thing the feature is for:
+  that the pitch comes out where it went in.
+
+  So the test is a sine. Zero crossings per second are twice the frequency, whatever the
+  length of the buffer — which makes them the one measure that separates a stretch from a
+  resample. A resample to 2× would report 1760 here. A stretch reports 880.
+*/
+const STRETCH_RATE = 48000;
+function sine(seconds: number, hz: number): Float32Array {
+  const data = new Float32Array(Math.round(seconds * STRETCH_RATE));
+  for (let i = 0; i < data.length; i++) data[i] = Math.sin((2 * Math.PI * hz * i) / STRETCH_RATE);
+  return data;
+}
+function crossingsPerSecond(data: Float32Array): number {
+  let crossings = 0;
+  for (let i = 1; i < data.length; i++) {
+    if ((data[i - 1] < 0 && data[i] >= 0) || (data[i - 1] >= 0 && data[i] < 0)) crossings++;
+  }
+  return (crossings * STRETCH_RATE) / data.length;
+}
+function rms(data: Float32Array): number {
+  let sum = 0;
+  for (const v of data) sum += v * v;
+  return Math.sqrt(sum / Math.max(1, data.length));
+}
+
+const tone = sine(1, 440);
+check('a 440 Hz tone reads as 880 crossings a second', crossingsPerSecond(tone), 880, 2);
+
+for (const speed of [0.5, 2, 4]) {
+  const [stretched] = timeStretch([tone], speed);
+  check(`stretching to ${speed}× gives ${speed}× less audio`,
+    stretched.length, Math.round(tone.length / speed), 2);
+  // The whole point. A resample would give 880 × speed here.
+  check(`and leaves the pitch alone at ${speed}×`, crossingsPerSecond(stretched), 880, 25);
+  check(`and roughly the same level at ${speed}×`, rms(stretched), rms(tone), 0.12);
+}
+
+check('1× is the samples themselves', timeStretch([tone], 1)[0], tone);
+check('a broken speed changes nothing', timeStretch([tone], 0)[0].length, tone.length);
+// Below one frame there is nothing to overlap, and the honest answer is what came in.
+check('audio too short to hold a frame is returned as it was',
+  timeStretch([sine(0.01, 440)], 2)[0].length, Math.round(0.01 * STRETCH_RATE));
+check('no channels, nothing to do', timeStretch([], 2), []);
+
+/*
+  Pitch shifting is the same two operations in the other order: stretch to `ratio` times the
+  length, which leaves the pitch alone, then read that back at `ratio` samples per sample,
+  which restores the duration and multiplies every frequency by `ratio`.
+
+  The assertion that matters is the pair — *both* the new frequency and the unchanged length.
+  Checking only the frequency would pass for a plain resample, which is the wrong thing; only
+  the length would pass for doing nothing at all.
+*/
+for (const semitones of [2, -2, 7, 12, -12]) {
+  const shifted = pitchShift([tone], semitones)[0];
+  const want = 880 * semitonesToRatio(semitones);
+  check(`shifting ${semitones} semitones multiplies the frequency`,
+    crossingsPerSecond(shifted), want, want * 0.02);
+  check(`and leaves the length alone at ${semitones}`, shifted.length, tone.length, 2);
+}
+check('0 semitones is the samples themselves', pitchShift([tone], 0)[0], tone);
+// A resample is the thing a pitch shift must *not* be: it moves both at once.
+const halved = resampleByRate([tone], 2)[0];
+check('a resample halves the samples', halved.length, tone.length / 2);
+check('and doubles the frequency with them', crossingsPerSecond(halved), 1760, 4);
+check('and rate 1 changes nothing', resampleByRate([tone], 1)[0], tone);
+
+// Both channels must be stretched by the same decision, or a stereo pair walks apart.
+const stereo = timeStretch([sine(1, 440), sine(1, 440)], 2);
+check('a stereo pair stays a pair', [stereo.length, stereo[0].length], [2, stereo[1].length]);
+// One decision per frame, applied to every channel: correlate on channel 0 and slide them
+// together. Sliding each channel to its own best offset would walk a stereo image apart.
+check('and stays in phase', Array.from(stereo[0].slice(20000, 20004)),
+  Array.from(stereo[1].slice(20000, 20004)));
+
+
+
+// --- 48. a mark that moves ------------------------------------------------------
+/*
+  An arrow that points at something moving has to move with it. The clip's placement cannot do
+  that — it moves every mark together — so a mark carries its own poses, in clip-local seconds
+  like every other keyframe in the document.
+
+  The rule that matters most here is the one about *holding*: a single key means "this mark is
+  here for the whole clip", not "start from nothing and arrive". Anything else makes the first
+  key you record change the clip everywhere except at the playhead.
+*/
+const posed = (keys: { t: number; points: { x: number; y: number }[] }[] | undefined) =>
+  ({ id: 'm1', type: 'arrow', color: '#f00', width: 0.006, fill: null,
+     points: [{ x: 0, y: 0 }, { x: 0.2, y: 0 }], pointKeys: keys }) as unknown as AnnotationShape;
+
+const twoPoses = posed([
+  { t: 0, points: [{ x: 0, y: 0 }, { x: 0.2, y: 0 }] },
+  { t: 2, points: [{ x: 0.4, y: 0.4 }, { x: 0.6, y: 0.4 }] },
+]);
+
+check('a mark with no poses stays where it is',
+  shapePointsAt(posed(undefined), 5), [{ x: 0, y: 0 }, { x: 0.2, y: 0 }]);
+check('halfway between two poses is halfway between them',
+  shapePointsAt(twoPoses, 1), [{ x: 0.2, y: 0.2 }, { x: 0.4, y: 0.2 }]);
+check('before the first pose it holds', shapePointsAt(twoPoses, -3), twoPoses.pointKeys![0].points);
+check('and after the last one it holds', shapePointsAt(twoPoses, 99), twoPoses.pointKeys![1].points);
+// One key is a placement, not the start of a move.
+check('a single pose applies for the whole clip',
+  [shapePointsAt(posed([{ t: 1, points: [{ x: 0.5, y: 0.5 }] }]), 0),
+   shapePointsAt(posed([{ t: 1, points: [{ x: 0.5, y: 0.5 }] }]), 9)],
+  [[{ x: 0.5, y: 0.5 }], [{ x: 0.5, y: 0.5 }]]);
+// A freehand path redrawn between two keys has a different number of points at each end.
+check('poses of different lengths hold rather than blending into nonsense',
+  shapePointsAt(posed([
+    { t: 0, points: [{ x: 0, y: 0 }, { x: 0.2, y: 0 }] },
+    { t: 2, points: [{ x: 0.4, y: 0.4 }] },
+  ]), 1),
+  [{ x: 0, y: 0 }, { x: 0.2, y: 0 }]);
+check('keys out of order are read in order',
+  shapePointsAt(posed([
+    { t: 2, points: [{ x: 1, y: 1 }] },
+    { t: 0, points: [{ x: 0, y: 0 }] },
+  ]), 1), [{ x: 0.5, y: 0.5 }]);
+
+check('upsert adds a pose', upsertShapeKey(undefined, 1, [{ x: 0.5, y: 0.5 }]).length, 1);
+check('and replaces the one already at that moment',
+  upsertShapeKey([{ t: 1, points: [{ x: 0, y: 0 }] }], 1, [{ x: 0.9, y: 0.9 }]),
+  [{ t: 1, points: [{ x: 0.9, y: 0.9 }] }]);
+check('removing the last pose leaves the mark static again',
+  removeShapeKeyAt([{ t: 1, points: [{ x: 0, y: 0 }] }], 1), undefined);
+
+// Clip-local, so the poses travel with the clip when it is moved along the timeline.
+const movingClip = {
+  id: 'anno', kind: 'annotation', trackId: 'v1', timelineStart: 10,
+  sourceTrimIn: 0, sourceTrimOut: 4, shapes: [twoPoses],
+} as unknown as AnnotationClip;
+check('a clip that starts at 10s reads its poses from 10s',
+  annotationShapesAt(movingClip, 11)[0].points, [{ x: 0.2, y: 0.2 }, { x: 0.4, y: 0.2 }]);
+check('the clip knows whether anything in it moves',
+  [hasShapeAnimation(movingClip), hasShapeAnimation({ shapes: [posed(undefined)] })],
+  [true, false]);
+/*
+  Identity, not equality. The compositor caches its raster against `JSON.stringify(shapes)`,
+  so handing back an equal-but-new array for a clip where nothing moves would redraw and
+  re-upload a full-frame RGBA texture thirty times a second.
+*/
+const staticClip = { ...movingClip, shapes: [posed(undefined)] } as AnnotationClip;
+check('a clip with nothing moving hands back its own array',
+  annotationShapesAt(staticClip, 11) === staticClip.shapes, true);
+
+/*
+  A mark that follows something is picked where it is *drawn*, which for any moment but its
+  base pose is not where it is stored. The overlay hit-tested `clip.shapes` while the
+  compositor drew `annotationShapesAt`, so a mark that had been made to travel could only be
+  selected by clicking the place it used to be — invisible, and reported as "it is not possible
+  to select and move the object".
+*/
+const travellingLabel: AnnotationShape = {
+  id: 'tl', type: 'callout', color: '#fff', width: 0.006, fill: null, text: 'Note',
+  points: [{ x: 0.2, y: 0.2 }, { x: 0.2, y: 0.2 }],
+  pointKeys: [
+    { t: 0, points: [{ x: 0.2, y: 0.2 }, { x: 0.2, y: 0.2 }] },
+    { t: 4, points: [{ x: 0.8, y: 0.8 }, { x: 0.8, y: 0.8 }] },
+  ],
+};
+const travelClip = {
+  id: 'tc', kind: 'annotation', trackId: 'tt', timelineStart: 0,
+  sourceTrimIn: 0, sourceTrimOut: 4, shapes: [travellingLabel],
+} as unknown as AnnotationClip;
+const midway = annotationShapesAt(travelClip, 2);
+check('a travelling mark is halfway across at halfway through',
+  midway[0].points[0], { x: 0.5, y: 0.5 });
+check('and clicking where it is drawn picks it',
+  pickShape(midway, { x: 0.5, y: 0.5 }, HIT_TOLERANCE, ASPECT), 'tl');
+check('while clicking there picks nothing among the stored points — the bug',
+  pickShape(travelClip.shapes, { x: 0.5, y: 0.5 }, HIT_TOLERANCE, ASPECT), null);
+check('at its base pose the two agree, which is why this hid',
+  [pickShape(midway, { x: 0.2, y: 0.2 }, HIT_TOLERANCE, ASPECT),
+   pickShape(annotationShapesAt(travelClip, 0), { x: 0.2, y: 0.2 }, HIT_TOLERANCE, ASPECT)],
+  [null, 'tl']);
+
+/*
+  An aspect change puts every pose through the one content map, so a mark that travels across
+  the picture arrives at the same landmark at every moment and the path is translated rigidly.
+  Refitting each pose against its own bounding box — which is what this did — re-anchored every
+  moment separately and could pull the far end of a journey back towards where it started.
+*/
+const refitPoses = refitAnnotationShapes([twoPoses], annoWide, annoTall)[0];
+check('every pose is refitted, not just the base one',
+  refitPoses.pointKeys!.map((k) => k.points.length), [2, 2]);
+const travelBefore = twoPoses.pointKeys![1].points[0].x - twoPoses.pointKeys![0].points[0].x;
+const travelAfter = refitPoses.pointKeys![1].points[0].x - refitPoses.pointKeys![0].points[0].x;
+check('and the journey is scaled by the picture, not re-anchored pose by pose',
+  travelAfter, travelBefore * fittedContentBox(annoWide, annoTall).w, 1e-9);
+
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

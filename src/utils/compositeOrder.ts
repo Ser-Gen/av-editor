@@ -1,4 +1,5 @@
 import type { AdjustmentClip, Clip, Track, VisualClip } from '../types/editor';
+import { MAX_CLIP_GAIN, MAX_TRACK_VOLUME } from './trackVolume';
 
 /**
  * Single source of truth for layering, shared by the canvas preview and the FFmpeg
@@ -6,8 +7,21 @@ import type { AdjustmentClip, Clip, Track, VisualClip } from '../types/editor';
  * composite bottom-up, so the topmost track is drawn last and wins.
  */
 
+/**
+ * Every clip kind that draws something.
+ *
+ * This is the list that decides what the preview, the WebCodecs export and the FFmpeg
+ * fallback all iterate over, so a drawing clip kind missing from it is invisible in all
+ * three at once — with no error anywhere, because a type predicate is not checked for
+ * exhaustiveness. Adding a visual clip kind means adding it here, first.
+ */
 export function isVisualClip(clip: Clip): clip is VisualClip {
-  return clip.kind === 'video' || clip.kind === 'image' || clip.kind === 'text';
+  return (
+    clip.kind === 'video' ||
+    clip.kind === 'image' ||
+    clip.kind === 'text' ||
+    clip.kind === 'annotation'
+  );
 }
 
 export function videoTracks(tracks: Track[]): Track[] {
@@ -105,19 +119,29 @@ export function audibleClips(
     if (clip.kind === 'audio') {
       if (!audible.has(clip.trackId)) continue;
       const track = trackById.get(clip.trackId);
-      out.push({ clip, gain: clamp(clip.gain) * clamp(track?.volume ?? 1) });
+      out.push({ clip, gain: clampClip(clip.gain) * clampTrack(track?.volume ?? 1) });
       continue;
     }
     if (clip.kind === 'video') {
       // Video-clip audio lives on a video track, so no track volume applies —
       // but an active audio solo silences it.
       if (!clip.hasAudio || !clip.audioEnabled || soloActive) continue;
-      out.push({ clip, gain: clamp(clip.gain) });
+      out.push({ clip, gain: clampClip(clip.gain) });
     }
   }
   return out;
 }
 
-function clamp(v: number): number {
-  return Math.min(1.5, Math.max(0, Number.isFinite(v) ? v : 1));
+/*
+ * Two ceilings, because they answer different questions. A clip's gain is where levelling
+ * happens and reaches +12 dB, which is what normalizing a quiet take needs; a track fader is a
+ * balance control over already-levelled material and stays at +3.5 dB. Sharing one number is
+ * what made Normalize write a gain nothing would play.
+ */
+function clampClip(v: number): number {
+  return Math.min(MAX_CLIP_GAIN, Math.max(0, Number.isFinite(v) ? v : 1));
+}
+
+function clampTrack(v: number): number {
+  return Math.min(MAX_TRACK_VOLUME, Math.max(0, Number.isFinite(v) ? v : 1));
 }

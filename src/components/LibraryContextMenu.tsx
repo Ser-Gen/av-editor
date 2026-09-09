@@ -4,6 +4,7 @@ import { useEditorStore } from '../store/editorStore';
 import { isAssetInUse } from '../store/clipFactory';
 import { clampMenuPosition } from '../utils/clipMenu';
 import { libraryMenuItems } from '../utils/libraryMenu';
+import { downloadFile, safeFileName } from '../utils/downloadFile';
 import type { LibraryMenuId } from '../utils/libraryMenu';
 
 export interface LibraryMenuRequest {
@@ -90,6 +91,9 @@ export function LibraryContextMenu({ request, onClose, onInfo, onPreset, onRelin
         break;
       case 'add':
         store.addAssetToTimeline(asset.id);
+        break;
+      case 'download':
+        if (asset.file) downloadFile(asset.file, safeFileName(asset.name));
         break;
       case 'preset':
         onPreset(asset.id);

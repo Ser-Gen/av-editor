@@ -2,6 +2,7 @@ import type { MediaAsset } from '../types/editor';
 import { useEditorStore } from '../store/editorStore';
 import { collectAssetMemPaths } from './assetPaths';
 import { buildExportPlan, buildFfmpegInputArgs } from './buildFilterGraph';
+import { rasterizeOverlays } from './overlayPng';
 import { clearExportLogs, formatExportError, logExportError } from './exportLog';
 import { fetchFile, loadFfmpeg } from './ffmpegLoader';
 import { fileHasAudioStream } from './probeStreams';
@@ -15,7 +16,6 @@ import type { ResolvedAudioExport } from '../utils/audioExport';
 import { ffmpegMetadataArgs, wavMetadataFormat } from '../utils/audioMetadata';
 import { buildMetadataTags } from './metadataTags';
 import { sameAspect } from '../utils/resolution';
-import { publicUrl } from '../utils/publicUrl';
 
 let activeExport: AbortController | null = null;
 
@@ -257,12 +257,26 @@ async function runFfmpegExport(signal: AbortSignal): Promise<void> {
 
   // The fallback renders at the export's size and rate, not the project's, so the two engines
   // produce the same file from the same settings.
-  const plan = buildExportPlan({
-    clips,
-    mediaLibrary: assetsForExport,
-    settings: { width: spec.width, height: spec.height, fps: spec.fps },
-    tracks: store.tracks,
-  });
+  // Text and annotation are drawn by the same code the preview uses and handed to FFmpeg as
+  // PNGs. This is what retired `drawtext`: the fallback overlays the picture rather than
+  // rebuilding it out of filter arguments.
+  const overlays = await rasterizeOverlays(clips, spec.width, spec.height);
+
+  const plan = buildExportPlan(
+    {
+      clips,
+      mediaLibrary: assetsForExport,
+      settings: { width: spec.width, height: spec.height, fps: spec.fps },
+      tracks: store.tracks,
+    },
+    overlays,
+  );
+
+  for (const input of plan.inputSpecs) {
+    if (!input.bytes) continue;
+    signal.throwIfAborted();
+    await ffmpeg.writeFile(input.path, input.bytes);
+  }
 
   if (plan.warnings.length > 0) {
     // Prepended, so a "falling back to FFmpeg" notice stays visible alongside it.
@@ -286,12 +300,6 @@ async function runFfmpegExport(signal: AbortSignal): Promise<void> {
   console.log('Video out:', plan.videoOut, 'Audio out:', plan.audioOut);
   console.log('Inputs:', plan.inputSpecs);
   console.log('Filter complex:', plan.filterComplex);
-
-  const fontRes = await fetch(publicUrl('fonts/DejaVuSans.ttf'));
-  if (!fontRes.ok) {
-    throw new Error(`Font not found (${fontRes.status}). Run npm run bootstrap.`);
-  }
-  await ffmpeg.writeFile('font.ttf', new Uint8Array(await fontRes.arrayBuffer()));
 
   const args = [
     ...buildFfmpegInputArgs(plan),

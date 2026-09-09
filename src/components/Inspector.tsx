@@ -1,13 +1,27 @@
 import { useEffect, useState } from 'react';
 import { useEditorStore } from '../store/editorStore';
-import { clipDuration, formatTimecode } from '../utils/time';
-import type { OverlayTransform, TextTemplate, TransitionType } from '../types/editor';
+import { AudioSection } from './AudioSection';
+import { TextStyleSection } from './TextStyleSection';
+import { SPEED_MAX, SPEED_MIN, clipDuration, formatTimecode } from '../utils/time';
+import { SPEED_PRESETS, canRetime, formatSpeed } from '../utils/retime';
+import type { OverlayTransform, TransitionType } from '../types/editor';
 import {
   DEFAULT_OVERLAY_TRANSFORM,
   normalizeOverlayTransform,
   textFrameForClip,
 } from '../utils/overlayTransform';
-import { TRANSFORM_CHANNELS, maxFade, sourceTimeAt, transformAt } from '../utils/clipRender';
+import {
+  TRANSFORM_CHANNELS,
+  acceptsTransform,
+  clipSpeedOf,
+  maxFade,
+  sourceTimeAt,
+  transformAt,
+} from '../utils/clipRender';
+import { placementForShapes } from '../utils/annotationEdit';
+import { MAX_CLIP_GAIN } from '../utils/trackVolume';
+import { DEFAULT_LOUDNESS_TARGET } from '../utils/loudness';
+import { sortedKeys } from '../utils/annotationAnim';
 import { TRANSITION_LABELS, incomingTransition } from '../utils/transitions';
 import { EffectStack } from './EffectStack';
 import { ProcessDialog } from './ProcessDialog';
@@ -37,12 +51,23 @@ export function Inspector({ width }: { width: number }) {
   const updateClipTransform = useEditorStore((s) => s.updateClipTransform);
   const updateTextClip = useEditorStore((s) => s.updateTextClip);
   const setClipGain = useEditorStore((s) => s.setClipGain);
+  const normalizeSelected = useEditorStore((s) => s.normalizeSelected);
+  const loudnessJob = useEditorStore((s) => s.loudnessJob);
   const setClipFade = useEditorStore((s) => s.setClipFade);
   const detachAudio = useEditorStore((s) => s.detachAudio);
   const toggleChannelArmed = useEditorStore((s) => s.toggleChannelArmed);
   const playhead = useEditorStore((s) => s.playhead);
   const setTransitionType = useEditorStore((s) => s.setTransitionType);
   const processJob = useEditorStore((s) => s.processJob);
+  const removeAnnotationShape = useEditorStore((s) => s.removeAnnotationShape);
+  const clearAnnotationShapeKeys = useEditorStore((s) => s.clearAnnotationShapeKeys);
+  const removeAnnotationShapeKey = useEditorStore((s) => s.removeAnnotationShapeKey);
+  const setPlayhead = useEditorStore((s) => s.setPlayhead);
+  const setClipSpeed = useEditorStore((s) => s.setClipSpeed);
+  const setClipPitchFollows = useEditorStore((s) => s.setClipPitchFollows);
+  const updateAnnotationShape = useEditorStore((s) => s.updateAnnotationShape);
+  const selectedShapeId = useEditorStore((s) => s.selectedShapeId);
+  const selectShape = useEditorStore((s) => s.selectShape);
   const [processOpen, setProcessOpen] = useState(false);
   const [bakeOpen, setBakeOpen] = useState(false);
   const [wantedTab, setWantedTab] = useState<InspectorTab>(
@@ -56,6 +81,18 @@ export function Inspector({ width }: { width: number }) {
   }, [wantedTab]);
 
   if (selectedClipIds.length > 1) {
+    /*
+     * Multi-selection used to be a dead end: a count and a sentence about dragging. But
+     * *matching* loudness is a multi-clip operation by definition — one clip has nothing to
+     * match — and the only button for it lived in the single-clip Audio section, where a
+     * selection of three could never reach it. Anything that means something for a set of
+     * clips belongs here; anything that needs one clip stays where it was.
+     */
+    const audible = clips.filter(
+      (c) =>
+        selectedClipIds.includes(c.id) &&
+        (c.kind === 'audio' || (c.kind === 'video' && c.hasAudio && c.audioEnabled)),
+    );
     return (
       <aside className="inspector" style={{ width }}>
         <h3>Inspector</h3>
@@ -63,6 +100,26 @@ export function Inspector({ width }: { width: number }) {
         <p className="hint">
           Drag to move them together, ⌫ to delete, ⇧⌫ to ripple delete, arrows to nudge.
         </p>
+        {audible.length > 1 && (
+          <section className="inspector-section">
+            <label>Loudness</label>
+            <p className="hint">
+              {audible.length} of them carry sound. Matching measures each one and sets its gain
+              so they all land on {DEFAULT_LOUDNESS_TARGET} LUFS — a quiet take and a loud one
+              sit at the same level across the cut. Only the gain changes; nothing is
+              re-encoded.
+            </p>
+            <div className="inspector-row">
+              <button
+                type="button"
+                disabled={loudnessJob !== null}
+                onClick={() => void normalizeSelected(DEFAULT_LOUDNESS_TARGET)}
+              >
+                {loudnessJob !== null ? 'Measuring…' : `Match ${audible.length} clips`}
+              </button>
+            </div>
+          </section>
+        )}
       </aside>
     );
   }
@@ -79,21 +136,26 @@ export function Inspector({ width }: { width: number }) {
   }
 
   const track = tracks.find((t) => t.id === clip.trackId);
+  const selectedShape =
+    clip.kind === 'annotation' ? clip.shapes.find((sh) => sh.id === selectedShapeId) : undefined;
   const transition = incomingTransition(clip, clips);
   const asset = 'assetId' in clip ? mediaLibrary[clip.assetId] : undefined;
   const duration = clipDuration(clip);
-  const hasTransform = (clip.kind === 'video' || clip.kind === 'image') && !!clip.transform;
+  const speed = clipSpeedOf(clip);
+  // The same question the store's writer asks, asked once here: a tab that offers a
+  // placement the store will not store is worse than no tab.
+  const placeable = acceptsTransform(clip);
+  const hasTransform = placeable && !!clip.transform;
   const placementAnimated = TRANSFORM_CHANNELS.some(
     (ch) => (clip.transformKeyframes?.[ch]?.length ?? 0) > 0,
   );
   // With placement animated the editor shows the rectangle at the playhead, so dragging
   // it edits the pose you are actually looking at.
-  const editedTransform =
-    clip.kind === 'video' || clip.kind === 'image' ? transformAt(clip, playhead) : undefined;
+  const editedTransform = placeable ? transformAt(clip, playhead) : undefined;
 
   // A tab is offered only when this clip has something to put in it. An audio clip has no
   // placement and no effect chain, so it gets no tab strip at all rather than two dead ends.
-  const canPlace = clip.kind === 'video' || clip.kind === 'image' || clip.kind === 'text';
+  const canPlace = placeable || clip.kind === 'text';
   const canEffect = clip.kind !== 'audio' || track?.kind === 'video';
   const available: InspectorTab[] = [
     'clip',
@@ -133,6 +195,8 @@ export function Inspector({ width }: { width: number }) {
       </dl>
 
       {tab === 'placement' && (clip.kind === 'video' || clip.kind === 'image') && (
+        /* Media only: the editor below shows the source under the rectangle, and an
+           annotation has no source to show — its section is the next one. */
         <section className="inspector-section">
           <label>Placement</label>
           <label className="checkbox">
@@ -184,6 +248,70 @@ export function Inspector({ width }: { width: number }) {
               sourceTime={sourceTimeAt(clip, playhead, 1 / 60)}
               onChange={(transform: OverlayTransform) => updateClipTransform(clip.id, transform)}
             />
+          )}
+        </section>
+      )}
+
+      {tab === 'placement' && clip.kind === 'annotation' && (
+        <section className="inspector-section">
+          <label>Placement</label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={hasTransform}
+              onChange={(e) =>
+                updateClipTransform(
+                  clip.id,
+                  e.target.checked
+                    ? normalizeOverlayTransform(
+                        // The marks' own box, as both crop and frame: an identity mapping, so
+                        // ticking this moves nothing and what changes is what the frame means.
+                        placementForShapes(clip.shapes) ?? DEFAULT_OVERLAY_TRANSFORM,
+                      )
+                    : undefined,
+                )
+              }
+            />
+            Place the marks in a frame
+          </label>
+          <p className="hint">
+            {hasTransform
+              ? 'Drag the marks on the preview with the Select tool to move them together. They scale with the frame, so the strokes stay in proportion.'
+              : 'Filling the frame. Turn this on to move or scale the whole set of marks — and to animate them.'}
+          </p>
+          {hasTransform && clip.transform && (
+            <>
+              <label className="checkbox">
+                <button
+                  type="button"
+                  className={`stopwatch${placementAnimated ? ' is-armed' : ''}`}
+                  title="Animate placement: moving the frame writes a keyframe at the playhead"
+                  onClick={() => {
+                    for (const channel of TRANSFORM_CHANNELS) {
+                      toggleChannelArmed(clip.id, { effectId: null, param: channel });
+                    }
+                  }}
+                >
+                  ⏱
+                </button>
+                Animate placement
+              </label>
+              <FrameFields
+                frame={normalizeOverlayTransform(editedTransform ?? clip.transform).frame}
+                onChange={(frame) =>
+                  updateClipTransform(clip.id, {
+                    ...normalizeOverlayTransform(editedTransform ?? clip.transform),
+                    frame,
+                  })
+                }
+              />
+              {placementAnimated && (
+                <p className="hint">
+                  Armed: every change here writes the whole rectangle as keys at the playhead.
+                  The FFmpeg fallback freezes the animation at the clip's midpoint and says so.
+                </p>
+              )}
+            </>
           )}
         </section>
       )}
@@ -283,7 +411,7 @@ export function Inspector({ width }: { width: number }) {
                 <input
                   type="range"
                   min={0}
-                  max={150}
+                  max={MAX_CLIP_GAIN * 100}
                   value={Math.round(clip.gain * 100)}
                   disabled={!clip.audioEnabled}
                   onChange={(e) => setClipGain(clip.id, Number(e.target.value) / 100)}
@@ -363,7 +491,7 @@ export function Inspector({ width }: { width: number }) {
             <input
               type="range"
               min={0}
-              max={150}
+              max={MAX_CLIP_GAIN * 100}
               value={Math.round(clip.gain * 100)}
               onChange={(e) => setClipGain(clip.id, Number(e.target.value) / 100)}
             />
@@ -371,6 +499,70 @@ export function Inspector({ width }: { width: number }) {
           </div>
           <p className="hint">Multiplied by the {track?.label} track volume.</p>
         </section>
+      )}
+
+      {tab === 'clip' && canRetime(clip) && (
+        <section className="inspector-section">
+          <label>Speed</label>
+          <div className="speed-presets">
+            {SPEED_PRESETS.map((preset) => (
+              <button
+                key={preset}
+                type="button"
+                className={Math.abs(speed - preset) < 1e-6 ? 'is-active' : ''}
+                disabled={!!track?.locked}
+                onClick={() => setClipSpeed(clip.id, preset)}
+              >
+                {formatSpeed(preset)}
+              </button>
+            ))}
+          </div>
+          <div className="slider-row">
+            <span className="effect-param-label">Rate</span>
+            <input
+              type="range"
+              min={SPEED_MIN}
+              max={SPEED_MAX}
+              step={0.05}
+              value={speed}
+              disabled={!!track?.locked}
+              onChange={(e) => setClipSpeed(clip.id, Number(e.target.value))}
+            />
+            <span>{formatSpeed(speed)}</span>
+          </div>
+          <p className="hint">
+            {speed === 1
+              ? 'Playing at its recorded rate.'
+              : `${formatTimecode(duration, fps)} on the timeline, from ${formatTimecode(
+                  clip.sourceTrimOut - clip.sourceTrimIn,
+                  fps,
+                )} of source.`}
+          </p>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={!!clip.pitchFollowsSpeed}
+              disabled={!!track?.locked}
+              onChange={(e) => setClipPitchFollows(clip.id, e.target.checked)}
+            />
+            Pitch follows the speed
+          </label>
+          <p className="hint">
+            {clip.pitchFollowsSpeed
+              ? 'Like a tape: faster is higher. Both exports reproduce it exactly.'
+              : 'Held, so speech still sounds like speech. Each engine holds it its own way — the browser stretches the preview, the WebCodecs export overlap-adds, FFmpeg uses atempo — so sustained music can differ slightly between them.'}
+          </p>
+          {track?.locked && <p className="hint">The {track.label} track is locked.</p>}
+          <p className="hint">
+            ⌥-drag a trim handle to retime by dragging: the frames are kept and the clip takes
+            longer or less time to play them.
+          </p>
+        </section>
+      )}
+
+      {tab === 'clip' && clip.kind === 'audio' && <AudioSection clip={clip} />}
+      {tab === 'clip' && clip.kind === 'video' && clip.hasAudio && clip.audioEnabled && (
+        <AudioSection clip={clip} />
       )}
 
       {tab === 'clip' && clip.kind === 'text' && (
@@ -381,15 +573,165 @@ export function Inspector({ width }: { width: number }) {
             value={clip.text}
             onChange={(e) => updateTextClip(clip.id, e.target.value, clip.template)}
           />
-          <label>Template</label>
-          <select
-            value={clip.template}
-            onChange={(e) => updateTextClip(clip.id, clip.text, e.target.value as TextTemplate)}
-          >
-            <option value="lowerThird">Lower third</option>
-            <option value="centerTitle">Center title</option>
-            <option value="subtitle">Subtitle</option>
-          </select>
+          {clip.textObjectId && (
+            <p className="hint">
+              From the library. Editing it changes every clip that uses it — duplicate it in the
+              library first if you want this one to go its own way.
+            </p>
+          )}
+        </section>
+      )}
+
+      {tab === 'clip' && clip.kind === 'text' && <TextStyleSection clip={clip} />}
+
+      {tab === 'clip' && clip.kind === 'annotation' && (
+        <section className="inspector-section">
+          <label>Annotation</label>
+          <p className="hint">
+            {clip.shapes.length === 0
+              ? 'Pick a tool above the preview and drag on the picture.'
+              : `${clip.shapes.length} mark${clip.shapes.length === 1 ? '' : 's'}. Click one here or with the Select tool to edit it.`}
+          </p>
+          <ul className="annotation-list">
+            {clip.shapes.map((shape) => (
+              <li
+                key={shape.id}
+                className={shape.id === selectedShapeId ? 'is-selected' : ''}
+                onClick={() =>
+                  selectShape(shape.id === selectedShapeId ? null : shape.id)
+                }
+              >
+                <span className="annotation-swatch" style={{ background: shape.color }} />
+                <span>{shape.type === 'callout' ? shape.text || 'callout' : shape.type}</span>
+                <div className="spacer" />
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    removeAnnotationShape(clip.id, shape.id);
+                  }}
+                >
+                  ×
+                </button>
+              </li>
+            ))}
+          </ul>
+          {/*
+            The selected mark's own properties. They live here as well as on the tool strip
+            because the strip is a drawing control that happens to restyle, and this is where
+            every other clip property is.
+          */}
+          {selectedShape && (
+            <div className="annotation-shape-editor">
+              <label>Selected mark</label>
+              {selectedShape.type === 'callout' && (
+                <>
+                  <label className="field-label">Label</label>
+                  <input
+                    type="text"
+                    value={selectedShape.text ?? ''}
+                    placeholder="Note"
+                    onChange={(e) =>
+                      updateAnnotationShape(clip.id, selectedShape.id, { text: e.target.value })
+                    }
+                  />
+                </>
+              )}
+              <div className="inspector-row">
+                <input
+                  type="color"
+                  value={selectedShape.color}
+                  onChange={(e) =>
+                    updateAnnotationShape(clip.id, selectedShape.id, { color: e.target.value })
+                  }
+                />
+                <span className="hint">Colour</span>
+              </div>
+              <div className="slider-row">
+                <span className="effect-param-label">Width</span>
+                <input
+                  type="range"
+                  min={2}
+                  max={20}
+                  value={Math.round(selectedShape.width * 1000)}
+                  onChange={(e) =>
+                    updateAnnotationShape(clip.id, selectedShape.id, {
+                      width: Number(e.target.value) / 1000,
+                    })
+                  }
+                />
+                <span>{Math.round(selectedShape.width * 1000)}</span>
+              </div>
+              {(selectedShape.type === 'box' || selectedShape.type === 'ellipse') && (
+                <label className="checkbox">
+                  <input
+                    type="checkbox"
+                    checked={!!selectedShape.fill}
+                    onChange={(e) =>
+                      updateAnnotationShape(clip.id, selectedShape.id, {
+                        fill: e.target.checked ? 'rgba(0,0,0,0.35)' : null,
+                      })
+                    }
+                  />
+                  Shade the inside
+                </label>
+              )}
+              {sortedKeys(selectedShape.pointKeys).length > 0 ? (
+                <>
+                  <label className="field-label">Poses</label>
+                  {/*
+                    Listed rather than counted. Where a mark's poses are is the one thing you
+                    need to know to add another in the right place, and it was invisible.
+                  */}
+                  <div className="shape-poses">
+                    {sortedKeys(selectedShape.pointKeys).map((key) => {
+                      const at = clip.timelineStart + key.t;
+                      const here = Math.abs(playhead - at) < 1 / fps / 2;
+                      return (
+                        <span key={key.t} className="shape-pose">
+                          <button
+                            type="button"
+                            className={here ? 'is-active' : ''}
+                            title="Go to this pose"
+                            onClick={() => setPlayhead(at)}
+                          >
+                            {formatTimecode(key.t, fps)}
+                          </button>
+                          <button
+                            type="button"
+                            className="shape-pose-remove"
+                            title="Delete this pose. The mark travels between the ones that are left; delete all but one and it stops moving"
+                            onClick={() =>
+                              removeAnnotationShapeKey(clip.id, selectedShape.id, key.t)
+                            }
+                          >
+                            ×
+                          </button>
+                        </span>
+                      );
+                    })}
+                  </div>
+                  <p className="hint">
+                    Move the playhead and drag the mark to add another; drag a pose along the
+                    clip on the timeline to change when it happens. The FFmpeg engine freezes
+                    the movement at the clip's midpoint and says so.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => clearAnnotationShapeKeys(clip.id, selectedShape.id)}
+                  >
+                    Stop it moving
+                  </button>
+                </>
+              ) : (
+                <p className="hint">
+                  Press ⏱ above the preview to make this mark move. That records where it is
+                  now; move the playhead, drag it, and it travels between the two.
+                </p>
+              )}
+              <p className="hint">Delete removes it. Drag its ends on the preview to reshape it.</p>
+            </div>
+          )}
         </section>
       )}
 
@@ -400,11 +742,52 @@ export function Inspector({ width }: { width: number }) {
           <TextPlacementEditor
             text={clip.text}
             template={clip.template}
+            style={clip.style}
             textFrame={textFrameForClip(clip.textFrame)}
             onChange={(textFrame) => updateTextClip(clip.id, clip.text, clip.template, textFrame)}
           />
         </section>
       )}
     </aside>
+  );
+}
+
+/**
+ * A frame as four numbers, for the clips that have no picture to drag.
+ *
+ * The media placement editor shows the source under the rectangle; an annotation has nothing
+ * to show, so its frame is typed rather than dragged here — the dragging happens on the
+ * preview, over the marks themselves.
+ */
+function FrameFields({
+  frame,
+  onChange,
+}: {
+  frame: { x: number; y: number; w: number; h: number };
+  onChange: (frame: { x: number; y: number; w: number; h: number }) => void;
+}) {
+  const rows: { key: 'x' | 'y' | 'w' | 'h'; label: string; min: number }[] = [
+    { key: 'x', label: 'Left', min: -0.5 },
+    { key: 'y', label: 'Top', min: -0.5 },
+    { key: 'w', label: 'Width', min: 0.05 },
+    { key: 'h', label: 'Height', min: 0.05 },
+  ];
+  return (
+    <>
+      {rows.map((row) => (
+        <div className="slider-row" key={row.key}>
+          <span className="effect-param-label">{row.label}</span>
+          <input
+            type="range"
+            min={row.min}
+            max={1.5}
+            step={0.005}
+            value={frame[row.key]}
+            onChange={(e) => onChange({ ...frame, [row.key]: Number(e.target.value) })}
+          />
+          <span>{Math.round(frame[row.key] * 100)}%</span>
+        </div>
+      ))}
+    </>
   );
 }

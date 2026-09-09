@@ -11,6 +11,7 @@ import {
   scaledSize,
 } from '../capture/sources';
 import type { CaptureController } from '../capture/useCaptureSession';
+import { RecordingControl } from './RecordingControl';
 import type { SourceStatus } from '../capture/CaptureSession';
 import {
   AUDIO_BITRATE_DEFAULT,
@@ -23,7 +24,6 @@ import {
   isQualityPreset,
   qualityLabel,
 } from '../capture/bitrate';
-import { formatDuration } from '../utils/time';
 import { useEditorStore } from '../store/editorStore';
 import { useStorageBudget } from '../hooks/useStorageBudget';
 import {
@@ -43,19 +43,6 @@ import type { CaptureBitrate } from '../capture/bitrate';
  * 30 while still calling itself 60. So the delivered rate is shown beside the negotiated
  * one, and the two diverging is the readout doing its job, not a bug in the counter.
  */
-function VideoReadout({ source }: { source: SourceStatus }) {
-  if (!source.format) return null;
-  const delivered = source.deliveredFps;
-  const negotiated = source.format.frameRate;
-  const starved = delivered > 0 && negotiated > 0 && delivered < negotiated * 0.8;
-  return (
-    <span className={`record-format${starved ? ' is-starved' : ''}`}>
-      {formatLabel(source.format)}
-      {delivered > 0 && ` · ${Math.round(delivered)} delivered`}
-    </span>
-  );
-}
-
 /** The preview, mirrored — see the note on `mirrorNote` below. */
 function CameraPreview({ stream }: { stream: MediaStream }) {
   const ref = useRef<HTMLVideoElement>(null);
@@ -435,32 +422,10 @@ export function RecordPanel({ capture }: Props) {
             Cancel
           </button>
         )}
-        {recording && (
-          <button type="button" className="record-discard" onClick={() => void capture.cancel()}>
-            Discard
-          </button>
-        )}
-        {recording && status && (
-          <span className="record-readout">
-            <span className="record-dot" />
-            {formatDuration(status.elapsed)} · {formatBytes(status.bytesTotal)}
-          </span>
-        )}
       </div>
 
-      {recording && status && status.sources.some((s) => s.format) && (
-        <ul className="record-formats">
-          {status.sources
-            .filter((s) => s.format)
-            .map((s) => (
-              <li key={s.kind}>
-                <span className="record-source-name">{SOURCE_LABELS[s.kind]}</span>
-                <VideoReadout source={s} />
-                {s.endedReason && <span className="record-ended">stopped early</span>}
-              </li>
-            ))}
-        </ul>
-      )}
+      {/* Everything about the take in progress, including the per-source mute. */}
+      {recording && <RecordingControl capture={capture} />}
 
       {phase === 'starting' && capture.stalled && (
         <p className="record-warning">{capture.stalled}</p>
