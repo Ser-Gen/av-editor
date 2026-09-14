@@ -83,6 +83,7 @@ import {
   canRetime,
   clampSpeed,
   formatSpeed,
+  rescaleClipKeys,
   retimeToSpeed,
   rippleDelta,
   slowestSpeedThatFits,
@@ -2853,12 +2854,19 @@ export const useEditorStore = create<Store>((set, get) => {
         const retimed = retimeToSpeed(clip, speedForDuration(clip, wanted), fps);
         const retimedStart =
           edge === 'left' ? Math.max(0, oldEnd - retimed.duration) : clip.timelineStart;
-        next = {
-          ...clip,
-          speed: retimed.speed,
-          sourceTrimOut: retimed.sourceTrimOut,
-          timelineStart: retimedStart,
-        };
+        // Keys are relative to the clip's start, so moving the start with a left-edge rate trim
+        // needs no correction of its own — only the change of pace does.
+        next = rescaleClipKeys(
+          {
+            ...clip,
+            speed: retimed.speed,
+            sourceTrimOut: retimed.sourceTrimOut,
+            timelineStart: retimedStart,
+          },
+          speed,
+          retimed.speed,
+          fps,
+        );
       } else if (edge === 'left') {
         // A ripple trim is bounded by the source alone: the neighbour it would have run into
         // is about to move out of the way.
@@ -2957,7 +2965,15 @@ export const useEditorStore = create<Store>((set, get) => {
       }
 
       const retimed = retimeToSpeed(clip, wanted, state.settings.fps);
-      const next: Clip = { ...clip, speed: retimed.speed, sourceTrimOut: retimed.sourceTrimOut };
+      // The animation keeps pace with the picture: every key stays on the frame it was set
+      // against. Each slider step rescales from the speed the clip has now, so a coalesced drag
+      // composes rather than compounding.
+      const next: Clip = rescaleClipKeys(
+        { ...clip, speed: retimed.speed, sourceTrimOut: retimed.sourceTrimOut },
+        clipSpeedOf(clip),
+        retimed.speed,
+        state.settings.fps,
+      );
       const oldEnd = clipEnd(clip);
       const delta = rippleDelta(clip, next);
       const shifts =

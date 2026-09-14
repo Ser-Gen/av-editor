@@ -372,7 +372,10 @@ you are choosing.
 
 Everything else follows the clip: trimming lands where you drop it, a split gives two halves
 that together play what the one did, detached audio carries the same speed, and keyframes and
-volume envelopes stretch with the clip.
+volume envelopes stay on the frame of picture they were set against — retime a clip and its
+animation closes up or spreads out with it, whether the speed came from the Inspector, the menu
+or an ⌥-drag. A shader's own clock (grain, a Shadertoy's `iTime`) is the exception: it describes
+the effect, not the picture, and keeps timeline time.
 
 ### Dropping files onto the timeline
 

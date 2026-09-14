@@ -439,7 +439,7 @@ none of that can tell whether the thing feels right, and none of it opens a wind
 ### Phase 2 — Library
 
 - [x] Group by origin: recordings, preset outputs and imports separate correctly.
-- [ ] Sort by size, then by duration, then back to Custom — Custom is your manual drag order.
+- [x] Sort by size, then by duration, then back to Custom — Custom is your manual drag order.
 - [x] Type part of a file name in the search box; the list narrows and the rest is still there
       when you clear it.
 - [x] Reload: the group and sort you chose are still chosen.

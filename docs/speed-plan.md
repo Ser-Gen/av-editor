@@ -234,34 +234,39 @@ not do what it says here is a bug in this document or in the code, and either wa
 
 **The basics**
 
-- [ ] 1. Drop a video with speech on the timeline. Set 2× in the Inspector: the block halves,
+- [x] 1. Drop a video with speech on the timeline. Set 2× in the Inspector: the block halves,
       the ruler agrees, and it plays twice as fast with the voice still sounding like a voice.
-- [ ] 2. Set 0.5×. The block doubles. With ripple off it stops at the next clip and says so;
+- [x] 2. Set 0.5×. The block doubles. With ripple off it stops at the next clip and says so;
       undo, turn ripple on, and it makes room instead.
-- [ ] 3. Tick *Pitch follows the speed*: at 2× the voice goes high, and stays high in the export.
-- [ ] 4. Set 1× again. The clip is exactly the length it started at.
+- [x] 3. Tick *Pitch follows the speed*: at 2× the voice goes high, and stays high in the export.
+- [x] 4. Set 1× again. The clip is exactly the length it started at.
 
 **The edits that touch it**
 
-- [ ] 5. Trim a 2× clip from either end. The edge lands under the pointer.
-- [ ] 6. ⌥-drag the right edge of a 1× clip. The clip keeps its frames and the speed changes.
-- [ ] 7. Split a 2× clip at the playhead. Both halves stay at 2×, and together they play what
+- [x] 5. Trim a 2× clip from either end. The edge lands under the pointer.
+- [x] 6. ⌥-drag the right edge of a 1× clip. The clip keeps its frames and the speed changes.
+- [x] 7. Split a 2× clip at the playhead. Both halves stay at 2×, and together they play what
       the one did.
-- [ ] 8. Detach the audio of a 0.5× clip. The two are the same length and stay in sync.
-- [ ] 9. Put a cross-dissolve between a 1× and a 2× clip. The transition is where the overlap is.
-- [ ] 10. Animate an effect on a 2× clip. The keyframes stretch with the clip.
+- [x] 8. Detach the audio of a 0.5× clip. The two are the same length and stay in sync.
+- [x] 9. Put a cross-dissolve between a 1× and a 2× clip. The transition is where the overlap is.
+- [x] 10. Animate an effect at 1× — a mask region following something, or Pixelate ramping
+      up — then set the clip to 2×. The keyframe markers close up to half their spacing and the
+      animation keeps pace with the picture: the region is still on what it was following, and
+      the ramp finishes on the same frame. Set 1× again: every marker is back where it was.
+- [x] 10a. Do it with an **⌥-drag** on the clip's edge instead of the Inspector. Same result.
+- [x] 10b. Draw a volume dip under one word, then set 2×. The dip is still under that word.
 
 **Both engines**
 
-- [ ] 11. Export with WebCodecs. Length, sync and pitch as previewed.
-- [ ] 12. Export forcing FFmpeg. Same length, same cuts. Compare a 0.25× clip's audio between
+- [x] 11. Export with WebCodecs. Length, sync and pitch as previewed.
+- [x] 12. Export forcing FFmpeg. Same length, same cuts. Compare a 0.25× clip's audio between
       the two — the FFmpeg one is `atempo` and should be the cleaner of the pair.
-- [ ] 13. Export a project with 0.25×, 1× and 4× clips on three tracks. Everything lines up.
+- [x] 13. Export a project with 0.25×, 1× and 4× clips on three tracks. Everything lines up.
 
 **Persistence**
 
-- [ ] 14. Reload. Every speed is where it was.
-- [ ] 15. Open a project saved before this phase. Nothing has moved.
+- [x] 14. Reload. Every speed is where it was.
+- [x] 15. Open a project saved before this phase. Nothing has moved.
 
 ## Results
 
@@ -365,6 +370,39 @@ Two smaller things fell out of it:
   usually starts a little before what was asked for; stretching the overhang would drag audio
   from outside the window into it.
 
+### Follow-up: the animation stayed at 1×
+
+*"The animation does not change speed along with the video, it remains as if for 1x. I tested
+this on the Mask a region effect and Pixelate filter."*
+
+Checklist step 10 said the keyframes stretch with the clip, and the README said so too. Nothing
+did it. A key's `t` is timeline seconds since the clip began, and every animation — effect
+parameters, placement, the mask overlay, the volume envelope — is evaluated at
+`t - clip.timelineStart`. That is the right coordinate for drawing a key on the timeline and
+addressing it in a drag, and the wrong thing to hold fixed when the pace of the picture
+changes: what a key *marks* is a frame of source, `sourceTrimIn + t × speed`. Retiming
+changed the speed and left `t` alone, so each key landed on different material. At 2× the
+animation kept its old timing over a picture running twice as fast, and its second half fell
+off the end of the shortened clip.
+
+The results above explain why this was missed: the video export, the filmstrip and the
+waveform "followed `sourceTimeAt` by construction", and it was easy to count animation among
+them. It is not in that set. It reads the timeline clock, not the source one.
+
+`rescaleClipKeys` in `utils/retime.ts` holds `sourceTrimIn + t × speed` constant — `t × from /
+to` — across all three keyed fields, and both things that change a speed call it:
+`setClipSpeed` and the ⌥-drag rate trim. Keys stay in timeline seconds, so nothing that draws,
+drags, splits or evaluates them changed. A result within a microsecond of a frame is put on the
+frame, and `check:math` holds a 1× → 1.5× → 1× round trip, and a slider dragged through seven
+speeds, to returning every key *exactly*, because a key a float's width off its frame is one a
+later drag cannot address.
+
+Why rescale on change rather than store keys in source time: this is two call sites, and
+source-relative keys would have meant converting in every place a key is drawn, dragged, added
+at the playhead or split — about a dozen, across three render paths — for the same result at
+a constant speed. That trade reverses with **speed ramps**, where a speed change is no longer
+one ratio; the backlog item should expect to revisit it.
+
 ### Known gaps
 
 - **Three engines, three stretchers.** The preview uses the browser's, the WebCodecs export
@@ -376,5 +414,9 @@ Two smaller things fell out of it:
   clip's source range, so *Normalize* on a heavily retimed clip is measuring material that is
   slightly not what will be heard. The reading is invalidated whenever the trim changes, and
   retiming moves the out point, so it is never *stale* — just measured before the stretch.
+- **A shader's own clock is not retimed.** The effect clock — the `time` a custom shader or
+  film grain animates by — stays in timeline seconds. It describes the effect rather than the
+  picture: grain on a 4× clip should not flicker four times as fast. Keyframes are the thing that
+  marks a moment in the material, and they are what moves.
 - **Speed ramps and reverse are not here**, deliberately, and are in the backlog with what
   each would actually cost.

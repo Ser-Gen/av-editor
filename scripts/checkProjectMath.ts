@@ -82,13 +82,14 @@ import {
   canRetime,
   clampSpeed,
   formatSpeed,
+  rescaleClipKeys,
   retimeAudioFilters,
   retimeToSpeed,
   roomAfter,
   slowestSpeedThatFits,
   speedForDuration,
 } from '../src/utils/retime';
-import { clipDuration as durationOfClip, speedOf } from '../src/utils/time';
+import { clipDuration as durationOfClip, quantizeToFrame, speedOf } from '../src/utils/time';
 import { pitchShift, resampleByRate, semitonesToRatio, timeStretch } from '../src/utils/timeStretch';
 import {
   annotationShapesAt,
@@ -2835,6 +2836,79 @@ check('a round trip through both is the identity',
   speedForDuration(speedClip(), durationOfClip(speedClip({ speed: 2.5 }))), 2.5, 1e-9);
 check('an impossible duration clamps rather than throwing',
   speedForDuration(speedClip(), 0.001), 4);
+
+/*
+  Retiming carries the animation with the picture. A key's time is timeline seconds since the
+  clip began, but what it marks is a frame of source — `in + t × speed` — and until this was
+  written nothing moved the keys when the speed changed. A mask region set against a face at
+  1× kept its 1× timing over a picture running twice as fast, and the second half of every
+  animation fell off the end of the shortened clip. The README already promised otherwise.
+*/
+const keyFps = 29.97;
+const onFrame = (t: number) => quantizeToFrame(t, keyFps);
+const keyedClip = speedClip({
+  effects: [
+    { id: 'mask', type: 'mask', enabled: true, params: { x: 0.1 },
+      keyframes: { x: [{ t: 0, value: 0.1, interp: 'linear' }, { t: onFrame(6), value: 0.7, interp: 'smooth' }] } },
+    { id: 'still', type: 'pixelate', enabled: true, params: { size: 8 } },
+  ],
+  transformKeyframes: { 'frame.x': [{ t: onFrame(2), value: 0, interp: 'hold' }] },
+  gainKeyframes: [{ t: onFrame(4), value: 0.2, interp: 'linear' }],
+});
+const keyTimes = (clip: Clip) => {
+  const c = clip as unknown as {
+    effects: { keyframes?: Record<string, { t: number }[]> }[];
+    transformKeyframes: Record<string, { t: number }[]>;
+    gainKeyframes: { t: number }[];
+  };
+  return [
+    ...c.effects.flatMap((e) => Object.values(e.keyframes ?? {}).flat().map((k) => k.t)),
+    ...Object.values(c.transformKeyframes).flat().map((k) => k.t),
+    ...c.gainKeyframes.map((k) => k.t),
+  ];
+};
+
+// `check` compares arrays by their JSON, where 6.002002002002001 and …002 differ, so these
+// compare the largest difference as a number instead.
+const worstGap = (a: number[], b: number[]) =>
+  a.length === b.length ? Math.max(0, ...a.map((v, i) => Math.abs(v - b[i]))) : Infinity;
+const sourceFrames = (clip: Clip) => keyTimes(clip).map((t) => sourceTimeAt(clip, 10 + t, 0));
+
+const atDouble = { ...rescaleClipKeys(keyedClip, 1, 2, keyFps), speed: 2 } as Clip;
+check('at 2× every key — effect, placement, envelope — is half as far into the clip',
+  worstGap(keyTimes(atDouble), keyTimes(keyedClip).map((t) => t / 2)), 0, 1e-9);
+check('and every one still marks the same frame of source',
+  worstGap(sourceFrames(atDouble), sourceFrames(keyedClip)), 0, 1e-9);
+check('so the last key is inside the shortened clip, not past its end',
+  Math.max(...keyTimes(atDouble)) <= durationOfClip(atDouble), true);
+
+const atHalf = { ...rescaleClipKeys(keyedClip, 1, 0.5, keyFps), speed: 0.5 } as Clip;
+check('at 0.5× they spread to twice the spacing, on the same frames of source',
+  worstGap(sourceFrames(atHalf), sourceFrames(keyedClip)), 0, 1e-9);
+
+// Exact equality on purpose: a key a float's width off its frame is one a later drag or upsert
+// addressing that frame can miss.
+const keysRoundTrip = rescaleClipKeys(rescaleClipKeys(keyedClip, 1, 1.5, keyFps), 1.5, 1, keyFps);
+check('1× to 1.5× and back returns every key to exactly the time it had',
+  JSON.stringify(keyTimes(keysRoundTrip)), JSON.stringify(keyTimes(keyedClip)));
+const sliderDrag = [1.1, 1.25, 1.7, 2.3, 3.05, 1.9, 1.0].reduce(
+  (acc, next) => ({ clip: rescaleClipKeys(acc.clip, acc.speed, next, keyFps), speed: next }),
+  { clip: keyedClip, speed: 1 },
+).clip;
+check('and so does a slider dragged through seven speeds back to 1×',
+  JSON.stringify(keyTimes(sliderDrag)), JSON.stringify(keyTimes(keyedClip)));
+
+const doubledEffects = (atDouble as unknown as { effects: unknown[] }).effects;
+check('values and interpolation are untouched — only when, not what',
+  JSON.stringify((doubledEffects[0] as { keyframes: { x: { value: number; interp: string }[] } })
+    .keyframes.x.map((k) => [k.value, k.interp])),
+  JSON.stringify([[0.1, 'linear'], [0.7, 'smooth']]));
+check('an effect with no animation is passed through as it was',
+  doubledEffects[1] === (keyedClip as unknown as { effects: unknown[] }).effects[1], true);
+check('and a speed that does not change returns the clip itself',
+  rescaleClipKeys(keyedClip, 2, 2, keyFps) === keyedClip, true);
+check('a clip with nothing animated gains no empty key fields',
+  Object.keys(rescaleClipKeys(speedClip(), 1, 2, keyFps)).sort(), Object.keys(speedClip()).sort());
 
 // Growing a clip with ripple off must stop at its neighbour: an overlap *is* a transition
 // here, so a slowed clip would otherwise silently cross-dissolve into what follows it.

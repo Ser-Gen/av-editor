@@ -13,7 +13,7 @@
  * is quantized and the source range absorbs the difference, which is sub-frame and which
  * nothing can observe. The speed the user asked for stays the number they see.
  */
-import type { Clip } from '../types/editor';
+import type { Clip, Keyframe } from '../types/editor';
 import {
   MIN_CLIP_DURATION,
   SPEED_MAX,
@@ -69,6 +69,55 @@ export function speedForDuration(
   const source = Math.max(0, clip.sourceTrimOut - clip.sourceTrimIn);
   if (source <= 0 || duration <= 0) return 1;
   return clampSpeed(source / duration);
+}
+
+/**
+ * The clip's animation, moved to keep pace with a new speed.
+ *
+ * A key's `t` is timeline seconds since the clip began, which is what lets the timeline draw it
+ * and a drag address it. But what someone *means* by a key is a moment in the picture — the
+ * frame a mask region was set against, the word a volume dip sits under — and that moment is
+ * `sourceTrimIn + t × speed`. Retiming changes the speed, so unless `t` changes with it the key
+ * lands on different material: at 2× an animation drawn at 1× runs at its old pace over a
+ * picture going twice as fast, and its second half falls off the end of the shortened clip.
+ *
+ * Holding `sourceTrimIn + t × speed` constant gives `t × from / to`. It is exact whatever the
+ * duration quantized to, because it never looks at the duration. A result within a microsecond
+ * of a frame is put on that frame, so a round trip — 1× to 1.5× and back — returns every key to
+ * exactly the time it had, rather than to a float's width beside it, where a later drag or
+ * upsert addressing the frame would miss it.
+ *
+ * Every keyed field on a retimable clip goes through here: effect parameters (mask regions
+ * included — they are effect parameters), placement, and the volume envelope.
+ */
+export function rescaleClipKeys<C extends Clip>(
+  clip: C,
+  fromSpeed: number,
+  toSpeed: number,
+  fps: number,
+): C {
+  const from = clampSpeed(fromSpeed);
+  const to = clampSpeed(toSpeed);
+  if (from === to) return clip;
+
+  const move = (keys: Keyframe[]): Keyframe[] =>
+    keys.map((key) => {
+      const t = (key.t * from) / to;
+      const onFrame = quantizeToFrame(t, fps);
+      return { ...key, t: Math.abs(onFrame - t) < 1e-6 ? onFrame : t };
+    });
+  const moveMap = (channels: Record<string, Keyframe[]>): Record<string, Keyframe[]> =>
+    Object.fromEntries(Object.entries(channels).map(([name, keys]) => [name, move(keys)]));
+
+  const next = { ...clip } as C & { gainKeyframes?: Keyframe[] };
+  if (clip.effects) {
+    next.effects = clip.effects.map((effect) =>
+      effect.keyframes ? { ...effect, keyframes: moveMap(effect.keyframes) } : effect,
+    );
+  }
+  if (clip.transformKeyframes) next.transformKeyframes = moveMap(clip.transformKeyframes);
+  if (next.gainKeyframes) next.gainKeyframes = move(next.gainKeyframes);
+  return next;
 }
 
 /**
