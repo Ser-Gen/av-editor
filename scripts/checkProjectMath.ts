@@ -3097,5 +3097,31 @@ check('and the journey is scaled by the picture, not re-anchored pose by pose',
   travelAfter, travelBefore * fittedContentBox(annoWide, annoTall).w, 1e-9);
 
 
+/*
+  The favicon is an .svg, so the browser fetches it as image/svg+xml and hands it to an XML
+  parser rather than to the lenient HTML one. XML forbids a double hyphen inside a comment,
+  and the comment explaining the icon's colours named the theme's custom properties with
+  theirs — so the file was not well-formed and the icon was missing wherever a cached copy
+  was not covering for it. Nothing in a browser says why: a favicon that fails to decode
+  fails silently.
+*/
+const faviconSvg = readFileSync('public/favicon.svg', 'utf8');
+const faviconComments = [...faviconSvg.matchAll(/<!--([\s\S]*?)-->/g)].map((m) => m[1]);
+check('the favicon has its comment', faviconComments.length > 0, true);
+check('and no comment in it contains the sequence XML forbids',
+  faviconComments.filter((c) => c.includes('--')), []);
+check('the icon itself is still four rects', (faviconSvg.match(/<rect/g) ?? []).length, 4);
+
+/*
+  Both icons are declared as `icon`. `alternate icon` is not a rel keyword list the HTML spec
+  defines, and the PNG exists precisely for the browsers least likely to forgive that — the
+  ones with no SVG icon support at all. `sizes="any"` is what tells the rest to prefer the
+  vector over the 32px raster.
+*/
+const iconLinks = readFileSync('index.html', 'utf8').match(/<link rel="[^"]*icon[^"]*"[^>]*>/g) ?? [];
+check('two icons are declared', iconLinks.length, 2);
+check('both under the plain `icon` keyword', iconLinks.filter((l) => /rel="icon"/.test(l)).length, 2);
+check('the vector one claims any size', /sizes="any"/.test(iconLinks[0]), true);
+
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
